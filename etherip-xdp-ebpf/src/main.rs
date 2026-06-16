@@ -136,6 +136,30 @@ fn store<T: Copy>(ctx: &aya_ebpf::programs::XdpContext, offset: usize, value: T)
     Ok(())
 }
 
+/// `load`, but for a *packet-derived* (variable) offset. The barrier is what
+/// makes variable-offset access pass the verifier: without it, when an earlier
+/// bounds check covers a wider span (e.g. `data + tcp_off + 20 > data_end`),
+/// LLVM proves this access's own `ptr_at` check redundant and elides it. The
+/// pointer is then recomputed as a fresh register that reaches the verifier
+/// with no bounds it can see ("R0 offset is outside of the packet"). Hiding the
+/// offset behind `black_box` keeps every access's check independent and tied to
+/// its own dereference. This is the safe equivalent of the `asm volatile` hint
+/// in the original C/Go implementation.
+#[inline(always)]
+fn load_var<T: Copy>(ctx: &aya_ebpf::programs::XdpContext, offset: usize) -> Result<T, ()> {
+    load(ctx, core::hint::black_box(offset))
+}
+
+/// `store`, for a packet-derived (variable) offset. See `load_var`.
+#[inline(always)]
+fn store_var<T: Copy>(
+    ctx: &aya_ebpf::programs::XdpContext,
+    offset: usize,
+    value: T,
+) -> Result<(), ()> {
+    store(ctx, core::hint::black_box(offset), value)
+}
+
 #[inline(always)]
 fn dbg_inc(idx: u32) {
     if let Some(ptr) = DEBUG_COUNTERS.get_ptr_mut(idx) {
@@ -159,7 +183,7 @@ fn skip_ext_headers(
         if nexthdr != 0 && nexthdr != 43 && nexthdr != 44 && nexthdr != 60 {
             return Ok((pos, nexthdr));
         }
-        let ext: headers::ExtHdr = load(ctx, pos)?;
+        let ext: headers::ExtHdr = load_var(ctx, pos)?;
         let cur = nexthdr;
         nexthdr = ext.nexthdr;
         let hdrlen = ext.hdrlen as usize;
@@ -192,8 +216,8 @@ fn update_tcp_mss(
     if data + tcp_off + 20 > data_end {
         return Err(());
     }
-    let data_offset = (load::<u8>(ctx, tcp_off + 12)? >> 4) as usize;
-    let flags = load::<u8>(ctx, tcp_off + 13)?;
+    let data_offset = (load_var::<u8>(ctx, tcp_off + 12)? >> 4) as usize;
+    let flags = load_var::<u8>(ctx, tcp_off + 13)?;
     if flags & 0x02 == 0 {
         return Ok(()); // not a SYN
     }
@@ -210,7 +234,7 @@ fn update_tcp_mss(
         if remaining < 1 {
             break;
         }
-        let Ok(kind) = load::<u8>(ctx, opt_off) else {
+        let Ok(kind) = load_var::<u8>(ctx, opt_off) else {
             break;
         };
         if kind == 0 {
@@ -224,7 +248,7 @@ fn update_tcp_mss(
         if remaining < 2 {
             break;
         }
-        let Ok(len_byte) = load::<u8>(ctx, opt_off + 1) else {
+        let Ok(len_byte) = load_var::<u8>(ctx, opt_off + 1) else {
             break;
         };
         let len = len_byte as i32;
@@ -232,12 +256,12 @@ fn update_tcp_mss(
             break;
         }
         if kind == 2 && len == 4 {
-            let old_mss = u16::from_be_bytes(load::<[u8; 2]>(ctx, opt_off + 2)?);
+            let old_mss = u16::from_be_bytes(load_var::<[u8; 2]>(ctx, opt_off + 2)?);
             if old_mss > new_mss {
-                store(ctx, opt_off + 2, new_mss.to_be_bytes())?;
-                let csum = u16::from_be_bytes(load::<[u8; 2]>(ctx, tcp_off + 16)?);
+                store_var(ctx, opt_off + 2, new_mss.to_be_bytes())?;
+                let csum = u16::from_be_bytes(load_var::<[u8; 2]>(ctx, tcp_off + 16)?);
                 let updated = etherip_xdp_common::checksum_update(csum, old_mss, new_mss);
-                store(ctx, tcp_off + 16, updated.to_be_bytes())?;
+                store_var(ctx, tcp_off + 16, updated.to_be_bytes())?;
             }
             return Ok(());
         }
@@ -445,7 +469,7 @@ fn handle_decap(ctx: &aya_ebpf::programs::XdpContext) -> u32 {
         return xdp_action::XDP_PASS;
     }
 
-    let eip: headers::EtherIpHdr = match load(ctx, eip_off) {
+    let eip: headers::EtherIpHdr = match load_var(ctx, eip_off) {
         Ok(e) => e,
         Err(()) => return xdp_action::XDP_ABORTED,
     };
