@@ -1,0 +1,30 @@
+# Templated systemd unit: one instance per external (uplink) interface.
+#
+#   sudo install -Dm0644 packaging/etherip-xdp@.service /etc/systemd/system/etherip-xdp@.service
+#   sudo install -Dm0755 target/release/etherip-xdp /usr/bin/etherip-xdp
+#   sudo mkdir -p /etc/etherip-xdp/eth1.d   # one *.json per tunnel
+#   sudo systemctl enable --now etherip-xdp@eth1
+#   sudo systemctl reload etherip-xdp@eth1  # graceful config reload (SIGHUP)
+[Unit]
+Description=XDP EtherIP tunnels on %i
+Documentation=https://github.com/sorah/etherip-xdp
+After=network-pre.target sys-subsystem-net-devices-%i.device
+Wants=network-pre.target
+BindsTo=sys-subsystem-net-devices-%i.device
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/etherip-xdp %i
+# `systemctl reload` applies config changes gracefully (no data-path interruption
+# for unaffected tunnels).
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+
+# Loading/attaching XDP, managing veth/neighbours, and ethtool need these.
+# On kernels < 5.8, CAP_BPF does not exist; replace it with CAP_SYS_ADMIN.
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_SYS_RESOURCE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_SYS_RESOURCE CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

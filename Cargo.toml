@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "etherip-xdp",
+    "etherip-xdp-common",
+    "etherip-xdp-ebpf",
+]
+default-members = ["etherip-xdp", "etherip-xdp-common"]
+
+[workspace.package]
+license = "MIT"
+edition = "2024"
+authors = ["Sorah Fukumori <her@sorah.jp>"]
+repository = "https://github.com/sorah/etherip-xdp"
+
+[workspace.dependencies]
+# aya is pinned to a main revision that includes the `TestRun` trait
+# (BPF_PROG_TEST_RUN, commit d10c87e2) used by the byte-exact data-path tests.
+aya = { git = "https://github.com/aya-rs/aya", rev = "b277f74443d4befdeb088879d0c358d726f9aa8e", default-features = false }
+aya-build = { git = "https://github.com/aya-rs/aya", rev = "b277f74443d4befdeb088879d0c358d726f9aa8e", default-features = false }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", rev = "b277f74443d4befdeb088879d0c358d726f9aa8e", default-features = false }
+aya-log = { git = "https://github.com/aya-rs/aya", rev = "b277f74443d4befdeb088879d0c358d726f9aa8e", default-features = false }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", rev = "b277f74443d4befdeb088879d0c358d726f9aa8e", default-features = false }
+
+anyhow = { version = "1", default-features = false }
+cargo_metadata = { version = "0.23.0", default-features = false }
+# `std` feature is currently required to build `clap`.
+#
+# See https://github.com/clap-rs/clap/blob/61f5ee5/clap_builder/src/lib.rs#L15.
+clap = { version = "4.5.20", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+env_logger = { version = "0.11.5", default-features = false }
+log = { version = "0.4.22", default-features = false }
+tokio = { version = "1.40.0", default-features = false }
+which = { version = "6.0.0", default-features = false }
+
+# Userspace daemon dependencies.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# netlink-packet-route / -core / -sys are used via rtnetlink's re-exports
+# (rtnetlink::packet_route / packet_core) to guarantee a single matching version.
+rtnetlink = "0.21"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+nix = { version = "0.31", default-features = false, features = ["ioctl", "net", "resource", "socket"] }
+etherparse = "0.20"
+
+[profile.release.package.etherip-xdp-ebpf]
+debug = 2
+codegen-units = 1
+strip = false

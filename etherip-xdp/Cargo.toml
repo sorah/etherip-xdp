@@ -1,0 +1,86 @@
+[package]
+name = "etherip-xdp"
+version = "0.1.0"
+edition.workspace = true
+description = "XDP-accelerated EtherIP (RFC 3378) over IPv6 tunnels"
+
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[package.metadata.deb]
+maintainer = "Sorah Fukumori <her@sorah.jp>"
+copyright = "2021 Takeru Hayasaka; 2026 Sorah Fukumori"
+license-file = ["../LICENSE-MIT", "0"]
+section = "net"
+priority = "optional"
+extended-description = """\
+XDP-accelerated EtherIP (RFC 3378) over IPv6 tunnels. Ethernet frames are \
+encapsulated in outer-Ethernet + IPv6 + EtherIP and moved between a physical \
+uplink and a veth pair entirely in XDP, with one process per uplink driven by \
+the templated etherip-xdp@<iface>.service unit and JSON config under \
+/etc/etherip-xdp/<iface>.d/."""
+assets = [
+    ["target/release/etherip-xdp", "usr/bin/", "755"],
+    ["../README.md", "usr/share/doc/etherip-xdp/README.md", "644"],
+    ["../packaging/etc/etherip-xdp/eth1.d/peer.json", "usr/share/doc/etherip-xdp/examples/eth1.d/", "644"],
+    ["../packaging/etc/etherip-xdp/eth1.d/example-explicit-mss.json", "usr/share/doc/etherip-xdp/examples/eth1.d/", "644"],
+]
+
+# Templated unit (etherip-xdp@.service): no default instance to enable/start, so
+# the maintainer scripts only run daemon-reload. Enable per uplink with e.g.
+# `systemctl enable --now etherip-xdp@eth1`.
+[package.metadata.deb.systemd-units]
+unit-name = "etherip-xdp"
+unit-scripts = "../packaging"
+enable = false
+start = false
+
+[dependencies]
+etherip-xdp-common = { path = "../etherip-xdp-common", features = ["user"] }
+
+anyhow = { workspace = true, default-features = true }
+aya = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "time",
+    "sync",
+    "fs",
+] }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rtnetlink = { workspace = true }
+futures-util = { workspace = true }
+nix = { workspace = true }
+
+[dev-dependencies]
+etherparse = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+# TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but
+# it's not possible to tell cargo to use `-Z build-std` to build it. We cargo-in-cargo in the build
+# script to build this, but we want to teach cargo about the dependency so that cache invalidation
+# works properly.
+#
+# Note also that https://github.com/rust-lang/cargo/issues/10593 occurs when `target = ...` is added
+# to an artifact dependency; it seems possible to work around that by setting `resolver = "1"` in
+# Cargo.toml in the workspace root.
+#
+# Finally note that *any* usage of `artifact = ...` in *any* Cargo.toml in the workspace breaks
+# workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
+# features.
+etherip-xdp-ebpf = { path = "../etherip-xdp-ebpf" }
+
+[[bin]]
+name = "etherip-xdp"
+path = "src/main.rs"

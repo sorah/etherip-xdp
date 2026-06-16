@@ -1,0 +1,9 @@
+# The daemon needs root (CAP_NET_ADMIN/CAP_SYS_RESOURCE/CAP_NET_RAW) to load
+# and attach XDP, manage links, and set ethtool features. It is normally run via
+# the etherip-xdp@.service systemd unit. For local runs and the root-only
+# data-path tests, use `sudo` explicitly (see mise.toml), e.g.
+#   sudo -E ./target/debug/etherip-xdp --external eth1
+#   sudo -E $(cargo test --no-run --message-format=json ... )
+#
+# A blanket `runner = "sudo -E"` is intentionally NOT set here: it would force
+# every host unit-test binary to run under sudo too, breaking `cargo test`.

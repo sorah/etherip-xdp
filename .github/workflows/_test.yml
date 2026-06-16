@@ -1,0 +1,64 @@
+name: test
+
+# Reusable workflow: build, lint, and test the etherip-xdp workspace.
+# Modeled on the aya-template CI, trimmed to this project's single XDP program
+# and to Linux amd64 + aarch64 (the only targets etherip-xdp runs on).
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: {}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest # linux/amd64
+          - ubuntu-24.04-arm # linux/aarch64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # nightly provides rust-src for aya-build's `-Z build-std=core` (it invokes
+      # `rustup run nightly cargo ...` to compile the eBPF), plus rustfmt/clippy.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy,rust-src,rustfmt
+
+      # stable is the default toolchain for the userspace crates.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: taiki-e/install-action@0631aa6515c7d545823c67cfae7ef4fc7f490154 # v2.81.8
+        with:
+          tool: bpf-linker
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Clippy
+        run: cargo clippy --all-targets --workspace --exclude etherip-xdp-ebpf -- -D warnings
+
+      - name: Rustfmt
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Test (host)
+        run: cargo test -p etherip-xdp -p etherip-xdp-common
+
+      # Byte-exact data-path tests via BPF_PROG_TEST_RUN need root (CAP_BPF) and a
+      # kernel >= 5.15; GitHub-hosted Ubuntu runners satisfy both.
+      - name: Test (eBPF data path)
+        run: |
+          set -euxo pipefail
+          cargo test -p etherip-xdp --test data_path --no-run
+          bin=$(find target/debug/deps -maxdepth 1 -type f -executable -name 'data_path-*' -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
+          sudo -E "$bin" --ignored --test-threads=1
