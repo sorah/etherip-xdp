@@ -1,0 +1,105 @@
+name: release
+
+# Cut a GitHub release with cargo-deb packages, gated on the full test suite.
+#
+# Triggered by pushing a `rel/YYYY.MM.DD` tag. The unit/data-path tests
+# (_test.yml) and the VM/netns/FreeBSD integration tests (_integration.yml) run
+# as reusable workflows; the .deb is built in parallel, but the release is only
+# published once all of them pass.
+on:
+  push:
+    tags:
+      - 'rel/*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: {}
+
+jobs:
+  test:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_test.yml
+
+  integration:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_integration.yml
+
+  build-deb:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest # linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm # linux/aarch64
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # nightly + rust-src for aya-build's eBPF `-Z build-std` (build.rs invokes
+      # `rustup run nightly cargo ...`); stable is the userspace default.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: bpf-linker,cargo-deb
+
+      # cargo-deb runs `cargo build --release -p etherip-xdp` (building the eBPF
+      # object via build.rs) and packages it natively for this runner's arch.
+      - name: Build .deb
+        id: deb
+        run: |
+          set -euxo pipefail
+          # cargo-deb writes to target/debian/ and prints the package path on
+          # the last line of stdout.
+          deb=$(cargo deb -p etherip-xdp | tail -n1)
+          echo "path=${deb}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: ${{ steps.deb.outputs.path }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deb-${{ matrix.arch }}
+          path: ${{ steps.deb.outputs.path }}
+          if-no-files-found: error
+
+  release:
+    needs: [test, integration, build-deb]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.deb
