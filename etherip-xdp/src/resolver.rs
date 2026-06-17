@@ -170,9 +170,10 @@ async fn resolve_route_and_src(
                 }
             }
         }
-        Err(e) => {
-            log::debug!("listing source addresses on ifindex {external_ifindex} failed: {e}")
-        }
+        Err(e) => log::warn!(
+            "could not list source addresses on ifindex {external_ifindex} to resolve a \
+             source for {dst}: {e}"
+        ),
     }
     (None, None)
 }

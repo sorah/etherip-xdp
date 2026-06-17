@@ -321,15 +321,19 @@ impl Manager {
                 let decap_key = Self::decap_key(src, spec.remote);
                 self.bpf.set_encap(peer_index, &config)?;
                 self.bpf.set_decap(&decap_key, &config)?;
-                log::info!(
-                    "tunnel {name} up: {} -> {} via next-hop {}, mtu {}, mss ({},{})",
-                    src,
-                    spec.remote,
-                    fmt_mac(&dst_mac),
-                    tunnel_mtu,
-                    config.mss_clamp_ipv4,
-                    config.mss_clamp_ipv6
-                );
+                if dst_mac == [0u8; 6] {
+                    warn_next_hop_unresolved(&name, src, spec.remote);
+                } else {
+                    log::info!(
+                        "tunnel {name} up: {} -> {} via next-hop {}, mtu {}, mss ({},{})",
+                        src,
+                        spec.remote,
+                        fmt_mac(&dst_mac),
+                        tunnel_mtu,
+                        config.mss_clamp_ipv4,
+                        config.mss_clamp_ipv6
+                    );
+                }
                 (config, decap_key, Some(src))
             }
             None => {
@@ -476,6 +480,20 @@ impl Manager {
         }
         self.bpf.set_decap(&new_key, &config)?;
 
+        if dst_mac == [0u8; 6] {
+            warn_next_hop_unresolved(&name, src, spec.remote);
+        } else {
+            log::info!(
+                "tunnel {name} updated: {} -> {} via next-hop {}, mtu {}, mss ({},{})",
+                src,
+                spec.remote,
+                fmt_mac(&dst_mac),
+                tunnel_mtu,
+                config.mss_clamp_ipv4,
+                config.mss_clamp_ipv6
+            );
+        }
+
         if let Some(t) = self.tunnels.get_mut(&name) {
             t.spec = spec;
             t.tunnel_mtu = tunnel_mtu;
@@ -483,7 +501,6 @@ impl Manager {
             t.decap_key = new_key;
             t.effective_src = Some(src);
         }
-        log::info!("tunnel {name} updated");
         Ok(())
     }
 
@@ -617,7 +634,9 @@ impl Manager {
                 t.decap_key = new_key;
                 t.effective_src = Some(src);
             }
-            if was_installed {
+            if dst_mac == [0u8; 6] {
+                warn_next_hop_unresolved(&name, src, spec.remote);
+            } else if was_installed {
                 log::info!(
                     "tunnel {name}: endpoint updated (src {src}, next-hop {})",
                     fmt_mac(&dst_mac)
@@ -661,6 +680,17 @@ impl Manager {
         }
         self.bpf.remove_redirect(self.external.index).ok();
     }
+}
+
+/// A real neighbour MAC is never all-zero, so a zero `dst_mac` after resolution
+/// means the next hop has not resolved yet: the encap/decap entries are installed
+/// but the data path drops every frame (addressed to the null MAC) until a
+/// neighbour appears. That is a failure the operator must see, hence `warn`.
+fn warn_next_hop_unresolved(name: &str, src: std::net::Ipv6Addr, remote: std::net::Ipv6Addr) {
+    log::warn!(
+        "tunnel {name}: {src} -> {remote} installed but next-hop MAC unresolved; \
+         frames are dropped until a neighbour resolves"
+    );
 }
 
 fn fmt_mac(mac: &[u8; 6]) -> String {
