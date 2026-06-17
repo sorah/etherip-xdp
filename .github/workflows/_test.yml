@@ -26,15 +26,22 @@ jobs:
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       # nightly provides rust-src for aya-build's `-Z build-std=core` (it invokes
       # `rustup run nightly cargo ...` to compile the eBPF), plus rustfmt/clippy.
-      - uses: dtolnay/rust-toolchain@nightly
+      # Hash-pinned, so the toolchain is named explicitly (the ref no longer
+      # selects it).
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
+          toolchain: nightly
           components: clippy,rust-src,rustfmt
 
       # stable is the default toolchain for the userspace crates.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
