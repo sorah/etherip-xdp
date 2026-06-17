@@ -1,14 +1,21 @@
 //! Outer-endpoint resolution: source address selection and next-hop MAC.
 //!
 //! Resolves the route to the remote tunnel endpoint and, from the same lookup,
-//! derives both the outer source address and the next-hop MAC:
+//! derives both the outer source address and the next-hop MAC. Every route
+//! lookup is constrained to the external interface (`oif`), since encap always
+//! egresses there, and carries no `iif` so the kernel routes it as the
+//! locally-originated packet it is (`iif lo`).
 //!
 //! - **Source address.** When a tunnel configures an explicit `src`, it is used
 //!   verbatim (and passed as the route lookup's source hint so policy routing and
 //!   source-address selection behave as if the packet originated there). When
 //!   `src` is omitted, the kernel's preferred source for the route (`RTA_PREFSRC`,
-//!   i.e. its RFC 6724 selection) is adopted instead. If neither is available the
-//!   source is left unresolved and the tunnel stays pending.
+//!   i.e. its RFC 6724 selection) is adopted; if a sourceless lookup yields none
+//!   — which happens when policy routing is source-keyed, so no table is reached
+//!   until a source is known — the source is instead seeded from the external
+//!   interface's own global addresses, supplying the `from` the source rule needs
+//!   to match. If neither resolves, the source is left unresolved and the tunnel
+//!   stays pending.
 //! - **Next-hop MAC.** The next hop's link-layer address is looked up in the
 //!   neighbour table. If the entry is missing or unusable, an active UDP probe is
 //!   sent out the external interface to trigger kernel neighbour discovery — so no
@@ -104,6 +111,72 @@ pub enum Probe {
     Passive,
 }
 
+/// One route lookup, with its error logged and folded into `None` (a missing
+/// route is not fatal — resolution is retried later). The lookup is always
+/// constrained to `external_ifindex`, matching the fact that encap egresses
+/// there unconditionally.
+async fn route_get_oif(
+    nl: &crate::netlink::Netlink,
+    dst: std::net::Ipv6Addr,
+    src: Option<std::net::Ipv6Addr>,
+    external_ifindex: u32,
+) -> Option<crate::netlink::RouteInfo> {
+    match nl.route_get(dst, src, Some(external_ifindex)).await {
+        Ok(info) => info,
+        Err(e) => {
+            log::debug!("route lookup for {dst} (src {src:?}) failed: {e}");
+            None
+        }
+    }
+}
+
+/// Resolve the route to `dst` and the effective outer source together, applying
+/// policy routing accurately. Returns `(src, route_info)`; either may be `None`
+/// when unresolved. The source hint is chosen so source-keyed `ip rule`s match:
+///
+/// - **Explicit `src`:** used as the hint verbatim.
+/// - **Auto `src`, kernel-selected:** a sourceless lookup lets the kernel apply
+///   destination-keyed rules and its own RFC 6724 selection (`RTA_PREFSRC`).
+/// - **Auto `src`, seeded:** when that yields no source — the host's policy
+///   routing is source-keyed, so a sourceless lookup reaches no usable table —
+///   the external interface's own global addresses are tried as the hint, the
+///   first that yields a route winning. This supplies the `from` the source rule
+///   needs, which the kernel cannot bootstrap on its own.
+async fn resolve_route_and_src(
+    nl: &crate::netlink::Netlink,
+    external_ifindex: u32,
+    configured_src: Option<std::net::Ipv6Addr>,
+    dst: std::net::Ipv6Addr,
+) -> (
+    Option<std::net::Ipv6Addr>,
+    Option<crate::netlink::RouteInfo>,
+) {
+    if configured_src.is_some() {
+        let info = route_get_oif(nl, dst, configured_src, external_ifindex).await;
+        return (choose_src(configured_src, info), info);
+    }
+
+    let info = route_get_oif(nl, dst, None, external_ifindex).await;
+    if let Some(src) = choose_src(None, info) {
+        return (Some(src), info);
+    }
+
+    match nl.interface_global_addrs(external_ifindex).await {
+        Ok(addrs) => {
+            for cand in addrs {
+                let info = route_get_oif(nl, dst, Some(cand), external_ifindex).await;
+                if info.is_some() {
+                    return (Some(cand), info);
+                }
+            }
+        }
+        Err(e) => {
+            log::debug!("listing source addresses on ifindex {external_ifindex} failed: {e}")
+        }
+    }
+    (None, None)
+}
+
 /// Resolve a tunnel's outer endpoint: the effective source address and the
 /// next-hop MAC. Failure to resolve either is reported as `None` in the
 /// respective field (not an error), since resolution is retried on netlink
@@ -118,28 +191,11 @@ pub async fn resolve_endpoint(
     on_link: NextHopOnLink,
     probe: Probe,
 ) -> anyhow::Result<Resolved> {
-    // A failed route lookup (e.g. no route / unreachable) is treated as "no
-    // route info" so the on-link policy decides; resolution is retried later on
-    // netlink changes, so a transient error is not fatal. An explicit source is
-    // passed as a hint so policy routing / source selection behave as if the
-    // packet originated there; auto source omits the hint so the kernel reports
-    // its own preferred source.
-    let info = match nl.route_get(dst, configured_src).await {
-        Ok(info) => info,
-        Err(e) => {
-            log::debug!("route lookup for {dst} failed: {e}");
-            None
-        }
-    };
-    let src = choose_src(configured_src, info);
-    if let Some(oif) = info.and_then(|i| i.oif)
-        && oif != external_ifindex
-    {
-        log::warn!(
-            "route to {dst} resolves via ifindex {oif}, not external interface \
-             (ifindex {external_ifindex}); encap still egresses the external interface"
-        );
-    }
+    // Resolve the route and the effective outer source together, applying policy
+    // routing accurately (see `resolve_route_and_src`). A failed lookup is not
+    // fatal: it leaves the relevant field `None` and resolution is retried on
+    // netlink changes.
+    let (src, info) = resolve_route_and_src(nl, external_ifindex, configured_src, dst).await;
     let Some(next_hop) = choose_next_hop(on_link, info, dst) else {
         log::debug!(
             "no next hop for {dst} (no gateway and on-link policy is {on_link:?}); \
@@ -256,7 +312,6 @@ mod tests {
     fn gw_route(gw: std::net::Ipv6Addr) -> Option<crate::netlink::RouteInfo> {
         Some(crate::netlink::RouteInfo {
             gateway: Some(std::net::IpAddr::V6(gw)),
-            oif: Some(3),
             prefsrc: None,
         })
     }
@@ -264,7 +319,6 @@ mod tests {
     fn onlink_route() -> Option<crate::netlink::RouteInfo> {
         Some(crate::netlink::RouteInfo {
             gateway: None,
-            oif: Some(3),
             prefsrc: None,
         })
     }
@@ -272,7 +326,6 @@ mod tests {
     fn route_with_prefsrc(prefsrc: std::net::Ipv6Addr) -> Option<crate::netlink::RouteInfo> {
         Some(crate::netlink::RouteInfo {
             gateway: None,
-            oif: Some(3),
             prefsrc: Some(std::net::IpAddr::V6(prefsrc)),
         })
     }

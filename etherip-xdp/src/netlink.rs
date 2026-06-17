@@ -16,8 +16,6 @@ pub struct LinkInfo {
 pub struct RouteInfo {
     /// Gateway (next hop), or `None` when the destination is on-link.
     pub gateway: Option<std::net::IpAddr>,
-    /// Output interface index the kernel selected.
-    pub oif: Option<u32>,
     /// Preferred source address the kernel would use for this route
     /// (`RTA_PREFSRC`), i.e. the result of its RFC 6724 source selection. Used to
     /// auto-pick the outer source when a tunnel does not configure one.
@@ -142,41 +140,43 @@ impl Netlink {
 
     /// Resolve the route to `dst`. Passing `src` makes the kernel apply policy
     /// routing rules and source-address selection as if the packet originated
-    /// from that address (the "ip rule ... from <src>" case).
+    /// from that address (the "ip rule ... from <src>" case). Passing `oif`
+    /// constrains the lookup to that output interface, matching the fact that
+    /// encap always egresses the external interface; the request carries no
+    /// `iif`, so the kernel routes it as the locally-originated (`iif lo`) packet
+    /// it is.
     pub async fn route_get(
         &self,
         dst: std::net::Ipv6Addr,
         src: Option<std::net::Ipv6Addr>,
+        oif: Option<u32>,
     ) -> anyhow::Result<Option<RouteInfo>> {
         let mut builder = rtnetlink::RouteMessageBuilder::<std::net::Ipv6Addr>::new()
             .destination_prefix(dst, 128);
         if let Some(src) = src {
             builder = builder.source_prefix(src, 128);
         }
+        if let Some(oif) = oif {
+            builder = builder.output_interface(oif);
+        }
         let mut routes = self.handle.route().get(builder.build()).execute();
         let Some(route) = routes.try_next().await? else {
             return Ok(None);
         };
         let mut gateway = None;
-        let mut oif = None;
         let mut prefsrc = None;
         for attr in route.attributes {
             match attr {
                 rtnetlink::packet_route::route::RouteAttribute::Gateway(addr) => {
                     gateway = route_addr_to_ip(&addr);
                 }
-                rtnetlink::packet_route::route::RouteAttribute::Oif(i) => oif = Some(i),
                 rtnetlink::packet_route::route::RouteAttribute::PrefSource(addr) => {
                     prefsrc = route_addr_to_ip(&addr);
                 }
                 _ => {}
             }
         }
-        Ok(Some(RouteInfo {
-            gateway,
-            oif,
-            prefsrc,
-        }))
+        Ok(Some(RouteInfo { gateway, prefsrc }))
     }
 
     /// Whether `addr` is currently assigned to any interface on the host. Used to
@@ -190,6 +190,39 @@ impl Netlink {
             .set_address_filter(std::net::IpAddr::V6(addr))
             .execute();
         Ok(addrs.try_next().await?.is_some())
+    }
+
+    /// List the global-scope ("universe") IPv6 addresses assigned to `ifindex`.
+    /// Used to seed the outer source for an auto-`src` tunnel when the kernel
+    /// cannot select one itself — on a host whose policy routing is source-keyed,
+    /// a route lookup with no source matches no usable table, so the source must
+    /// be supplied up front. Link-local and host-scoped addresses are excluded by
+    /// the scope filter, leaving only addresses usable as an outer source.
+    pub async fn interface_global_addrs(
+        &self,
+        ifindex: u32,
+    ) -> anyhow::Result<Vec<std::net::Ipv6Addr>> {
+        let mut addrs = self
+            .handle
+            .address()
+            .get()
+            .set_link_index_filter(ifindex)
+            .execute();
+        let mut out = Vec::new();
+        while let Some(msg) = addrs.try_next().await? {
+            if msg.header.scope != rtnetlink::packet_route::address::AddressScope::Universe {
+                continue;
+            }
+            for attr in &msg.attributes {
+                if let rtnetlink::packet_route::address::AddressAttribute::Address(
+                    std::net::IpAddr::V6(v6),
+                ) = attr
+                {
+                    out.push(*v6);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Find the neighbour (link-layer) entry for `target` on interface
