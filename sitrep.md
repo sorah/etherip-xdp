@@ -12,11 +12,14 @@ repo generated from `aya-template`; everything below was written this session.
 - ✅ Host tests pass: **17** in `etherip-xdp` + **5** in `etherip-xdp-common`.
 - ✅ `clippy --all-targets … -D warnings` clean, with `clippy::undocumented_unsafe_blocks` **enforced**.
 - ✅ `cargo +nightly fmt --all -- --check` clean. `actionlint` clean on CI workflows.
-- ❗ **NOT verified locally:** the eBPF *verifier* acceptance, the byte-exact
-  `BPF_PROG_TEST_RUN` data-path tests, and live runtime. The sandbox is
-  unprivileged (uid != 0, no CAP_BPF, no passwordless sudo). These need **root +
-  kernel ≥ 5.15** — run `mise run test-bpf` (or rely on CI). This is the single
-  biggest open risk; see "Open risks" below.
+- ✅ **eBPF verifier + data path CI-confirmed** (both `ubuntu-latest` &
+  `ubuntu-24.04-arm`): the byte-exact `BPF_PROG_TEST_RUN` tests pass under root.
+  First load was rejected (variable-offset packet access, risk #1); fixed via
+  `load_var`/`store_var` — see "Open risks" #1. Still **not verifiable in this
+  sandbox** (unprivileged: uid != 0, no CAP_BPF, no passwordless sudo); to run
+  locally needs **root + kernel ≥ 5.15** (`mise run test-bpf`).
+- ❗ **Live runtime still unverified** — only `BPF_PROG_TEST_RUN` has run, not an
+  actual attach/redirect on real interfaces.
 - 🚫 **Nothing is committed.** Fresh repo, all files untracked (per user pref:
   commit/branch/push only when explicitly asked). `Cargo.lock` is present & should be committed.
 
@@ -157,19 +160,27 @@ to file stem; `local`/`remote` IPv6; `mss` auto/off/int/{ipv4,ipv6}; optional `m
 
 ## Open risks / TODO for next agent
 
-1. **eBPF verifier UNVALIDATED locally.** Highest priority: run `mise run test-bpf`
-   on a privileged host (or push to CI). Riskiest constructs if it's rejected:
-   `load`/`store` `read_unaligned` of large types (`Ipv6Hdr` 40B, `[u8;32]`,
-   `[u8;20]`) and the bounded variable-offset loops (`skip_ext_headers`,
-   TCP-option scan). The Go original used an `asm volatile` verifier hint in the
-   MSS loop that we don't replicate — watch that path. Fixes would be localized.
+1. ✅ **RESOLVED — eBPF verifier acceptance (CI-confirmed).** First CI load was
+   rejected at `update_tcp_mss` (`invalid access to packet … R0 offset is outside
+   of the packet`): a manual `data + tcp_off + 20 > data_end` check let LLVM
+   prove the subsequent `load`'s own bounds check redundant and elide it, so the
+   recomputed variable-offset pointer reached the verifier unchecked. Fixed by
+   `load_var`/`store_var` (in `main.rs`), which route the offset through
+   `core::hint::black_box` — the safe equivalent of the Go original's `asm
+   volatile` hint — so each variable-offset access keeps its own bounds check.
+   Applied at every packet-derived offset (`skip_ext_headers` ext-header walk,
+   `update_tcp_mss` data-offset/flags + option-scan loop + MSS/checksum, decap
+   EtherIP header). Constant-offset header reads/writes keep plain `load`/`store`.
+   Data-path `BPF_PROG_TEST_RUN` tests now green on both CI runners. If a *new*
+   variable-offset site is added, it must use `load_var`/`store_var`.
 2. **Multi-program-in-one-section** (`xdp_etherip` + `xdp_pass` share SEC `xdp`):
-   aya-obj extracts per function symbol (confirmed from source), but runtime load
-   of both is unconfirmed without root. `bpf.rs::Bpf::load` loads both by name.
-3. **GitHub runners + BPF_PROG_TEST_RUN:** CI runs the data-path tests under sudo
-   on `ubuntu-latest`/`ubuntu-24.04-arm`. Should work (root, recent kernel) but
-   unconfirmed; if the runner blocks BPF, gate/remove that CI step. `ubuntu-24.04-arm`
-   is free only for public repos.
+   aya-obj extracts per function symbol (confirmed from source). The data-path
+   tests load `xdp_etherip` (now CI-green); loading *both* programs together is
+   still only exercised at live attach, unconfirmed. `bpf.rs::Bpf::load` loads
+   both by name.
+3. ✅ **CONFIRMED — GitHub runners run BPF_PROG_TEST_RUN.** The data-path tests
+   pass under sudo on both `ubuntu-latest` and `ubuntu-24.04-arm`. (`ubuntu-24.04-arm`
+   is free only for public repos.)
 4. **External MAC/MTU captured once** at first appearance, not refreshed on link
    change. If the uplink MAC/MTU changes at runtime, running tunnels keep stale
    values until restart. (Offered to fix via the link-change monitor path; not done.)
@@ -186,6 +197,36 @@ to file stem; `local`/`remote` IPv6; `mss` auto/off/int/{ipv4,ipv6}; optional `m
    route/source appears.
 6. **README/plan** describe the design; keep README's `--next-hop-on-link` table
    and config schema in sync if you change them.
+
+## Integration tests (aya-style, added this session)
+
+Live end-to-end tests that run the **real** daemon on two peers and tunnel
+between them — covers the attach/redirect path `BPF_PROG_TEST_RUN` cannot
+(multi-program load, native→SKB attach, DEVMAP redirect over a real wire).
+Driver: `cargo xtask integration-test {local,vm}` (alias in `.cargo/config.toml`).
+
+- **New crates** (workspace `members`, NOT `default-members`, so plain
+  `cargo build`/`test` is unchanged): `xtask/` (orchestrator), `test/dut-distro/`
+  (PID-1 `init` + zstd/dep-aware `modprobe`/`depmod`, ported from aya),
+  `test/integration-test/` (the `--role server|client` scenario binary
+  `etherip-xdp-e2e`).
+- **`local`**: two netns + a veth uplink on the host (root; host kernel). Fast.
+- **`vm`**: two `qemu-system-x86_64` guests joined by a `-netdev stream` UNIX
+  socket (no host net privileges). Kernels 6.5/6.8/7.0 from the Ubuntu **mainline
+  PPA** (`.github/scripts/download_kernel_images.sh`). Guest binaries are static
+  musl; initramfs is a hand-rolled newc cpio (`xtask/src/cpio.rs`) shipping only
+  `veth.ko*` (virtio_net is built-in `=y` in the generic kernel).
+- **Load-bearing gotchas baked into `xtask/src/vm.rs`** (verified via research +
+  adversarial check; don't regress): virtio-net device props **must** disable
+  guest offloads (`guest_csum=off` etc.) or XDP_REDIRECT corrupts frames;
+  `net.ifnames=0` (else NIC is `enp0sN` and `wait_for_external` hangs);
+  `-accel kvm:tcg`; listener-VM-first + version-gated `reconnect`/`reconnect-ms`
+  (≥9.2 uses `-ms`). Initramfs `/bin` holds only the scenario; daemon in `/sbin`.
+- **CI**: `.github/workflows/_integration.yml` (called by `ci.yml`) — `vm` matrix
+  over the 3 kernels on `ubuntu-24.04` + KVM udev rule, and a root `local` job.
+- ✅ Verified locally: all crates build (host + musl), `clippy -D warnings`,
+  `fmt --check`, 9 new unit tests, actionlint — all clean. ❗ **The live VM/netns
+  run is NOT executable in this sandbox** (no root/KVM); first real run is in CI.
 
 ## Environment (this machine)
 

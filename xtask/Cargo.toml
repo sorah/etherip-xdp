@@ -1,0 +1,27 @@
+# Integration-test orchestrator, modelled on aya's `cargo xtask integration-test`.
+#
+#   cargo xtask integration-test local            # 2 netns on the host (root)
+#   cargo xtask integration-test vm <kernel.deb>… # 2 QEMU VMs over -netdev stream
+#
+# It builds the daemon + scenario + dut-distro, (vm) extracts mainline-PPA
+# kernels and packs a cpio initramfs, and drives two peers that tunnel to each
+# other and assert traffic round-trips.
+[package]
+name = "xtask"
+publish = false
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true, features = ["std"] }
+ar = { workspace = true }
+cargo_metadata = { workspace = true }
+clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context"] }
+lzma-rs = { workspace = true }
+ruzstd = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }
