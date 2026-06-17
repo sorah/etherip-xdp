@@ -2,8 +2,11 @@
 # List tasks with `mise tasks`; run with `mise run <task>`.
 
 [tools]
+actionlint = "latest"
 # bpf-linker is required to build the eBPF object (see build.rs / aya-build).
 "cargo:bpf-linker" = "latest"
+pinact = "latest"
+zizmor = "latest"
 
 [tasks.build]
 description = "Build the release binary (also builds the eBPF object)"
