@@ -12,6 +12,7 @@
 mod build;
 mod cpio;
 mod deb;
+mod freebsd;
 mod local;
 mod vm;
 
@@ -37,6 +38,8 @@ enum Environment {
     Local(local::Options),
     /// Run in two QEMU VMs connected by a `-netdev stream` socket.
     Vm(vm::Options),
+    /// Interop test against FreeBSD's native EtherIP (gif) in a QEMU VM.
+    FreebsdInterop(freebsd::Options),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,6 +55,7 @@ fn main() -> anyhow::Result<()> {
         Command::IntegrationTest { env } => match env {
             Environment::Local(opts) => local::run(opts, &workspace_root),
             Environment::Vm(opts) => vm::run(opts, &workspace_root),
+            Environment::FreebsdInterop(opts) => freebsd::run(opts, &workspace_root),
         },
     }
 }

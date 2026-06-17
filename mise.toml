@@ -35,6 +35,13 @@ cargo xtask integration-test vm tmp/integration/kernels/*.deb
 description = "Run the 2-netns integration test on the host (needs root via sudo)"
 run = 'sudo -E env "PATH=$PATH" "$(command -v cargo)" xtask integration-test local'
 
+[tasks.integration-freebsd]
+description = "FreeBSD native-EtherIP interop test (downloads kernel 6.8 + FreeBSD VM image)"
+run = '''
+.github/scripts/download_kernel_images.sh tmp/integration/kernels 6.8
+cargo xtask integration-test freebsd-interop tmp/integration/kernels/*6.8*.deb
+'''
+
 [tasks.fmt]
 description = "Format the workspace"
 run = "cargo fmt"

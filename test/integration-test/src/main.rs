@@ -23,6 +23,19 @@ enum Role {
     Client,
 }
 
+/// What to do for the TCP phase of the test.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum TcpMode {
+    /// Full echo exchange (server echoes, client sends + verifies). Used for the
+    /// symmetric Linux↔Linux test.
+    Echo,
+    /// Connect-only (client connects then closes; server accepts then closes).
+    /// Used for interop against a peer that only `listen`s (e.g. FreeBSD `nc`).
+    Connect,
+    /// Skip the TCP phase entirely (ICMP only).
+    Skip,
+}
+
 #[derive(clap::Parser)]
 #[command(about = "etherip-xdp end-to-end integration scenario")]
 struct Opt {
@@ -76,6 +89,10 @@ struct Opt {
     /// TCP port for the echo exchange.
     #[arg(long, default_value_t = 7878)]
     port: u16,
+
+    /// TCP phase behaviour (echo for Linux↔Linux, connect for interop peers).
+    #[arg(long, value_enum, default_value = "echo")]
+    tcp: TcpMode,
 }
 
 const PAYLOAD: &[u8] = b"etherip-xdp integration payload; the quick brown fox jumps; 0123456789";
@@ -207,14 +224,41 @@ async fn drive_traffic(
         .map_err(|e| anyhow::anyhow!("ping task join: {e}"))??;
     log("ping OK");
 
-    // TCP echo. The server binds its inner address and echoes; the client
-    // connects to the peer's inner address, sends, and verifies the echo.
+    // TCP through the tunnel. Echo mode (Linux↔Linux) verifies a full
+    // round-trip; connect mode (interop) only proves the handshake traverses the
+    // tunnel — enough to exercise the inner-TCP path against a plain listener.
     let addr = std::net::SocketAddrV4::new(inner_ip, opt.port);
     let peer_addr = std::net::SocketAddrV4::new(inner_peer, opt.port);
-    match opt.role {
-        Role::Server => tcp_echo_server(addr).await,
-        Role::Client => tcp_echo_client(peer_addr).await,
+    match (opt.tcp, opt.role) {
+        (TcpMode::Skip, _) => Ok(()),
+        (TcpMode::Echo, Role::Server) => tcp_echo_server(addr).await,
+        (TcpMode::Echo, Role::Client) => tcp_echo_client(peer_addr).await,
+        (TcpMode::Connect, Role::Server) => tcp_accept_once(addr).await,
+        (TcpMode::Connect, Role::Client) => tcp_connect_once(peer_addr).await,
     }
+}
+
+/// Connect to the peer and immediately close — success proves the TCP handshake
+/// (SYN/SYN-ACK) traversed the tunnel in both directions.
+async fn tcp_connect_once(peer: std::net::SocketAddrV4) -> anyhow::Result<()> {
+    log(&format!("TCP client: connecting to {peer}"));
+    let _sock = connect_retry(peer, std::time::Duration::from_secs(30)).await?;
+    log("TCP client: connected");
+    Ok(())
+}
+
+/// Accept one connection then close (peer for connect mode).
+async fn tcp_accept_once(addr: std::net::SocketAddrV4) -> anyhow::Result<()> {
+    log("TCP server: listening (accept-only)");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
+    let (_sock, peer) = listener
+        .accept()
+        .await
+        .map_err(|e| anyhow::anyhow!("accept: {e}"))?;
+    log(&format!("TCP server: accepted {peer}"));
+    Ok(())
 }
 
 async fn tcp_echo_server(addr: std::net::SocketAddrV4) -> anyhow::Result<()> {

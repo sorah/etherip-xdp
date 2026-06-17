@@ -90,3 +90,49 @@ jobs:
       # passed explicitly so rustup/cargo/bpf-linker resolve under sudo.
       - name: Run local (netns) integration test
         run: sudo -E env "PATH=$PATH" "$(command -v cargo)" xtask integration-test local
+
+  freebsd-interop:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: taiki-e/install-action@0631aa6515c7d545823c67cfae7ef4fc7f490154 # v2.81.8
+        with:
+          tool: bpf-linker
+
+      # Cache the FreeBSD VM image (~400 MB) across runs; xtask downloads it on miss.
+      - uses: actions/cache@v5
+        with:
+          path: tmp/integration/freebsd
+          key: freebsd-image-v0.14.0
+
+      - name: Download Linux kernel 6.8
+        run: .github/scripts/download_kernel_images.sh tmp/integration/kernels 6.8
+
+      - name: Run FreeBSD EtherIP interop test
+        run: cargo xtask integration-test freebsd-interop tmp/integration/kernels/*.deb

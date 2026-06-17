@@ -23,7 +23,7 @@ guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,\
 host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Outcome {
+pub(crate) enum Outcome {
     Success,
     Failure,
     /// The guest produced no verdict (panic, kill, or boot failure).
@@ -94,7 +94,7 @@ pub(crate) fn run(opts: Options, _workspace_root: &std::path::Path) -> anyhow::R
 }
 
 /// Group the supplied debs by ABI string into (version, image_deb, modules_deb).
-fn group_kernels(
+pub(crate) fn group_kernels(
     archives: &[std::path::PathBuf],
 ) -> anyhow::Result<Vec<(String, std::path::PathBuf, std::path::PathBuf)>> {
     let mut images: std::collections::BTreeMap<String, std::path::PathBuf> =
@@ -152,7 +152,7 @@ const WANTED_MODULES: &[&str] = &[
 
 /// Pack the initramfs: init + scenario + daemon + modprobe + the kernel modules
 /// needed to bring up the uplink (virtio-net chain) and veth.
-fn build_initramfs(
+pub(crate) fn build_initramfs(
     init: &std::path::Path,
     modprobe: &std::path::Path,
     daemon: &std::path::Path,
@@ -261,10 +261,9 @@ fn run_pair(
     let mut server = spawn_vm(
         vmlinuz,
         initramfs,
-        "server",
         &server_netdev,
         "52:54:00:00:00:01",
-        timeout_secs,
+        &linux_scenario_args("server", timeout_secs),
     )?;
     drain_stderr(&mut server, format!("{label}/A!"));
     let ta = watch(
@@ -282,10 +281,9 @@ fn run_pair(
     let mut client = spawn_vm(
         vmlinuz,
         initramfs,
-        "client",
         &client_netdev,
         "52:54:00:00:00:02",
-        timeout_secs,
+        &linux_scenario_args("client", timeout_secs),
     )?;
     drain_stderr(&mut client, format!("{label}/B!"));
     let tb = watch(
@@ -335,19 +333,32 @@ fn run_pair(
     }
 }
 
-fn spawn_vm(
+/// Scenario `init.arg=` tokens for a Linux peer in the symmetric vm test.
+fn linux_scenario_args(role: &str, timeout_secs: u64) -> Vec<String> {
+    vec![
+        "--role".into(),
+        role.into(),
+        "--load-veth".into(),
+        "--timeout-secs".into(),
+        timeout_secs.to_string(),
+    ]
+}
+
+/// Boot a Linux guest: `netdev`/`mac` wire it to the L2 link, `scenario_args` are
+/// forwarded to the in-guest scenario as `init.arg=` tokens.
+pub(crate) fn spawn_vm(
     vmlinuz: &std::path::Path,
     initramfs: &std::path::Path,
-    role: &str,
     netdev: &str,
     mac: &str,
-    timeout_secs: u64,
+    scenario_args: &[String],
 ) -> anyhow::Result<std::process::Child> {
-    let append = format!(
-        "console=ttyS0 noapic net.ifnames=0 biosdevname=0 panic=-1 init=/init \
-         init.arg=--role init.arg={role} init.arg=--load-veth \
-         init.arg=--timeout-secs init.arg={timeout_secs}"
-    );
+    let mut append =
+        String::from("console=ttyS0 noapic net.ifnames=0 biosdevname=0 panic=-1 init=/init");
+    for arg in scenario_args {
+        append.push_str(" init.arg=");
+        append.push_str(arg);
+    }
     let device = format!("virtio-net-pci,netdev=net0,addr=0x3,mac={mac},{DEVICE_PROPS}");
 
     let mut cmd = std::process::Command::new("qemu-system-x86_64");
@@ -377,7 +388,7 @@ fn spawn_vm(
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
     cmd.spawn()
-        .map_err(|e| anyhow::anyhow!("spawn qemu ({role}): {e}"))
+        .map_err(|e| anyhow::anyhow!("spawn qemu (mac {mac}): {e}"))
 }
 
 fn wait_for_socket(
@@ -403,7 +414,7 @@ fn wait_for_socket(
 
 /// Read a guest's serial console to EOF, echoing each line with `prefix`, and
 /// send the final [`Outcome`] derived from the `init:` verdict line.
-fn watch(
+pub(crate) fn watch(
     stdout: std::process::ChildStdout,
     prefix: String,
     tx: std::sync::mpsc::Sender<(String, Outcome)>,
@@ -433,7 +444,7 @@ fn watch(
     })
 }
 
-fn drain_stderr(child: &mut std::process::Child, prefix: String) {
+pub(crate) fn drain_stderr(child: &mut std::process::Child, prefix: String) {
     if let Some(stderr) = child.stderr.take() {
         std::thread::spawn(move || {
             use std::io::BufRead as _;
@@ -449,7 +460,7 @@ fn drain_stderr(child: &mut std::process::Child, prefix: String) {
 
 /// `reconnect-ms=1000` on QEMU ≥ 9.2 (where `reconnect` is deprecated/removed),
 /// else `reconnect=5`.
-fn reconnect_option() -> anyhow::Result<String> {
+pub(crate) fn reconnect_option() -> anyhow::Result<String> {
     let out = std::process::Command::new("qemu-system-x86_64")
         .arg("--version")
         .output()

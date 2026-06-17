@@ -12,6 +12,7 @@ There are two runners, both driven by `cargo xtask integration-test`:
 |---------|-------------------------------|------------------|-----|
 | `local` | two network namespaces        | root (host)      | fast iteration on the host kernel |
 | `vm`    | two `qemu-system-x86_64` VMs  | qemu (unprivileged) | matrix over kernels 6.5 / 6.8 / 7.0 |
+| `freebsd-interop` | Linux etherip-xdp VM + FreeBSD VM | qemu, ssh (unprivileged) | RFC 3378 interop vs FreeBSD's native `gif` EtherIP |
 
 ## What the test does
 
@@ -61,6 +62,31 @@ version-gated `reconnect`/`reconnect-ms` as a backstop). Each guest's
 mandatory, or XDP_REDIRECT corrupts frames. Each guest boots a tiny initramfs
 (`test-distro` `init` as PID 1) that runs the scenario and prints
 `init: success` / `init: failure`, which `xtask` reads from the serial console.
+
+## FreeBSD interop (`freebsd-interop`)
+
+Proves etherip-xdp speaks RFC 3378 EtherIP on the wire by interoperating with an
+**independent** implementation: FreeBSD's native `if_gif`. One peer is the Linux
+etherip-xdp VM (the existing initramfs, run as a `--tcp connect` client at
+`fd00::1` / inner `10.0.0.1`); the other is a FreeBSD VM whose `gif` EtherIP
+tunnel is bridged to an inner responder at `fd00::2` / `10.0.0.2`. They share the
+same `-netdev stream` L2 link. The Linux side pings and TCP-connects across the
+tunnel and is the verdict source (`init: success`).
+
+The FreeBSD VM is the [cross-platform-actions](https://github.com/cross-platform-actions/action)
+builder image (`freebsd-15.0-x86-64.qcow2`), booted by our own xtask (not the
+GitHub Action), so it runs locally and in CI alike. xtask drives it over SSH on a
+user-net hostfwd port — password auth with the image's empty `runner` password,
+supplied via `SSH_ASKPASS` (no `sshpass` dependency). The gif setup, pushed over
+SSH, has two non-obvious requirements (both learned the hard way and commented in
+`xtask/src/freebsd.rs`):
+
+- `ifconfig gif0 **inet6** tunnel fd00::2 fd00::1` — a bare `tunnel` uses the IPv4
+  ioctl and rejects IPv6 endpoints with "Invalid argument".
+- `gif0` must be a **bridge member before** its tunnel is set, so FreeBSD
+  registers the EtherIP (proto 97) receive demux rather than IP-in-IP (otherwise
+  inbound proto-97 is answered with "ICMP6 parameter problem, unrecognized next
+  header").
 
 ## Crates
 
