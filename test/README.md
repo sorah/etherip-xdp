@@ -60,7 +60,7 @@ the listener first, waits for its socket, then starts the connector (with a
 version-gated `reconnect`/`reconnect-ms` as a backstop). Each guest's
 `virtio-net` NIC is configured with guest offloads off (`guest_csum=off`, …) —
 mandatory, or XDP_REDIRECT corrupts frames. Each guest boots a tiny initramfs
-(`test-distro` `init` as PID 1) that runs the scenario and prints
+(`dut-distro` `init` as PID 1) that runs the scenario and prints
 `init: success` / `init: failure`, which `xtask` reads from the serial console.
 
 ## FreeBSD interop (`freebsd-interop`)
@@ -90,7 +90,7 @@ SSH, has two non-obvious requirements (both learned the hard way and commented i
 
 ## Crates
 
-- `test-distro/` — `init` (PID 1), plus minimal `modprobe` (dependency-aware,
+- `test/dut-distro/` — `init` (PID 1), plus minimal `modprobe` (dependency-aware,
   zstd-capable) and `depmod`. Ported from aya.
 - `test/integration-test/` — the `--role`-based scenario binary (`etherip-xdp-e2e`).
 - `xtask/` — the orchestrator: builds the binaries, extracts kernels, packs the

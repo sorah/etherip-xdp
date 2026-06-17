@@ -42,7 +42,7 @@ pub(crate) fn run(opts: Options, _workspace_root: &std::path::Path) -> anyhow::R
     println!("building harness binaries for x86_64-unknown-linux-musl…");
     let binaries = crate::build::build(
         Some("x86_64-unknown-linux-musl"),
-        &["etherip-xdp", "test-distro", "integration-test"],
+        &["etherip-xdp", "dut-distro", "integration-test"],
     )?;
     let init = crate::build::require(&binaries, "init")?;
     let modprobe = crate::build::require(&binaries, "modprobe")?;

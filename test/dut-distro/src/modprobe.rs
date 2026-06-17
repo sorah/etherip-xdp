@@ -32,7 +32,7 @@ fn main() {
 }
 
 fn try_main(name: &str) -> anyhow::Result<()> {
-    let modules_dir = test_distro::resolve_modules_dir()?;
+    let modules_dir = dut_distro::resolve_modules_dir()?;
     // Index every module by its base name so dependency names resolve to paths.
     let index = build_index(&modules_dir)?;
     let module = resolve_alias(&modules_dir, name)?.unwrap_or_else(|| name.to_string());
@@ -53,7 +53,7 @@ fn build_index(
         let Some(file_name) = entry.file_name().to_str() else {
             continue;
         };
-        if let Some((_, stem)) = test_distro::Compression::classify(file_name) {
+        if let Some((_, stem)) = dut_distro::Compression::classify(file_name) {
             index.insert(stem.to_string(), entry.path().to_path_buf());
         }
     }
@@ -75,7 +75,7 @@ fn load(
         return Ok(());
     };
     let contents =
-        test_distro::read_module(path).map_err(|e| anyhow::anyhow!("read {module}: {e}"))?;
+        dut_distro::read_module(path).map_err(|e| anyhow::anyhow!("read {module}: {e}"))?;
     for dep in
         module_dependencies(&contents).map_err(|e| anyhow::anyhow!("read deps of {module}: {e}"))?
     {

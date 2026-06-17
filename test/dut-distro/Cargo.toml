@@ -1,10 +1,10 @@
-# A minimal "distro" for the VM-based integration tests: a PID-1 `init`, plus
-# naive `modprobe`/`depmod` reimplementations good enough to load the handful of
+# A minimal "distro" for the device-under-test VMs: a PID-1 `init`, plus naive
+# `modprobe`/`depmod` reimplementations good enough to load the handful of
 # modules the tests need. Ported from aya's `test-distro`, with two changes:
 # `modprobe` resolves module dependencies, and both tools understand zstd-
 # compressed (`.ko.zst`) modules (which is what current mainline kernels ship).
 [package]
-name = "test-distro"
+name = "dut-distro"
 publish = false
 version = "0.1.0"
 edition.workspace = true

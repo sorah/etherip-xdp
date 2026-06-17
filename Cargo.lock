@@ -243,6 +243,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dut-distro"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_matches",
+ "clap",
+ "glob",
+ "lzma-rs",
+ "nix 0.31.3",
+ "object 0.36.7",
+ "ruzstd",
+ "walkdir",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -930,21 +945,6 @@ dependencies = [
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "test-distro"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "assert_matches",
- "clap",
- "glob",
- "lzma-rs",
- "nix 0.31.3",
- "object 0.36.7",
- "ruzstd",
- "walkdir",
 ]
 
 [[package]]

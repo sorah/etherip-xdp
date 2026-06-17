@@ -1,4 +1,4 @@
-//! Shared helpers for the test-distro binaries (`init`, `modprobe`, `depmod`).
+//! Shared helpers for the dut-distro binaries (`init`, `modprobe`, `depmod`).
 //!
 //! Ported from aya's `test-distro`. The notable addition over the original is
 //! [`read_module`], which transparently decompresses `.ko`, `.ko.xz` and

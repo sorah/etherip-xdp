@@ -8,7 +8,7 @@ members = [
     # so they are deliberately kept out of `default-members`: a plain
     # `cargo build` / `cargo test` builds only the daemon + common crate.
     "xtask",
-    "test-distro",
+    "test/dut-distro",
     "test/integration-test",
 ]
 default-members = ["etherip-xdp", "etherip-xdp-common"]

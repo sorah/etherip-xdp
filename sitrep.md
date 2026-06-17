@@ -206,7 +206,7 @@ between them — covers the attach/redirect path `BPF_PROG_TEST_RUN` cannot
 Driver: `cargo xtask integration-test {local,vm}` (alias in `.cargo/config.toml`).
 
 - **New crates** (workspace `members`, NOT `default-members`, so plain
-  `cargo build`/`test` is unchanged): `xtask/` (orchestrator), `test-distro/`
+  `cargo build`/`test` is unchanged): `xtask/` (orchestrator), `test/dut-distro/`
   (PID-1 `init` + zstd/dep-aware `modprobe`/`depmod`, ported from aya),
   `test/integration-test/` (the `--role server|client` scenario binary
   `etherip-xdp-e2e`).

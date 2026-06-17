@@ -3,7 +3,7 @@
 #   cargo xtask integration-test local            # 2 netns on the host (root)
 #   cargo xtask integration-test vm <kernel.deb>… # 2 QEMU VMs over -netdev stream
 #
-# It builds the daemon + scenario + test-distro, (vm) extracts mainline-PPA
+# It builds the daemon + scenario + dut-distro, (vm) extracts mainline-PPA
 # kernels and packs a cpio initramfs, and drives two peers that tunnel to each
 # other and assert traffic round-trips.
 [package]

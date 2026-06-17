@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
     let args = <Args as clap::Parser>::parse();
     let modules_dir: std::borrow::Cow<'_, std::path::Path> = match args.base_dir {
         Some(d) => d.into(),
-        None => test_distro::resolve_modules_dir()?,
+        None => dut_distro::resolve_modules_dir()?,
     };
 
     let alias_path = modules_dir.join("modules.alias");
@@ -36,10 +36,10 @@ fn main() -> anyhow::Result<()> {
         let Some(file_name) = entry.file_name().to_str() else {
             continue;
         };
-        let Some((_, module)) = test_distro::Compression::classify(file_name) else {
+        let Some((_, module)) = dut_distro::Compression::classify(file_name) else {
             continue;
         };
-        let contents = test_distro::read_module(entry.path())
+        let contents = dut_distro::read_module(entry.path())
             .map_err(|e| anyhow::anyhow!("read {}: {e}", entry.path().display()))?;
         write_aliases(&contents, module, &mut out)
             .map_err(|e| anyhow::anyhow!("aliases from {}: {e}", entry.path().display()))?;
