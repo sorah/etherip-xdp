@@ -21,3 +21,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/_test.yml
+
+  integration:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_integration.yml

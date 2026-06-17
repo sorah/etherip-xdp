@@ -4,6 +4,12 @@ members = [
     "etherip-xdp",
     "etherip-xdp-common",
     "etherip-xdp-ebpf",
+    # Integration-test harness (aya-style). Built explicitly by `cargo xtask`,
+    # so they are deliberately kept out of `default-members`: a plain
+    # `cargo build` / `cargo test` builds only the daemon + common crate.
+    "xtask",
+    "test-distro",
+    "test/integration-test",
 ]
 default-members = ["etherip-xdp", "etherip-xdp-common"]
 
@@ -42,6 +48,19 @@ rtnetlink = "0.21"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 nix = { version = "0.31", default-features = false, features = ["ioctl", "net", "resource", "socket"] }
 etherparse = "0.20"
+
+# Integration-test harness dependencies. Module/.deb decompression uses
+# pure-Rust codecs (no C) so the guest binaries link cleanly as static musl.
+ar = "0.9"
+tar = "0.4"
+ruzstd = "0.7"
+lzma-rs = "0.3"
+socket2 = { version = "0.5", features = ["all"] }
+walkdir = "2"
+tempfile = "3"
+glob = "0.3"
+object = { version = "0.36", default-features = false, features = ["elf", "read_core", "std"] }
+assert_matches = "1.5"
 
 [profile.release.package.etherip-xdp-ebpf]
 debug = 2

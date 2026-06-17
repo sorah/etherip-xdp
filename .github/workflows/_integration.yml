@@ -1,0 +1,92 @@
+name: integration
+
+# Reusable workflow: end-to-end integration tests.
+#
+# `vm` boots two qemu-system-x86_64 guests joined by a -netdev stream socket
+# (no host networking privileges) and tunnels between them, once per mainline
+# kernel. `local` does the same on the host using two network namespaces.
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: {}
+
+jobs:
+  vm:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mainline kernels exercised in the VM (qemu-system-x86_64).
+        kernel:
+          - "6.5"
+          - "6.8"
+          - "7.0"
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # Expose /dev/kvm to the runner user so qemu uses KVM (else it falls back
+      # to slow TCG). See the GitHub hardware-acceleration changelog.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86
+
+      # nightly + rust-src for aya-build's eBPF `-Z build-std`; the guest
+      # binaries are static musl.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: taiki-e/install-action@0631aa6515c7d545823c67cfae7ef4fc7f490154 # v2.81.8
+        with:
+          tool: bpf-linker
+
+      - name: Download kernel ${{ matrix.kernel }}
+        run: .github/scripts/download_kernel_images.sh tmp/integration/kernels ${{ matrix.kernel }}
+
+      - name: Run VM integration test (kernel ${{ matrix.kernel }})
+        run: cargo xtask integration-test vm tmp/integration/kernels/*.deb
+
+  local:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - uses: taiki-e/install-action@0631aa6515c7d545823c67cfae7ef4fc7f490154 # v2.81.8
+        with:
+          tool: bpf-linker
+
+      # The netns setup needs CAP_NET_ADMIN; -E keeps HOME/CARGO and the PATH is
+      # passed explicitly so rustup/cargo/bpf-linker resolve under sudo.
+      - name: Run local (netns) integration test
+        run: sudo -E env "PATH=$PATH" "$(command -v cargo)" xtask integration-test local

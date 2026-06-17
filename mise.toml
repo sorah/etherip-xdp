@@ -24,6 +24,17 @@ sudo -E "$(ls -t target/debug/deps/data_path-* | grep -vE '\.(d|so)$' | head -1)
 description = "Clippy (must pass before commit)"
 run = "cargo clippy --all-targets --workspace --exclude etherip-xdp-ebpf -- -D warnings"
 
+[tasks.integration-vm]
+description = "Download mainline kernels (6.5/6.8/7.0) and run the 2-VM integration test"
+run = '''
+.github/scripts/download_kernel_images.sh tmp/integration/kernels 6.5 6.8 7.0
+cargo xtask integration-test vm tmp/integration/kernels/*.deb
+'''
+
+[tasks.integration-local]
+description = "Run the 2-netns integration test on the host (needs root via sudo)"
+run = 'sudo -E env "PATH=$PATH" "$(command -v cargo)" xtask integration-test local'
+
 [tasks.fmt]
 description = "Format the workspace"
 run = "cargo fmt"

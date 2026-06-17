@@ -180,6 +180,19 @@ mise run test-bpf   # byte-exact data-path tests via BPF_PROG_TEST_RUN (root, ke
 The data-path tests drive the XDP program with `BPF_PROG_TEST_RUN` and assert the
 exact encap/decap output and action, mirroring the upstream Go test suite.
 
+### Integration tests
+
+End-to-end tests run the **real** daemon on two peers and tunnel between them,
+covering the live attach/redirect path that `BPF_PROG_TEST_RUN` cannot:
+
+```shell
+mise run integration-local   # two network namespaces on the host (root)
+mise run integration-vm      # two qemu-system-x86_64 VMs (kernels 6.5/6.8/7.0)
+```
+
+The VM runner joins the two guests with a QEMU `-netdev stream` socket, so no
+privileged host networking is required. See [`test/README.md`](test/README.md).
+
 ## License
 
 With the exception of eBPF code, etherip-xdp is distributed under the terms of

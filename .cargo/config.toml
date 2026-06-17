@@ -7,3 +7,7 @@
 #
 # A blanket `runner = "sudo -E"` is intentionally NOT set here: it would force
 # every host unit-test binary to run under sudo too, breaking `cargo test`.
+
+# `cargo xtask …` runs the integration-test orchestrator (xtask crate).
+[alias]
+xtask = "run --package xtask --release --"
