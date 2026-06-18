@@ -1,0 +1,70 @@
+name: deb
+
+# Reusable workflow: build the cargo-deb package natively per arch and upload
+# each .deb as a workflow artifact (deb-amd64 / deb-arm64).
+#
+# Used by CI on main (downloadable nightly packages) and by the release workflow
+# (which downloads these artifacts, attests them, and publishes a release). No
+# rust-cache: the package is built clean (reproducibility, and the same path is
+# reused for releases built from a privileged tag event).
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: {}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest # linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm # linux/aarch64
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # nightly + rust-src for aya-build's eBPF `-Z build-std` (build.rs invokes
+      # `rustup run nightly cargo ...`); stable is the userspace default. Pinned
+      # by hash, so the toolchain must be named explicitly (the ref no longer
+      # selects it).
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      - uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: bpf-linker,cargo-deb
+
+      # cargo-deb runs `cargo build --release -p etherip-xdp` (building the eBPF
+      # object via build.rs) and packages it natively for this runner's arch.
+      - name: Build .deb
+        id: deb
+        run: |
+          set -euxo pipefail
+          # cargo-deb writes to target/debian/ and prints the package path on
+          # the last line of stdout.
+          deb=$(cargo deb -p etherip-xdp | tail -n1)
+          echo "path=${deb}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deb-${{ matrix.arch }}
+          path: ${{ steps.deb.outputs.path }}
+          if-no-files-found: error
