@@ -5,7 +5,8 @@ name: release
 # Triggered by pushing a `rel/YYYY.MM.DD` tag. The unit/data-path tests
 # (_test.yml), the VM/netns/FreeBSD integration tests (_integration.yml), and the
 # cargo-deb build (_deb.yml) run as reusable workflows in parallel; the release
-# is only attested and published once all of them pass.
+# is only attested and a draft published once all of them pass. A human reviews
+# and finalizes (publishes) the draft.
 on:
   push:
     tags:
@@ -61,4 +62,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
+            --draft \
             dist/*.deb
