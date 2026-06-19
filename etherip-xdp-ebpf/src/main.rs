@@ -314,7 +314,14 @@ fn build_outer_headers(
     flow_hash: u32,
 ) -> Result<(), ()> {
     let eip_off = ETH_HDR_LEN + IPV6_HDR_LEN;
-    let payload_len = (ctx.data_end() - (ctx.data() + eip_off)) as u16; // EtherIP + inner
+    // Outer IPv6 payload length = EtherIP + inner frame = total length minus the
+    // outer Ethernet+IPv6 headers. Computing this as `data_end - (data + eip_off)`
+    // is a packet-pointer subtraction the verifier rejects on newer kernels
+    // ("R2 pointer -= pointer prohibited", seen on 6.x/7.0); the buff-len helper
+    // returns the total length as a scalar instead.
+    // SAFETY: eBPF helper; `ctx.ctx` is the valid `xdp_md` pointer aya provides.
+    let total_len = unsafe { aya_ebpf::helpers::bpf_xdp_get_buff_len(ctx.ctx) } as usize;
+    let payload_len = total_len.saturating_sub(eip_off) as u16; // EtherIP + inner
     let ip6 = headers::Ipv6Hdr {
         vtf: [
             0x60, // version 6, traffic class 0
