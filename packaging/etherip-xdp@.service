@@ -23,8 +23,11 @@ RestartSec=2
 
 # Loading/attaching XDP, managing veth/neighbours, and ethtool need these.
 # On kernels < 5.8, CAP_BPF does not exist; replace it with CAP_SYS_ADMIN.
-AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_SYS_RESOURCE CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_SYS_RESOURCE CAP_NET_RAW
+# CAP_PERFMON sets allow_ptr_leaks so the verifier accepts the data-path's
+# variable packet-offset arithmetic; without it newer kernels (6.x/7.0) reject
+# the load with "pointer arithmetic ... prohibited for !root".
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
