@@ -46,7 +46,7 @@ serde_json = "1"
 # (rtnetlink::packet_route / packet_core) to guarantee a single matching version.
 rtnetlink = "0.21"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-nix = { version = "0.31", default-features = false, features = ["ioctl", "net", "resource", "socket"] }
+nix = { version = "0.31", default-features = false, features = ["ioctl", "net", "resource", "sched", "socket"] }
 etherparse = "0.20"
 
 # Integration-test harness dependencies. Module/.deb decompression uses

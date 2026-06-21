@@ -81,10 +81,10 @@ fn load_and_setup() -> aya::Ebpf {
     )))
     .expect("load ebpf object");
 
-    {
-        let prog: &mut aya::programs::Xdp =
-            ebpf.program_mut("xdp_etherip").unwrap().try_into().unwrap();
-        prog.load().expect("verifier-load xdp_etherip");
+    for name in ["xdp_encap", "xdp_decap"] {
+        let prog: &mut aya::programs::Xdp = ebpf.program_mut(name).unwrap().try_into().unwrap();
+        prog.load()
+            .unwrap_or_else(|e| panic!("verifier-load {name}: {e}"));
     }
 
     let cfg = test_config();
@@ -107,15 +107,24 @@ fn load_and_setup() -> aya::Ebpf {
     }
     {
         let mut d: aya::maps::xdp::DevMapHash<_> =
-            aya::maps::xdp::DevMapHash::try_from(ebpf.map_mut("REDIRECT_DEV").unwrap()).unwrap();
+            aya::maps::xdp::DevMapHash::try_from(ebpf.map_mut("REDIRECT_UPLINK").unwrap()).unwrap();
         d.insert(EXTERNAL_IFINDEX, EXTERNAL_IFINDEX, None, 0)
             .unwrap();
+    }
+    {
+        let mut d: aya::maps::xdp::DevMapHash<_> =
+            aya::maps::xdp::DevMapHash::try_from(ebpf.map_mut("REDIRECT_PEER").unwrap()).unwrap();
         d.insert(PEER_IFINDEX, PEER_IFINDEX, None, 0).unwrap();
     }
     ebpf
 }
 
-fn run(ebpf: &mut aya::Ebpf, input: &[u8], ingress_ifindex: u32) -> (u32, Vec<u8>) {
+fn run(
+    ebpf: &mut aya::Ebpf,
+    prog_name: &str,
+    input: &[u8],
+    ingress_ifindex: u32,
+) -> (u32, Vec<u8>) {
     use aya::programs::TestRun as _;
     let md = XdpMd {
         data: 0,
@@ -127,8 +136,7 @@ fn run(ebpf: &mut aya::Ebpf, input: &[u8], ingress_ifindex: u32) -> (u32, Vec<u8
     };
     let mut data_out = vec![0u8; input.len() + 256];
     let mut ctx_out = vec![0u8; std::mem::size_of::<XdpMd>()];
-    let prog: &mut aya::programs::Xdp =
-        ebpf.program_mut("xdp_etherip").unwrap().try_into().unwrap();
+    let prog: &mut aya::programs::Xdp = ebpf.program_mut(prog_name).unwrap().try_into().unwrap();
     let result = prog
         .test_run(aya::programs::TestRunOptions {
             data_in: Some(input),
@@ -188,7 +196,7 @@ fn encap_ipv4_tcp_syn_is_clamped_and_redirected() {
     let input = ipv4_tcp_syn(1460);
     let expected_inner = ipv4_tcp_syn(MSS_V4); // 1460 clamped to 1404
 
-    let (action, out) = run(&mut ebpf, &input, PEER_IFINDEX);
+    let (action, out) = run(&mut ebpf, "xdp_encap", &input, PEER_IFINDEX);
     assert_eq!(action, 4, "expected XDP_REDIRECT");
 
     let mut expected =
@@ -204,7 +212,7 @@ fn encap_mss_not_raised_when_below_clamp() {
     // An inner MSS already below the clamp must be left untouched.
     let mut ebpf = load_and_setup();
     let input = ipv4_tcp_syn(1000);
-    let (action, out) = run(&mut ebpf, &input, PEER_IFINDEX);
+    let (action, out) = run(&mut ebpf, "xdp_encap", &input, PEER_IFINDEX);
     assert_eq!(action, 4);
     // Inner (offset 56..) is byte-identical to the input.
     assert_eq!(&out[etherip_xdp_common::OUTER_OVERHEAD..], &input[..]);
@@ -235,7 +243,7 @@ fn decap_strips_outer_and_rewrites_inner_dst_mac() {
     // Packet arrives from remote (src) to us (dst=local).
     let input = etherip_wrap(&inner, remote(), local());
 
-    let (action, out) = run(&mut ebpf, &input, EXTERNAL_IFINDEX);
+    let (action, out) = run(&mut ebpf, "xdp_decap", &input, EXTERNAL_IFINDEX);
     assert_eq!(action, 4, "expected XDP_REDIRECT");
 
     let mut expected = inner.clone();
@@ -249,7 +257,7 @@ fn decap_passes_non_etherip() {
     let mut ebpf = load_and_setup();
     // A plain IPv4 frame on the uplink is not EtherIP -> XDP_PASS.
     let input = ipv4_tcp_syn(1460);
-    let (action, _out) = run(&mut ebpf, &input, EXTERNAL_IFINDEX);
+    let (action, _out) = run(&mut ebpf, "xdp_decap", &input, EXTERNAL_IFINDEX);
     assert_eq!(action, 2, "expected XDP_PASS");
 }
 
@@ -261,6 +269,6 @@ fn decap_passes_unknown_tunnel_pair() {
     // Outer source is our own local address, so the (remote, local) pair matches
     // no tunnel (and would also trip the loopback guard): must not be decapsulated.
     let input = etherip_wrap(&inner, local(), local());
-    let (action, _out) = run(&mut ebpf, &input, EXTERNAL_IFINDEX);
+    let (action, _out) = run(&mut ebpf, "xdp_decap", &input, EXTERNAL_IFINDEX);
     assert_eq!(action, 2, "expected XDP_PASS for an unknown tunnel pair");
 }

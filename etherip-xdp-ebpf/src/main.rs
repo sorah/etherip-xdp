@@ -4,10 +4,14 @@
 
 //! XDP EtherIP (RFC 3378) data plane — a Rust port of `src/xdp_prog.c`.
 //!
-//! One program, attached to the uplink (decap ingress, shared by all tunnels on
-//! that NIC) and to every veth peer (encap ingress). It branches on the ingress
-//! ifindex: known veth peer -> encap; otherwise -> decap, demuxed by the outer
-//! IPv6 (source, destination) address pair.
+//! Two entry points: [`xdp_encap`], attached to every veth peer (one per tunnel,
+//! keyed by ingress ifindex), and [`xdp_decap`], attached to the uplink and
+//! shared by all tunnels on that NIC (demuxed by the outer IPv6 (source,
+//! destination) address pair). Keeping the roles in separate programs means the
+//! encap config lookup is never reached on the uplink, so a veth-peer ifindex
+//! (which, when the peer lives in a hidden network namespace, is allocated
+//! independently of the uplink's) can never be mistaken for the uplink's and
+//! misclassify decap traffic as encap.
 //!
 //! # Safety model
 //!
@@ -49,9 +53,18 @@ static DECAP_CONFIG: aya_ebpf::maps::HashMap<
     etherip_xdp_common::TunnelConfig,
 > = aya_ebpf::maps::HashMap::with_max_entries(256, NO_PREALLOC);
 
-/// Redirect targets, keyed by real ifindex (uplink + every veth peer).
+/// Encap redirect target: the shared uplink, keyed by its ifindex. Held separate
+/// from [`REDIRECT_PEER`] so a veth-peer ifindex — which, when the peer lives in a
+/// hidden network namespace, is allocated independently of the uplink's and
+/// routinely takes the same small value — can never collide with the uplink key
+/// and steer encap and decap to the wrong device.
 #[aya_ebpf::macros::map]
-static REDIRECT_DEV: aya_ebpf::maps::DevMapHash =
+static REDIRECT_UPLINK: aya_ebpf::maps::DevMapHash =
+    aya_ebpf::maps::DevMapHash::with_max_entries(1, 0);
+
+/// Decap redirect targets: the veth peers, keyed by ifindex.
+#[aya_ebpf::macros::map]
+static REDIRECT_PEER: aya_ebpf::maps::DevMapHash =
     aya_ebpf::maps::DevMapHash::with_max_entries(512, 0);
 
 /// Per-CPU per-path debug counters (see `etherip_xdp_common::DBG_*`).
@@ -421,7 +434,7 @@ fn handle_encap(
     }
 
     dbg_inc(etherip_xdp_common::DBG_ENCAP_REDIRECT);
-    REDIRECT_DEV
+    REDIRECT_UPLINK
         .redirect(cfg.external_ifindex, 0)
         .unwrap_or(xdp_action::XDP_ABORTED)
 }
@@ -504,13 +517,16 @@ fn handle_decap(ctx: &aya_ebpf::programs::XdpContext) -> u32 {
     }
 
     dbg_inc(etherip_xdp_common::DBG_DECAP_REDIRECT);
-    REDIRECT_DEV
+    REDIRECT_PEER
         .redirect(cfg.internal_ifindex, 0)
         .unwrap_or(xdp_action::XDP_ABORTED)
 }
 
+/// Encap entry, attached to each veth peer. The per-tunnel config is keyed by the
+/// ingress (veth-peer) ifindex; a peer whose tunnel is still pending has no entry
+/// yet, so its frames pass through untouched until a source resolves.
 #[aya_ebpf::macros::xdp]
-pub fn xdp_etherip(ctx: aya_ebpf::programs::XdpContext) -> u32 {
+pub fn xdp_encap(ctx: aya_ebpf::programs::XdpContext) -> u32 {
     dbg_inc(etherip_xdp_common::DBG_MAIN_ENTER);
     let in_if = ctx.ingress_ifindex() as u32;
     // SAFETY: aya's `HashMap::get` is unsafe because it returns a reference into
@@ -522,8 +538,17 @@ pub fn xdp_etherip(ctx: aya_ebpf::programs::XdpContext) -> u32 {
             let cfg = *cfg;
             handle_encap(&ctx, &cfg)
         }
-        None => handle_decap(&ctx),
+        None => xdp_action::XDP_PASS,
     }
+}
+
+/// Decap entry, attached to the shared uplink. Frames are demuxed by the outer
+/// IPv6 (remote, local) address pair inside [`handle_decap`]; the encap config is
+/// never consulted here, so a veth-peer ifindex can never be misread as decap.
+#[aya_ebpf::macros::xdp]
+pub fn xdp_decap(ctx: aya_ebpf::programs::XdpContext) -> u32 {
+    dbg_inc(etherip_xdp_common::DBG_MAIN_ENTER);
+    handle_decap(&ctx)
 }
 
 /// Minimal pass-through attached to the user-facing veth end so the kernel's

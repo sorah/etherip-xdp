@@ -2,9 +2,9 @@
 //!
 //! The [`Manager`] owns the loaded eBPF object, a netlink handle, the external
 //! interface identity, and the set of running tunnels. Each tunnel owns a veth
-//! pair (`<name>` user end, `<name>-xdp` peer) with the main XDP program on the
-//! peer (encap) and `xdp_pass` on the user end; the shared main program on the
-//! uplink handles decap for all tunnels.
+//! pair (`<name>` user end, `<name>-xdp` peer) with `xdp_encap` on the peer and
+//! `xdp_pass` on the user end; the shared `xdp_decap` on the uplink handles decap
+//! for all tunnels.
 
 const IFNAMSIZ: usize = 15;
 const PEER_SUFFIX: &str = "-xdp";
@@ -30,7 +30,7 @@ pub struct RunningTunnel {
     /// encap/decap map entries are deliberately withheld so the data path never
     /// encapsulates with a bogus source.
     effective_src: Option<std::net::Ipv6Addr>,
-    main_link: aya::programs::xdp::XdpLinkId,
+    encap_link: aya::programs::xdp::XdpLinkId,
     pass_link: aya::programs::xdp::XdpLinkId,
 }
 
@@ -94,9 +94,13 @@ pub struct Manager {
     bpf: crate::bpf::Bpf,
     nl: crate::netlink::Netlink,
     external: ExternalInterface,
-    external_main_link: aya::programs::xdp::XdpLinkId,
+    external_decap_link: aya::programs::xdp::XdpLinkId,
     config_dir: std::path::PathBuf,
     on_link: crate::resolver::NextHopOnLink,
+    /// When `Some`, each tunnel's `<name>-xdp` peer is moved into this private
+    /// anonymous namespace to hide it from userland; when `None`, peers stay in
+    /// the host namespace alongside the user-facing ends.
+    netns: Option<crate::netns::NetNs>,
     tunnels: std::collections::HashMap<String, RunningTunnel>,
 }
 
@@ -140,9 +144,19 @@ impl Manager {
         external_name: String,
         config_dir: std::path::PathBuf,
         on_link: crate::resolver::NextHopOnLink,
+        hide_peer: bool,
     ) -> anyhow::Result<Self> {
         let nl = crate::netlink::Netlink::connect()?;
         let mut bpf = crate::bpf::Bpf::load()?;
+
+        let netns = if hide_peer {
+            let ns = crate::netns::NetNs::create()?;
+            log::info!("hiding veth peers in a private anonymous network namespace");
+            Some(ns)
+        } else {
+            log::info!("keeping veth peers in the host namespace (--disable-veth-peer-netns)");
+            None
+        };
 
         // Tolerate starting before the underlay is ready: wait for the uplink to
         // appear instead of crash-looping.
@@ -162,16 +176,17 @@ impl Manager {
         );
 
         // The shared decap program + redirect target for the uplink.
-        bpf.add_redirect(external.index)?;
-        let external_main_link = bpf.attach_main(&external.name)?;
+        bpf.add_uplink_redirect(external.index)?;
+        let external_decap_link = bpf.attach_decap(&external.name)?;
 
         let mut manager = Manager {
             bpf,
             nl,
             external,
-            external_main_link,
+            external_decap_link,
             config_dir,
             on_link,
+            netns,
             tunnels: std::collections::HashMap::new(),
         };
 
@@ -248,6 +263,80 @@ impl Manager {
         }
     }
 
+    /// Bring the freshly-created peer up at `mtu`, attach the encap program, and
+    /// register its decap redirect target. Returns the peer's ifindex (in the
+    /// namespace it ends up in) and the encap link. With hiding enabled the peer
+    /// is first moved into the private namespace and all of this runs there, so
+    /// the attach and the devmap insert — both of which resolve the ifindex
+    /// against the calling namespace — see the peer; otherwise it stays in the
+    /// host namespace.
+    async fn setup_peer(
+        &mut self,
+        peer: &str,
+        mtu: u32,
+    ) -> anyhow::Result<(u32, aya::programs::xdp::XdpLinkId)> {
+        let peer_host_index = self
+            .nl
+            .index_of(peer)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("veth peer {peer} missing after creation"))?;
+
+        match &self.netns {
+            None => {
+                self.nl.set_mtu_up(peer_host_index, mtu).await?;
+                let encap_link = self.bpf.attach_encap(peer)?;
+                self.bpf.add_peer_redirect(peer_host_index)?;
+                Ok((peer_host_index, encap_link))
+            }
+            Some(ns) => {
+                self.nl
+                    .move_link_to_netns(peer_host_index, ns.as_raw_fd())
+                    .await?;
+                let bpf = &mut self.bpf;
+                ns.run_in(|| {
+                    // A current-thread runtime drives netlink inside the namespace;
+                    // the daemon's main runtime stays in the host namespace. The
+                    // peer was reassigned a fresh ifindex by the move, so re-resolve
+                    // it here.
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("build hidden-netns runtime: {e}"))?;
+                    let peer_index = rt.block_on(async {
+                        let nl = crate::netlink::Netlink::connect()?;
+                        let idx = nl.index_of(peer).await?.ok_or_else(|| {
+                            anyhow::anyhow!("veth peer {peer} missing in hidden netns")
+                        })?;
+                        nl.set_mtu_up(idx, mtu).await?;
+                        anyhow::Ok(idx)
+                    })?;
+                    let encap_link = bpf.attach_encap(peer)?;
+                    bpf.add_peer_redirect(peer_index)?;
+                    anyhow::Ok((peer_index, encap_link))
+                })
+            }
+        }
+    }
+
+    /// Set the peer's MTU and keep it up, in the private namespace when hiding is
+    /// enabled (its ifindex is only resolvable there) or the host namespace
+    /// otherwise.
+    async fn set_peer_mtu_up(&self, peer_index: u32, mtu: u32) -> anyhow::Result<()> {
+        match &self.netns {
+            None => self.nl.set_mtu_up(peer_index, mtu).await,
+            Some(ns) => ns.run_in(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("build hidden-netns runtime: {e}"))?;
+                rt.block_on(async {
+                    let nl = crate::netlink::Netlink::connect()?;
+                    nl.set_mtu_up(peer_index, mtu).await
+                })
+            }),
+        }
+    }
+
     /// Create a new tunnel: veth pair, MTU/offload, map population, attach.
     async fn add_tunnel(&mut self, spec: crate::config::TunnelSpec) -> anyhow::Result<()> {
         validate_name(&spec.name)?;
@@ -267,21 +356,24 @@ impl Manager {
             .link_info(&name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("veth {name} missing after creation"))?;
-        let peer_index = self
-            .nl
-            .index_of(&peer)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("veth peer {peer} missing after creation"))?;
-
         let mtu = tunnel_mtu as u32;
         self.nl.set_mtu_up(user.index, mtu).await?;
-        self.nl.set_mtu_up(peer_index, mtu).await?;
         // disable_tx_offload does blocking socket/ioctl syscalls; offload it from
-        // the async runtime.
+        // the async runtime. The user-facing end stays in the host namespace, so
+        // this is unaffected by peer hiding.
         let offload_name = name.clone();
         tokio::task::spawn_blocking(move || crate::offload::disable_tx_offload(&offload_name))
             .await
             .map_err(|e| anyhow::anyhow!("tx-offload task failed to join: {e}"))??;
+
+        // Bring the peer up, attach encap, and register its decap redirect target.
+        // Attach/redirect are registered unconditionally; the encap/decap map
+        // entries (below) are what gate the data path, so a pending tunnel is
+        // attached but inert. When hiding the peer, all three run inside the
+        // private namespace: moving the link reassigns its ifindex there and
+        // resets it to down, and both the XDP attach and the devmap insert resolve
+        // the ifindex against the calling namespace.
+        let (peer_index, encap_link) = self.setup_peer(&peer, mtu).await?;
 
         self.warn_if_src_unassigned(&spec).await;
         let resolved = match crate::resolver::resolve_endpoint(
@@ -303,11 +395,8 @@ impl Manager {
         };
         let dst_mac = resolved.dst_mac.unwrap_or([0u8; 6]);
 
-        // Attach the programs and register the redirect target unconditionally;
-        // the encap/decap map entries (below) are what actually gate the data
-        // path, so a pending tunnel is attached but inert.
-        self.bpf.add_redirect(peer_index)?;
-        let main_link = self.bpf.attach_main(&peer)?;
+        // The user-facing end stays in the host namespace; its pass-through attach
+        // satisfies the kernel's `veth_xdp_xmit` peer check for redirected frames.
         let pass_link = self.bpf.attach_pass(&name)?;
 
         // Without a source address (auto-select found no route yet) the tunnel is
@@ -365,7 +454,7 @@ impl Manager {
                 config,
                 decap_key,
                 effective_src,
-                main_link,
+                encap_link,
                 pass_link,
             },
         );
@@ -377,15 +466,18 @@ impl Manager {
         let Some(t) = self.tunnels.remove(name) else {
             return Ok(());
         };
-        if let Err(e) = self.bpf.detach_main(t.main_link) {
-            log::warn!("tunnel {name}: detach main: {e:#}");
+        if let Err(e) = self.bpf.detach_encap(t.encap_link) {
+            log::warn!("tunnel {name}: detach encap: {e:#}");
         }
         if let Err(e) = self.bpf.detach_pass(t.pass_link) {
             log::warn!("tunnel {name}: detach pass: {e:#}");
         }
         self.bpf.remove_encap(t.peer_index).ok();
         self.bpf.remove_decap(&t.decap_key).ok();
-        self.bpf.remove_redirect(t.peer_index).ok();
+        self.bpf.remove_peer_redirect(t.peer_index).ok();
+        // Deleting the user-facing end removes the whole veth pair, including the
+        // peer in the private namespace; the namespace itself outlives it for the
+        // next tunnel and is torn down only when the daemon exits.
         self.nl.delete_link(name).await?;
         log::info!("tunnel {name} removed");
         Ok(())
@@ -420,7 +512,7 @@ impl Manager {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("veth {name} vanished"))?;
             self.nl.set_mtu_up(user_index, tunnel_mtu as u32).await?;
-            self.nl.set_mtu_up(peer_index, tunnel_mtu as u32).await?;
+            self.set_peer_mtu_up(peer_index, tunnel_mtu as u32).await?;
         }
 
         self.warn_if_src_unassigned(&spec).await;
@@ -675,10 +767,12 @@ impl Manager {
                 log::error!("cleanup: remove {name}: {e:#}");
             }
         }
-        if let Err(e) = self.bpf.detach_main(self.external_main_link) {
+        if let Err(e) = self.bpf.detach_decap(self.external_decap_link) {
             log::warn!("cleanup: detach uplink program: {e:#}");
         }
-        self.bpf.remove_redirect(self.external.index).ok();
+        self.bpf.remove_uplink_redirect(self.external.index).ok();
+        // Dropping `self` closes the namespace descriptor, destroying the private
+        // namespace and any peers that survived individual teardown.
     }
 }
 

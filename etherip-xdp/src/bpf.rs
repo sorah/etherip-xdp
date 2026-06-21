@@ -1,16 +1,18 @@
 //! Loads the eBPF object and wraps program attach/detach and map updates.
 //!
-//! The same `xdp_etherip` program is attached to the uplink (decap) and to each
-//! veth peer (encap); `xdp_pass` is attached to each user-facing veth end. Maps
-//! are shared across all attaches of a loaded object, so config reload is just
-//! `insert`/`remove` on the typed map handles.
+//! `xdp_decap` is attached to the uplink, `xdp_encap` to each veth peer, and
+//! `xdp_pass` to each user-facing veth end. Maps are shared across all attaches
+//! of a loaded object, so config reload is just `insert`/`remove` on the typed
+//! map handles.
 
-const MAIN_PROG: &str = "xdp_etherip";
+const ENCAP_PROG: &str = "xdp_encap";
+const DECAP_PROG: &str = "xdp_decap";
 const PASS_PROG: &str = "xdp_pass";
 
 const ENCAP_CONFIG: &str = "ENCAP_CONFIG";
 const DECAP_CONFIG: &str = "DECAP_CONFIG";
-const REDIRECT_DEV: &str = "REDIRECT_DEV";
+const REDIRECT_UPLINK: &str = "REDIRECT_UPLINK";
+const REDIRECT_PEER: &str = "REDIRECT_PEER";
 const DEBUG_COUNTERS: &str = "DEBUG_COUNTERS";
 
 pub struct Bpf {
@@ -24,7 +26,7 @@ impl Bpf {
             env!("OUT_DIR"),
             "/etherip-xdp"
         )))?;
-        for name in [MAIN_PROG, PASS_PROG] {
+        for name in [ENCAP_PROG, DECAP_PROG, PASS_PROG] {
             let prog: &mut aya::programs::Xdp = ebpf
                 .program_mut(name)
                 .ok_or_else(|| anyhow::anyhow!("program {name} not found in object"))?
@@ -76,9 +78,14 @@ impl Bpf {
             .map_err(|e| anyhow::anyhow!("detach {prog}: {e}"))
     }
 
-    /// Attach the main program to an interface (uplink or veth peer).
-    pub fn attach_main(&mut self, ifname: &str) -> anyhow::Result<aya::programs::xdp::XdpLinkId> {
-        self.attach(MAIN_PROG, ifname)
+    /// Attach the encap program to a veth peer.
+    pub fn attach_encap(&mut self, ifname: &str) -> anyhow::Result<aya::programs::xdp::XdpLinkId> {
+        self.attach(ENCAP_PROG, ifname)
+    }
+
+    /// Attach the decap program to the uplink.
+    pub fn attach_decap(&mut self, ifname: &str) -> anyhow::Result<aya::programs::xdp::XdpLinkId> {
+        self.attach(DECAP_PROG, ifname)
     }
 
     /// Attach the pass-through program to a user-facing veth end.
@@ -86,8 +93,12 @@ impl Bpf {
         self.attach(PASS_PROG, ifname)
     }
 
-    pub fn detach_main(&mut self, id: aya::programs::xdp::XdpLinkId) -> anyhow::Result<()> {
-        self.detach(MAIN_PROG, id)
+    pub fn detach_encap(&mut self, id: aya::programs::xdp::XdpLinkId) -> anyhow::Result<()> {
+        self.detach(ENCAP_PROG, id)
+    }
+
+    pub fn detach_decap(&mut self, id: aya::programs::xdp::XdpLinkId) -> anyhow::Result<()> {
+        self.detach(DECAP_PROG, id)
     }
 
     pub fn detach_pass(&mut self, id: aya::programs::xdp::XdpLinkId) -> anyhow::Result<()> {
@@ -155,25 +166,46 @@ impl Bpf {
         Ok(())
     }
 
-    /// Add an ifindex to the redirect devmap (target == key).
-    pub fn add_redirect(&mut self, ifindex: u32) -> anyhow::Result<()> {
+    fn devmap_insert(&mut self, name: &str, ifindex: u32) -> anyhow::Result<()> {
         let map = self
             .ebpf
-            .map_mut(REDIRECT_DEV)
-            .ok_or_else(|| anyhow::anyhow!("map {REDIRECT_DEV} missing"))?;
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("map {name} missing"))?;
         let mut map: aya::maps::xdp::DevMapHash<_> = aya::maps::xdp::DevMapHash::try_from(map)?;
         map.insert(ifindex, ifindex, None, 0)?;
         Ok(())
     }
 
-    pub fn remove_redirect(&mut self, ifindex: u32) -> anyhow::Result<()> {
+    fn devmap_remove(&mut self, name: &str, ifindex: u32) -> anyhow::Result<()> {
         let map = self
             .ebpf
-            .map_mut(REDIRECT_DEV)
-            .ok_or_else(|| anyhow::anyhow!("map {REDIRECT_DEV} missing"))?;
+            .map_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("map {name} missing"))?;
         let mut map: aya::maps::xdp::DevMapHash<_> = aya::maps::xdp::DevMapHash::try_from(map)?;
         map.remove(ifindex)?;
         Ok(())
+    }
+
+    /// Register the uplink as the encap redirect target. The insert resolves the
+    /// ifindex against the calling process's namespace, so it must run from the
+    /// host namespace where the uplink lives.
+    pub fn add_uplink_redirect(&mut self, ifindex: u32) -> anyhow::Result<()> {
+        self.devmap_insert(REDIRECT_UPLINK, ifindex)
+    }
+
+    pub fn remove_uplink_redirect(&mut self, ifindex: u32) -> anyhow::Result<()> {
+        self.devmap_remove(REDIRECT_UPLINK, ifindex)
+    }
+
+    /// Register a veth peer as a decap redirect target. The insert resolves the
+    /// ifindex against the calling process's namespace, so when the peer lives in
+    /// a hidden namespace this must run from inside it.
+    pub fn add_peer_redirect(&mut self, ifindex: u32) -> anyhow::Result<()> {
+        self.devmap_insert(REDIRECT_PEER, ifindex)
+    }
+
+    pub fn remove_peer_redirect(&mut self, ifindex: u32) -> anyhow::Result<()> {
+        self.devmap_remove(REDIRECT_PEER, ifindex)
     }
 
     /// Read and sum the per-CPU debug counters.
