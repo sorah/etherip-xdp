@@ -50,9 +50,8 @@ assets = [
 # Templated unit (etherip-xdp@.service): no default instance, and enable/start =
 # false, so cargo-deb writes no maintainer scripts (the unit is just placed on
 # disk). Enable per uplink with e.g. `systemctl enable --now etherip-xdp@eth1`;
-# for the varlink management interface also
-# `systemctl enable --now etherip-xdp-varlink@eth1.socket` and
-# `systemctl enable --now etherip-xdp-manager.socket`.
+# it pulls in the per-uplink control socket and the host-wide manager socket
+# (for etheripctl) via Wants=, so no separate socket enable is needed.
 [package.metadata.deb.systemd-units]
 unit-name = "etherip-xdp"
 unit-scripts = "../packaging"

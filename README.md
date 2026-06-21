@@ -100,13 +100,8 @@ sudo ip addr add 192.0.2.1/24 dev peer
 sudo ip link set peer up
 ```
 
-To inspect tunnels with `etheripctl` (next step), also enable the management
-socket and the host-wide manager once:
-
-```shell
-sudo systemctl enable --now etherip-xdp-varlink@eth1.socket
-sudo systemctl enable --now etherip-xdp-manager.socket
-```
+Enabling the instance also pulls in its control socket and the host-wide manager
+socket, so `etheripctl` (next step) works without any extra setup.
 
 ### 4. Check it
 
@@ -174,10 +169,10 @@ etheripctl -i eth1          # limit to one uplink
 etheripctl show <tunnel>    # full detail for one tunnel (alias: status)
 ```
 
-It needs the `etherip-xdp-manager.socket` (and each uplink's
-`etherip-xdp-varlink@<uplink>.socket`) enabled. Run it as root or as a member of
-the `etherip-xdp-sock` group; it tells you precisely which is missing if a
-connection fails. The interface is [varlink](https://varlink.org/), so
+The manager and control sockets it needs are pulled in by each
+`etherip-xdp@<uplink>` instance, so no separate enable step is required. Run it
+as root or as a member of the `etherip-xdp-sock` group; it tells you precisely
+what is wrong if a connection fails. The interface is [varlink](https://varlink.org/), so
 `varlinkctl call /run/etherip-xdp/co.0w0.etheripxdp.Management.List` works too.
 
 ## Reload behaviour

@@ -1,7 +1,8 @@
 # One instance per uplink interface:
 #   sudo systemctl enable --now etherip-xdp@eth1
 #   sudo systemctl reload etherip-xdp@eth1   # graceful config reload (SIGHUP)
-# For etheripctl / the host-wide manager: systemctl enable --now etherip-xdp-manager.socket
+# Enabling an instance also pulls in the per-uplink control socket and the
+# host-wide manager socket, so etheripctl works without extra steps.
 [Unit]
 Description=XDP EtherIP tunnels on %i
 Documentation=https://github.com/sorah/etherip-xdp
@@ -11,6 +12,8 @@ BindsTo=sys-subsystem-net-devices-%i.device
 # Pull in & order after the control socket; its fd is adopted via Sockets=.
 Wants=etherip-xdp-varlink@%i.socket
 After=etherip-xdp-varlink@%i.socket
+# Pull in the host-wide manager socket so etheripctl works out of the box.
+Wants=etherip-xdp-manager.socket
 
 [Service]
 Type=simple
