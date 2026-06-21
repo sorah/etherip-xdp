@@ -52,7 +52,8 @@ pub struct TunnelConfig {
     pub internal_ifindex: u32,
     /// External (uplink) ifindex — encap redirect target.
     pub external_ifindex: u32,
-    /// User-facing tunnel interface MAC — written as inner dst MAC on decap.
+    /// User-facing tunnel interface MAC (applied to the interface via netlink).
+    /// The loader's record of the current address; not read by the data path.
     pub tunnel_mac: [u8; 6],
     /// Uplink MAC — written as outer src MAC on encap.
     pub external_mac: [u8; 6],
