@@ -1,71 +1,242 @@
 # etherip-xdp
 
-XDP-accelerated **EtherIP (RFC 3378) over IPv6** tunnels, written in Rust with
-[aya](https://aya-rs.dev/). Ethernet frames are encapsulated in
-`outer-Ethernet + IPv6 + EtherIP` and moved between a physical uplink and a veth
-pair entirely in XDP, with DEVMAP redirect on both directions.
+XDP-accelerated **EtherIP (RFC 3378) over IPv6** tunnels. A transparent
+Layer-2 tunnel that forwards entirely in the kernel fast path, **designed for
+production: built to be configured, observed, and changed by an operator on a
+live host without dropping traffic.**
 
-This is a Rust port of [amaumene/xdp-etherip](https://github.com/amaumene/xdp-etherip)
-(itself a fork of [x86taka/xdp-etherip](https://github.com/x86taka/xdp-etherip)),
-with several enhancements:
+Each tunnel appears on the host as a plain Ethernet interface: give it an IP to
+use as an endpoint, or enslave it to a bridge to stretch an L2 segment across
+the network. Frames are encapsulated in `IPv6 + EtherIP` and moved between your
+physical uplink and the tunnel interface by an XDP program, never touching the
+normal network stack on the way through, so it stays fast even at high packet
+rates.
 
-- **Multiple tunnels per uplink** — many EtherIP tunnels share one physical
-  interface, demultiplexed in eBPF by ingress ifindex (encap) and outer IPv6
-  address pair (decap).
-- **Continuous next-hop tracking** — the next-hop MAC is re-resolved on netlink
-  neighbour/route changes (plus a periodic safety sweep), honouring policy
-  routing and source-address selection. An active ND probe is sent if the
-  neighbour entry is missing, so no manual "ping the peer first" is needed; the
-  periodic sweep also re-probes to keep entries fresh, since XDP egress bypasses
-  the kernel neighbour table and never refreshes them itself.
-- **Customisable TCP MSS clamping** — per tunnel: `auto` (from MTU), explicit, or off.
-- **JSON config with graceful reload** — `systemctl reload` (SIGHUP) applies
-  config changes in place; unaffected tunnels keep forwarding.
+The XDP fast path is the easy part; running it in production is the hard part,
+and that is what this project is about. Tunnels are described by plain JSON files
+and reloaded gracefully, the next hop is resolved and kept fresh automatically,
+live state is one `etheripctl` command away, and the shipped systemd units are
+sandboxed and run unprivileged. An operator can stand a tunnel up, see what
+it is doing, and reconfigure it safely while the rest keep forwarding.
+
+## Why etherip-xdp
+
+This is a Rust rewrite of [amaumene/xdp-etherip](https://github.com/amaumene/xdp-etherip)
+(itself a fork of [x86taka/xdp-etherip](https://github.com/x86taka/xdp-etherip)).
+The originals prove out the XDP data path; this rewrite is built for the operator
+who has to run it. Everything below exists to make day-2 operations
+(deploy, observe, reconfigure, troubleshoot) safe and routine:
+
+- **Many tunnels per uplink.** One physical interface carries as many EtherIP
+  tunnels as you configure, not one tunnel per program.
+- **JSON configuration, one file per tunnel.** Drop a small `*.json` file in a
+  directory; no recompiling, no hand-edited program constants. systemd drop-in
+  precedence is supported for layering volatile config over on-disk config.
+- **Graceful, safe reload.** `systemctl reload` applies config changes in place.
+  Unchanged tunnels keep forwarding and never flap; only the tunnels that
+  actually changed are touched.
+- **Automatic next-hop resolution.** The daemon resolves the peer's next-hop MAC
+  from the kernel routing/neighbour tables, honouring policy routing and source
+  selection, and keeps it fresh as the network changes. No "ping the peer
+  first" ritual; tunnels self-heal once the underlay is ready.
+- **A live status CLI.** `etheripctl` shows every interface, every tunnel, its
+  state, resolved source/next-hop, and counters across all uplinks on the host.
+- **Per-tunnel TCP MSS clamping.** `auto` (derived from MTU), an explicit value,
+  or off.
+- **Hardened by default.** The shipped systemd units run as a `DynamicUser` with
+  a tight capability set and `systemd-analyze security` sandboxing.
+
+## Quick start
+
+### 1. Install
+
+Build a Debian package with [`cargo-deb`](https://github.com/kornelski/cargo-deb)
+and install it (this places the binaries, systemd units, and example configs):
+
+```shell
+cargo install cargo-deb
+cargo deb -p etherip-xdp
+sudo dpkg -i target/debian/etherip-xdp_*.deb
+```
+
+Or build and install the binaries directly; see [Build](#build) below.
+
+### 2. Configure a tunnel
+
+Configuration is one JSON file per tunnel, under a directory named for the
+uplink it rides on. To run two tunnels over `eth1`:
+
+```shell
+sudo mkdir -p /etc/etherip-xdp/interfaces.d/eth1
+```
+
+`/etc/etherip-xdp/interfaces.d/eth1/peer.json`:
+
+```json
+{
+  "remote": "2001:db8::2",
+  "mss": "auto"
+}
+```
+
+That is the minimum: just the remote IPv6 endpoint. The tunnel interface is
+named after the file (`peer` here), and the local outer source is auto-selected
+from the routing table. See the [configuration reference](#configuration-reference)
+for every field.
+
+### 3. Start it
+
+One systemd instance owns one uplink and all of its tunnels:
+
+```shell
+sudo systemctl enable --now etherip-xdp@eth1
+```
+
+The tunnel interface `peer` now exists on the host. Address it like any L2
+interface:
+
+```shell
+sudo ip addr add 192.0.2.1/24 dev peer
+sudo ip link set peer up
+```
+
+To inspect tunnels with `etheripctl` (next step), also enable the management
+socket and the host-wide manager once:
+
+```shell
+sudo systemctl enable --now etherip-xdp-varlink@eth1.socket
+sudo systemctl enable --now etherip-xdp-manager.socket
+```
+
+### 4. Check it
+
+```shell
+sudo etheripctl                  # every interface and its tunnels
+sudo etheripctl show peer        # full detail for one tunnel
+```
+
+```
+interface eth1 (ifindex 3, mac 02:00:00:00:00:01, mtu 1500)
+  TUNNEL         STATE        REMOTE                     SOURCE                     NEXT-HOP
+  peer           up           2001:db8::2                2001:db8::1                fe80::1 mac aa:bb:cc:dd:ee:ff [reachable]
+  counters: encap_redirect=9 decap_redirect=7
+```
+
+A tunnel reports `up` once both its outer source and the peer's next-hop MAC are
+resolved; `pending` (no source yet) and `no-next-hop` (source but no neighbour)
+tell you exactly what is missing while it self-heals.
+
+### 5. Change config and reload
+
+Edit, add, or remove files under `interfaces.d/eth1/`, then:
+
+```shell
+sudo systemctl reload etherip-xdp@eth1
+```
+
+The reload is graceful: the new config set is diffed against what is running and
+only the difference is applied. Tunnels you did not touch keep forwarding without
+interruption. (Editing files alone does nothing until you reload.)
+
+## Configuration reference
+
+One JSON file per tunnel under `/etc/etherip-xdp/interfaces.d/<uplink>/`:
+
+| Field    | Required | Description |
+|----------|----------|-------------|
+| `remote` | yes      | Remote outer IPv6 endpoint. |
+| `name`   | no       | Tunnel / interface name (default: file stem). Max 11 chars. |
+| `local`  | no       | Local outer IPv6 source. Omit to auto-select the kernel's preferred source for the route to `remote` (re-evaluated as the underlay changes). |
+| `mss`    | no       | `"auto"` (default), `"off"`, an integer (both families), or `{ "ipv4": N, "ipv6": N }`. |
+| `mtu`    | no       | Tunnel MTU override (default: uplink MTU − 56). |
+| `mac`    | no       | MAC the interface presents: omit to keep the kernel default, `"inherit"` to copy the uplink's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"`. |
+| `next_hop_on_link` | no | On-link policy when the route returns no gateway: `"maybe"` (default), `"always"`, or `"never"`. |
+
+The uplink is the directory name, so it is **not** repeated inside the file. See
+`packaging/etc/etherip-xdp/interfaces.d/eth1/` for examples.
+
+**Config directories.** The default is `/etc/etherip-xdp/interfaces.d/<uplink>/`.
+The systemd unit also searches `/run/etherip-xdp/interfaces.d/<uplink>/` *ahead*
+of `/etc`, so a generator or orchestration layer can drop volatile tunnels under
+`/run` that override or extend the on-disk config without editing it. When a file
+name appears in more than one directory, the higher-precedence one wins (systemd
+drop-in semantics). The `--config-root` and `--config-dir` flags point the daemon
+elsewhere; run `etherip-xdp --help` for details.
+
+## etheripctl
+
+`etheripctl` queries the running daemons through the host-wide manager and prints
+live status; it changes nothing.
+
+```shell
+etheripctl                  # list every uplink and its tunnels (default)
+etheripctl -i eth1          # limit to one uplink
+etheripctl show <tunnel>    # full detail for one tunnel (alias: status)
+```
+
+It needs the `etherip-xdp-manager.socket` (and each uplink's
+`etherip-xdp-varlink@<uplink>.socket`) enabled. Run it as root or as a member of
+the `etherip-xdp-sock` group; it tells you precisely which is missing if a
+connection fails. The interface is [varlink](https://varlink.org/), so
+`varlinkctl call /run/etherip-xdp/co.0w0.etheripxdp.Management.List` works too.
+
+## Reload behaviour
+
+A reload diffs the configs against the running tunnels **by name**:
+
+| Case | Trigger | Action |
+|------|---------|--------|
+| Added   | A name not currently running | Created fresh. |
+| Removed | A running name no longer in the configs | Torn down. |
+| Updated | Same name, any field changed | Reconfigured **in place**; the interface is never recreated. |
+
+Because the name is the tunnel's identity, every other field (`local`, `remote`,
+`mss`, `mtu`, `mac`, `next_hop_on_link`) updates in place without dropping the
+interface. Renaming a tunnel (or its file) is the one exception: it is a remove
+plus an add, with a brief interruption. If one tunnel fails to apply, the error
+is logged and the rest still proceed.
+
+Reload is only for config-file edits. Tracking the underlay (re-selecting an
+auto `local` source and refreshing the next-hop MAC) happens continuously on
+its own, independent of reload.
+
+## Run without systemd
+
+```shell
+sudo etherip-xdp eth1          # foreground, owns eth1 and its tunnels
+```
+
+On SIGHUP it reloads config; on SIGINT/SIGTERM it prints debug counters and
+tears down all interfaces and XDP attachments.
 
 ## How it works
 
 ```
   /etc/etherip-xdp/interfaces.d/eth1/{peer,office}.json   (one file per tunnel)
                          │  one process per uplink: etherip-xdp@eth1
-   user iface peer  ◄─XDP_PASS             user iface office  ◄─XDP_PASS   (host netns)
-        │ veth                                  │ veth
-··· hidden netns ·······························│··································
-   peer-xdp  ◄─ xdp_encap                  office-xdp  ◄─ xdp_encap
-        │                                       │
-        └──────────── DEVMAP_HASH redirect ─────┴──────────►  eth1 ◄─ xdp_decap (shared)
+   tunnel iface peer ◄─XDP_PASS              tunnel iface office ◄─XDP_PASS  (host netns)
+        │ veth                                   │ veth
+··· hidden netns ········································································
+   peer-xdp  ◄─ xdp_encap                   office-xdp  ◄─ xdp_encap
+        │                                        │
+        └──────────── DEVMAP_HASH redirect ──────┴──────────►  eth1 ◄─ xdp_decap (shared)
 ```
 
-A veth pair is created per tunnel; the user-facing end (`<name>`) carries your L2
-traffic, the peer (`<name>-xdp`) runs `xdp_encap`. The shared `xdp_decap` program
-on the uplink handles decap for every tunnel. A minimal `XDP_PASS` program on each
-user-facing end satisfies the kernel's veth redirect peer check.
+Each tunnel is a veth pair. The user-facing end (`<name>`) carries your L2
+traffic; its hidden peer runs the `xdp_encap` program that adds the outer
+`IPv6 + EtherIP` headers and redirects the frame to the uplink. A single shared
+`xdp_decap` program on the uplink strips the headers off inbound frames and
+redirects each to the right tunnel, demultiplexing by the outer IPv6 address
+pair. Both directions preserve the inner Ethernet frame byte for byte, which is
+what makes `<name>` behave as an ordinary L2 interface.
 
-**Transparent L2:** both directions preserve the inner Ethernet frame byte for
-byte — encap only prepends the outer headers (and optionally clamps the inner TCP
-MSS), and decap only strips them; neither rewrites the inner MACs. So `<name>` is a
-plain L2 interface: give it an IP to use as a host endpoint (the far side reaches
-its MAC via ordinary ARP/ND), or enslave it to a Linux bridge to extend an L2
-segment. The `mac` option below only sets `<name>`'s own address.
+One process owns one uplink because only one XDP program can attach to an
+interface, so tunnels sharing an uplink must share its program; hence the
+`etherip-xdp@<uplink>` systemd instance boundary.
 
-**Hidden peer namespace:** the `<name>-xdp` peer is purely an internal artefact of
-driving encap through XDP, so by default it is moved into a daemon-private,
-anonymous network namespace — it never shows up in `ip link` (or `ip netns list`)
-and is destroyed when the daemon exits. Only the user-facing `<name>` end stays in
-the host namespace. Decap and encap therefore redirect across the namespace
-boundary, which native-mode XDP supports (the same path container networking uses);
-encap and decap use separate devmaps so the peer's namespace-local ifindex can
-never collide with the uplink's. Pass `--disable-veth-peer-netns` to keep the peer
-in the host namespace instead (for debugging, or on kernels without working
-cross-namespace XDP redirect, where it would otherwise fall back to slower SKB
-mode or fail).
-
-**Why one process per uplink:** only one XDP program may be attached to a given
-interface, so tunnels sharing an uplink must share one program. The process /
-systemd-instance boundary is therefore the uplink (`etherip-xdp@eth1`,
-`etherip-xdp@eth2`, …), not the individual tunnel.
-
-The tunnel MTU defaults to `external_mtu - 56` (outer IPv6 40 + EtherIP 2 + inner
-Ethernet 14) and can be overridden per tunnel.
+See [DESIGN.md](DESIGN.md) for the full design: the hidden namespace,
+cross-namespace redirect, next-hop resolution and the on-link policy,
+outer-source selection, the reload diff, and the varlink management plane.
 
 ## Build
 
@@ -83,178 +254,19 @@ Then:
 mise run build       # or: cargo build --release
 ```
 
-Tasks are defined in `mise.toml`; list them with `mise tasks`.
+The eBPF object is compiled and embedded automatically by the build script (via
+`aya-build`); no separate clang/libbpf step is required. Tasks are defined in
+`mise.toml`; list them with `mise tasks`.
 
-The eBPF object is compiled and embedded automatically by `etherip-xdp/build.rs`
-(via `aya-build`); no separate clang/libbpf step is required.
-
-## Configure
-
-One JSON file per tunnel under `/etc/etherip-xdp/interfaces.d/<device>/`:
-
-```json
-{
-  "local": "2001:db8::1",
-  "remote": "2001:db8::2",
-  "mss": "auto"
-}
-```
-
-| Field    | Required | Description |
-|----------|----------|-------------|
-| `name`   | no       | Tunnel / user-facing interface name (default: file stem). Max 11 chars. |
-| `local`  | no       | Local outer IPv6 endpoint. Omit to auto-select the kernel's preferred source for the route to `remote`; the choice is re-evaluated on underlay changes. |
-| `remote` | yes      | Remote outer IPv6 endpoint. |
-| `mss`    | no       | `"auto"` (default), `"off"`, an integer (both families), or `{ "ipv4": N, "ipv6": N }`. |
-| `mtu`    | no       | Tunnel MTU override (default: uplink MTU − 56). |
-| `mac`    | no       | Local MAC the user-facing interface presents on the connected L2 domain. Omit to keep the kernel-assigned address, `"inherit"` to copy the external device's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"`. |
-| `next_hop_on_link` | no | On-link policy when the route lookup returns no gateway: `"maybe"` (default), `"always"`, or `"never"`. See [Next-hop resolution](#next-hop-resolution--the-on-link-policy). |
-
-The external device is the process scope, so it is **not** repeated in the
-file (see `packaging/etc/etherip-xdp/interfaces.d/eth1/` for examples).
-
-### Config directories
-
-The daemon reads tunnels from `/etc/etherip-xdp/interfaces.d/<device>/` — that
-is all most setups need; drop one `*.json` per tunnel there.
-
-To point somewhere else, use one of two mutually-exclusive flags, both
-repeatable:
-
-- `--config-root <dir>` replaces the config root; the `interfaces.d/<device>`
-  layout is still appended (so the directory becomes
-  `<dir>/interfaces.d/<device>/`).
-- `--config-dir <dir>` names a directory to read verbatim, without the
-  `interfaces.d/<device>` layout.
-
-When several directories are given (or searched by default), they follow systemd
-drop-in precedence: a file name found in an earlier (higher-precedence) directory
-shadows the same name in later ones.
-
-The bundled `etherip-xdp@.service` sets `RuntimeDirectory=etherip-xdp` by
-default, so a systemd-managed daemon also searches
-`/run/etherip-xdp/interfaces.d/<device>/` *ahead* of `/etc` (via the exported
-`$RUNTIME_DIRECTORY`). This lets a generator or orchestration layer write
-volatile tunnel drop-ins under `/run` that override (or extend) the on-disk
-`/etc` config without touching it; the directory is kept across daemon restarts
-(`RuntimeDirectoryPreserve=yes`) and cleared only at reboot.
-
-## Reload
-
-The daemon re-reads the config directories only on **SIGHUP** (`systemctl reload
-etherip-xdp@<device>`); editing files has no effect until then. A reload is
-graceful: the new set of configs is diffed against the running tunnels **by
-tunnel name**, and only the difference is applied — unchanged tunnels are left
-running and never flap.
-
-Each loaded config falls into one of three cases:
-
-| Case | Trigger | Action |
-|------|---------|--------|
-| Added   | A tunnel name not currently running | Created fresh: veth pair, XDP attach, map entries. |
-| Removed | A running tunnel whose name is gone from the configs | Torn down: programs detached, map entries removed, veth deleted. |
-| Updated | Same name, any field changed | Reconfigured **in place** — the veth is never recreated, because its name is the tunnel's identity. |
-
-Because the tunnel name is the identity, an in-place update covers every other
-attribute without dropping the interface. How each behaves on update:
-
-| Attribute | Behavior on reload |
-|-----------|--------------------|
-| `name`   | This *is* the identity, so it is not an in-place update: the old name is treated as removed and the new one as added (the veth is recreated under the new name, with a brief data interruption). Renaming the file behaves the same, since the name defaults to the file stem. |
-| `local`  | Outer source re-resolved; the decap key and encap/decap map entries are updated. The last-known source is kept if a new one cannot be resolved, so a ready tunnel never flaps back to pending. |
-| `remote` | Outer destination and decap key updated; the next-hop MAC is re-resolved (with an ND probe) for the new endpoint. |
-| `mss`    | Recomputed and rewritten into the map. No veth or attach churn. |
-| `mtu`    | The user-facing veth and its peer are set to the new MTU in place. No recreation. |
-| `mac`    | Applied to the existing veth via netlink. Switching back to the omitted/default keeps the current address — the original kernel-assigned MAC is **not** restored without recreating the veth (rename or remove+add it to do so). |
-| `next_hop_on_link` | Next-hop MAC re-resolved under the new policy; the encap/decap map entries are updated. No veth or attach churn. |
-
-If applying one tunnel fails during a reload, the error is logged and the
-remaining tunnels are still processed. A tunnel that is still pending (an
-auto-selected `local` with no route yet) records the new spec on reload and is
-installed once a source resolves.
-
-Underlay tracking — re-selecting an auto `local` source and refreshing the
-next-hop MAC — happens continuously on netlink change events and a periodic
-tick, independent of SIGHUP. SIGHUP is only for applying config-file edits.
-
-## Run
+To install the binaries manually instead of via the `.deb`:
 
 ```shell
-# Manually (root):
-sudo ./target/release/etherip-xdp eth1
-# or `mise run run eth1`
-
-# Via systemd (templated by uplink):
-sudo install -Dm0755 target/release/etherip-xdp /usr/bin/etherip-xdp
-sudo install -Dm0644 packaging/etherip-xdp@.service /etc/systemd/system/etherip-xdp@.service
-sudo systemctl enable --now etherip-xdp@eth1
-sudo systemctl reload etherip-xdp@eth1   # graceful reload after editing configs
+sudo install -Dm0755 target/release/etherip-xdp        /usr/bin/etherip-xdp
+sudo install -Dm0755 target/release/etherip-xdp-manager /usr/bin/etherip-xdp-manager
+sudo install -Dm0755 target/release/etheripctl         /usr/bin/etheripctl
+sudo install -Dm0644 packaging/etherip-xdp@.service    /etc/systemd/system/etherip-xdp@.service
+# plus the manager/varlink units under packaging/ for etheripctl; see DESIGN.md
 ```
-
-### Debian package
-
-A `.deb` (binary at `/usr/bin/etherip-xdp`, the templated unit at
-`/lib/systemd/system/etherip-xdp@.service`, example configs under
-`/usr/share/doc/etherip-xdp/examples/`) can be built with
-[`cargo-deb`](https://github.com/kornelski/cargo-deb):
-
-```shell
-cargo install cargo-deb
-cargo deb -p etherip-xdp        # release build, then ./target/debian/*.deb
-```
-
-The package only runs `systemctl daemon-reload`; enable it per uplink yourself:
-
-```shell
-sudo systemctl enable --now etherip-xdp@eth1
-```
-
-On SIGINT/SIGTERM the program prints its debug counters and tears down all veths
-and XDP attachments.
-
-### Next-hop resolution & the on-link policy
-
-The next-hop MAC is resolved from the kernel routing/neighbour tables (honouring
-policy routing and source-address selection) and re-resolved on netlink changes.
-If a tunnel can't be resolved at startup (no route, no neighbour, uplink not up
-yet) the tunnel is still created and self-heals once the underlay is ready — the
-daemon also waits for the uplink interface to appear instead of crash-looping.
-
-When the route lookup returns **no gateway**, whether the remote endpoint is
-treated as its own next hop ("on-link") is controlled per tunnel by the
-`next_hop_on_link` config field:
-
-| Value | Behaviour |
-|-------|-----------|
-| `maybe` (default) | On-link only when the routing table returns a gatewayless (connected) route for the destination. No route → left unresolved (retried on netlink changes). |
-| `always` | Always treat the destination as on-link when no gateway is found, even without a matching route. |
-| `never` | Never assume on-link; a gateway is required. |
-
-An explicit gateway from the route lookup always takes precedence regardless of
-this setting.
-
-### Outer source address
-
-If `local` is set, it is used verbatim (and passed to the route lookup so policy
-routing and source-address selection behave as if the packet originated there).
-If `local` is **omitted**, the kernel's preferred source for the route to
-`remote` (its RFC 6724 selection) is adopted, and is re-evaluated on every
-re-resolution — so a change to the underlay address (e.g. a renumber, or the
-address appearing after boot) is picked up automatically. Until a source
-resolves, the tunnel is **pending**: the veth and programs exist but the
-data-path map entries are withheld, so nothing is encapsulated with a bogus
-source. A configured `local` that is not assigned to any local interface is
-used anyway but logged as a
-warning (it is usually a typo or a removed address, and tends to be dropped by
-reverse-path filtering).
-
-## Debug counters
-
-Per-CPU counters are maintained across the encap/decap paths and dumped on exit
-(`encap_enter`, `encap_redirect`, `encap_mss_fail`, `decap_enter`,
-`decap_redirect`, `decap_not_ipv6`, `decap_not_etherip`, `decap_no_tunnel`,
-`decap_own_pkt`, `decap_bad_header`, `main_enter`, …). Set `RUST_LOG=debug` for
-verbose logging.
 
 ## Test
 
@@ -264,39 +276,10 @@ mise run lint       # clippy (must pass before commit)
 mise run test-bpf   # byte-exact data-path tests via BPF_PROG_TEST_RUN (root, kernel >= 5.15)
 ```
 
-The data-path tests drive the XDP program with `BPF_PROG_TEST_RUN` and assert the
-exact encap/decap output and action, mirroring the upstream Go test suite.
-
-### Fuzzing
-
-The packet parsing/transform logic lives in `etherip_xdp_common::data_path`,
-generic over a packet-memory abstraction so it compiles both as the kernel XDP
-program and against a plain byte buffer on the host. The `BPF_PROG_TEST_RUN` tests
-above assert the two agree byte for byte, so coverage-guided fuzzing of the host
-core carries over to the kernel program — without needing root or a BPF-capable
-kernel:
-
-```shell
-mise run fuzz roundtrip   # encap∘decap round-trip property (default target)
-mise run fuzz encap       # outer header/flow-label invariants on arbitrary inner frames
-mise run fuzz decap       # IPv6 ext-header walking + EtherIP strip on arbitrary frames
-```
-
-Targets live under [`test/fuzzing/`](test/fuzzing/) (its own [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
-workspace; needs nightly). CI runs a short bounded pass of each on every change.
-
-### Integration tests
-
-End-to-end tests run the **real** daemon on two peers and tunnel between them,
-covering the live attach/redirect path that `BPF_PROG_TEST_RUN` cannot:
-
-```shell
-mise run integration-local   # two network namespaces on the host (root)
-mise run integration-vm      # two qemu-system-x86_64 VMs (kernels 6.5/6.8/7.0)
-```
-
-The VM runner joins the two guests with a QEMU `-netdev stream` socket, so no
-privileged host networking is required. See [`test/README.md`](test/README.md).
+The data path is a shared core, fuzzed on the host and asserted byte-for-byte
+equal to the kernel program via `BPF_PROG_TEST_RUN`; end-to-end integration
+tests run the real daemon between two peers. See [DESIGN.md](DESIGN.md#testing)
+and [`test/README.md`](test/README.md).
 
 ## License
 
