@@ -27,10 +27,7 @@ local guaRef(eni) = '${' + eni + '.PrimaryIpv6Address}';
 // (cloud-init's `network: {config: disabled}` can't prevent the first-boot
 // render), since networkd applies the first matching .network per link — hence
 // the `05-` prefix so this `Driver=ena` match wins over netplan's per-NIC files.
-local underlayNetwork = |||
-  [Match]
-  Driver=ena
-
+local underlayBody = |||
   [Link]
   MTUBytes=1500
 
@@ -46,6 +43,9 @@ local underlayNetwork = |||
   [IPv6AcceptRA]
   UseMTU=no
 |||;
+// Shared base for all ENAs. Per-link overlay routes (overlayNetworks) reuse the
+// same body in a Name-matched, earlier-sorting file so they win for that link.
+local underlayNetwork = '[Match]\nDriver=ena\n\n' + underlayBody;
 
 local loopbackHeader = |||
   [Match]
@@ -179,10 +179,7 @@ local dutSetupTmpl = |||
   HALF=$((MAXQ / 2))
   [ "$HALF" -ge 1 ] && ethtool -L "$UPLINK_IF" combined "$HALF" || true
 
-  # No route to the peer is pinned: both ENIs carry RA default routes, but
-  # etherip-xdp's resolver constrains its lookup to the uplink (oif), so it picks
-  # the uplink's gateway regardless of which default route has the lower metric.
-
+  @@PINS@@
   export DEBIAN_FRONTEND=noninteractive
   if ! dpkg -s etherip-xdp >/dev/null 2>&1; then
     apt-get update
@@ -201,6 +198,7 @@ local generatorSetupTmpl = |||
   networkctl reload 2>/dev/null || systemctl restart systemd-networkd
   sysctl --system >/dev/null
   for _ in $(seq 1 60); do ip -6 route show default | grep -q . && break; sleep 2; done
+  @@PINS@@
   export DEBIAN_FRONTEND=noninteractive
   if ! dpkg -s @@TRAFGEN@@ >/dev/null 2>&1; then
     apt-get update
@@ -274,10 +272,72 @@ local benchTmpl = |||
   rm -f "$CFG"
 |||;
 
-local dutSetup(inst) =
-  std.strReplace(std.strReplace(dutSetupTmpl, '@@OWN_GUA@@', guaRef(inst.uplinkEni)), '@@DEB_URL@@', c.deb_url);
+// Shared helper: pin an overlay /128 (+/32) to the ENI carrying `gua`, via that
+// ENI's RA/DHCP-learned gateway.
+// The `via: 'subnet:X'` overlay routes, grouped by the ENI (subnet) that carries
+// them: { subnet, eni, dests:[{v6,v4}] }.
+local routeGroups(key) =
+  local eniBySubnet = { [e.subnet]: e.logical for e in net.enisOf(key) };
+  local routes = net.instances[key].routes;
+  local subnetsWithRoutes = std.set([
+    std.split(r.via, ':')[1]
+    for r in routes
+    if std.startsWith(r.via, 'subnet:')
+  ]);
+  [
+    {
+      subnet: s,
+      eni: eniBySubnet[s],
+      dests: [{ v6: net.v6(r.di, r.ds), v4: net.v4(r.di, r.ds) } for r in routes if r.via == 'subnet:' + s],
+    }
+    for s in subnetsWithRoutes
+  ];
 
-local generatorSetup = std.strReplace(generatorSetupTmpl, '@@TRAFGEN@@', c.trafgen_package);
+local raRoutes(dests) = std.join('', [
+  '\n[Route]\nDestination=%s/128\nGateway=_ipv6ra\n\n[Route]\nDestination=%s/32\nGateway=_dhcp4\n' % [d.v6, d.v4]
+  for d in dests
+]);
+
+// Pin each overlay /128 (+/32) to the ENI on its subnet via systemd-networkd
+// [Route] (Gateway=_ipv6ra/_dhcp4) — networkd owns the routes and resolves the
+// RA link-local / DHCP gateway, reinstalling them across RA refresh and reload.
+// Both underlay ENIs carry an equal-metric RA default route, so without these an
+// overlay packet (notably the decapped inner packet's exit) would ride whichever
+// ENI the kernel's ECMP picks rather than the destination subnet's own ENI. The
+// encap/underlay path stays unpinned: the daemon's resolver constrains it via oif.
+//
+// The only runtime unknown is the AWS-assigned interface NAME, so the per-link
+// .network (Name-matched, sorts before 05-underlay so it wins) is written once
+// setup has found the interface by the ENI's known GUA, then networkctl reload.
+local overlayNetworks(key) =
+  local groups = routeGroups(key);
+  if std.length(groups) == 0 then '' else
+    std.join('', [
+      'UND_IF=$(ip -o -6 addr show to %s/128 scope global | awk \'{print $2; exit}\')\n' % guaRef(g.eni)
+      + '[ -n "$UND_IF" ] || { echo "subnet-%s ENI not up yet"; exit 1; }\n' % g.subnet
+      + 'cat > /etc/systemd/network/04-overlay-%s.network <<EOFNET\n' % g.subnet
+      + '[Match]\nName=$UND_IF\n\n'
+      + underlayBody
+      + raRoutes(g.dests)
+      + 'EOFNET\n'
+      for g in groups
+    ]) + 'networkctl reload\n';
+
+local dutSetup(key) =
+  local inst = net.instances[key];
+  std.strReplace(
+    std.strReplace(
+      std.strReplace(dutSetupTmpl, '@@OWN_GUA@@', guaRef(inst.uplinkEni)),
+      '@@DEB_URL@@', c.deb_url
+    ),
+    '@@PINS@@', overlayNetworks(key)
+  );
+
+local generatorSetup(key) =
+  std.strReplace(
+    std.strReplace(generatorSetupTmpl, '@@TRAFGEN@@', c.trafgen_package),
+    '@@PINS@@', overlayNetworks(key)
+  );
 
 local benchScript(inst) =
   std.strReplace(
@@ -305,10 +365,10 @@ local file(path, content, perm='0644') = { path: path, permissions: perm, conten
       file('/etc/systemd/network/20-etherip.network', etheripNetwork(inst)),
       file('/etc/etherip-xdp/tunnels/etherip.json', etheripJson(inst)),
       file('/etc/systemd/system/etherip-xdp@.service.d/10-config-dir.conf', etheripDropin),
-      file('/usr/local/sbin/etherip-bench-setup', dutSetup(inst), '0755'),
+      file('/usr/local/sbin/etherip-bench-setup', dutSetup(key), '0755'),
     ];
     local generatorFiles = [
-      file('/usr/local/sbin/etherip-bench-setup', generatorSetup, '0755'),
+      file('/usr/local/sbin/etherip-bench-setup', generatorSetup(key), '0755'),
       file('/usr/local/bin/etherip-bench', benchScript(inst), '0755'),
     ];
     // Optional root password for EC2 Serial Console recovery if SSH is lost.
