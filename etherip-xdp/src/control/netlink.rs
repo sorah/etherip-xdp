@@ -20,6 +20,10 @@ pub struct RouteInfo {
     /// (`RTA_PREFSRC`), i.e. the result of its RFC 6724 source selection. Used to
     /// auto-pick the outer source when a tunnel does not configure one.
     pub prefsrc: Option<std::net::IpAddr>,
+    /// Output interface the kernel actually chose for this route (`RTA_OIF`). A
+    /// `from`+`oif` lookup can silently ignore the requested `oif`, so this lets
+    /// the resolver detect when the returned route egresses the wrong interface.
+    pub oif: Option<u32>,
 }
 
 /// A resolved neighbour entry.
@@ -260,6 +264,7 @@ impl Netlink {
         };
         let mut gateway = None;
         let mut prefsrc = None;
+        let mut oif = None;
         for attr in route.attributes {
             match attr {
                 rtnetlink::packet_route::route::RouteAttribute::Gateway(addr) => {
@@ -268,10 +273,17 @@ impl Netlink {
                 rtnetlink::packet_route::route::RouteAttribute::PrefSource(addr) => {
                     prefsrc = route_addr_to_ip(&addr);
                 }
+                rtnetlink::packet_route::route::RouteAttribute::Oif(idx) => {
+                    oif = Some(idx);
+                }
                 _ => {}
             }
         }
-        Ok(Some(RouteInfo { gateway, prefsrc }))
+        Ok(Some(RouteInfo {
+            gateway,
+            prefsrc,
+            oif,
+        }))
     }
 
     /// Whether `addr` is currently assigned to any interface on the host. Used to

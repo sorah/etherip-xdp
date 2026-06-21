@@ -124,13 +124,11 @@ local etheripLink = |||
   MACAddressPolicy=none
 |||;
 
-// `local` is omitted (auto-source): the daemon's resolver passes a configured
-// `local` as the route lookup's `from`, and `ip route get <peer> from <local> oif
-// <uplink>` ignores `oif` when another ENI's default outranks the uplink's (it now
-// does — the uplink's RA default is deprioritised for SSH symmetry above), picking
-// that ENI's gateway and leaving the tunnel with no usable next hop. The sourceless
-// `oif` lookup honours the uplink and prefsrc yields the same outer source (the
-// uplink GUA).
+// `local` is omitted: auto-source adopts the uplink GUA (the route's prefsrc),
+// identical to what an explicit `local` would set here. The resolver now pins the
+// next hop to the uplink's `oif` even with an explicit `local` (a `from`+`oif`
+// lookup would otherwise resolve another ENI's gateway when its default outranks
+// the uplink's, as it does here for SSH symmetry), so this just keeps it minimal.
 local etheripJson(inst) =
   '{ "name": "etherip", "remote": "%s", "mss": "auto" }\n'
   % [guaRef(inst.peerUplinkEni)];
