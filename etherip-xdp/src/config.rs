@@ -13,6 +13,9 @@
 //! route to `remote` (the kernel's preferred source), which then tracks underlay
 //! address changes. `mss` is `"auto"` (default), `"off"`, an integer (both
 //! families), or `{ "ipv4": N, "ipv6": N }` (a missing family falls back to auto).
+//! `mac` sets the user-facing interface's MAC on the connected L2 domain: omit to
+//! keep the kernel-assigned address (default), `"inherit"` to copy the external
+//! device's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"` address.
 
 /// How to clamp the inner TCP MSS for a tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -45,6 +48,19 @@ impl MssConfig {
     }
 }
 
+/// Local MAC address policy for the user-facing tunnel interface, i.e. the
+/// address it presents on the connected L2 domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MacConfig {
+    /// Keep the kernel-assigned veth MAC (default).
+    #[default]
+    Auto,
+    /// Inherit the external (uplink) device's MAC.
+    Inherit,
+    /// Force an explicit MAC address.
+    Explicit([u8; 6]),
+}
+
 /// A fully-validated tunnel definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelSpec {
@@ -59,6 +75,8 @@ pub struct TunnelSpec {
     pub mss: MssConfig,
     /// Optional tunnel MTU override (default: external MTU minus overhead).
     pub mtu: Option<u32>,
+    /// Local MAC address presented on the connected L2 domain.
+    pub mac: MacConfig,
 }
 
 #[derive(serde::Deserialize)]
@@ -69,6 +87,7 @@ struct RawTunnel {
     remote: std::net::Ipv6Addr,
     mss: Option<RawMss>,
     mtu: Option<u32>,
+    mac: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -97,6 +116,42 @@ fn convert_mss(raw: Option<RawMss>) -> anyhow::Result<MssConfig> {
     })
 }
 
+fn convert_mac(raw: Option<String>) -> anyhow::Result<MacConfig> {
+    let Some(s) = raw else {
+        return Ok(MacConfig::Auto);
+    };
+    if s.eq_ignore_ascii_case("inherit") {
+        return Ok(MacConfig::Inherit);
+    }
+    Ok(MacConfig::Explicit(parse_mac(&s)?))
+}
+
+/// Parse a colon-separated `xx:xx:xx:xx:xx:xx` unicast MAC address.
+fn parse_mac(s: &str) -> anyhow::Result<[u8; 6]> {
+    let mut octets = [0u8; 6];
+    let mut count = 0;
+    for (i, part) in s.split(':').enumerate() {
+        let octet = octets.get_mut(i).ok_or_else(|| {
+            anyhow::anyhow!("invalid mac {s:?}: expected 6 colon-separated octets")
+        })?;
+        *octet = u8::from_str_radix(part, 16)
+            .map_err(|_| anyhow::anyhow!("invalid mac {s:?}: bad octet {part:?}"))?;
+        count = i + 1;
+    }
+    if count != 6 {
+        anyhow::bail!("invalid mac {s:?}: expected 6 colon-separated octets");
+    }
+    if octets[0] & 0x01 != 0 {
+        anyhow::bail!(
+            "invalid mac {s:?}: multicast/broadcast addresses cannot be an interface MAC"
+        );
+    }
+    if octets == [0u8; 6] {
+        anyhow::bail!("invalid mac {s:?}: the all-zero address cannot be an interface MAC");
+    }
+    Ok(octets)
+}
+
 fn validate_endpoint(addr: std::net::Ipv6Addr, role: &str) -> anyhow::Result<std::net::Ipv6Addr> {
     if addr.to_ipv4_mapped().is_some() {
         anyhow::bail!(
@@ -117,6 +172,7 @@ impl TunnelSpec {
             remote: validate_endpoint(raw.remote, "remote")?,
             mss: convert_mss(raw.mss)?,
             mtu: raw.mtu,
+            mac: convert_mac(raw.mac)?,
         })
     }
 
@@ -249,6 +305,57 @@ mod tests {
             }
             .resolve(1444),
             (1300, 1384)
+        );
+    }
+
+    #[test]
+    fn mac_variants() {
+        // Omitted -> auto (keep kernel-assigned).
+        assert_eq!(spec(r#"{"remote":"2001:db8::2"}"#).mac, MacConfig::Auto);
+        // Keyword "inherit" is case-insensitive.
+        assert_eq!(
+            spec(r#"{"remote":"2001:db8::2","mac":"inherit"}"#).mac,
+            MacConfig::Inherit
+        );
+        assert_eq!(
+            spec(r#"{"remote":"2001:db8::2","mac":"INHERIT"}"#).mac,
+            MacConfig::Inherit
+        );
+        // Explicit address.
+        assert_eq!(
+            spec(r#"{"remote":"2001:db8::2","mac":"02:00:5e:10:00:01"}"#).mac,
+            MacConfig::Explicit([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn rejects_bad_mac() {
+        // Too few octets.
+        assert!(
+            TunnelSpec::from_json(r#"{"remote":"2001:db8::2","mac":"02:00:5e"}"#, "n").is_err()
+        );
+        // Too many octets.
+        assert!(
+            TunnelSpec::from_json(
+                r#"{"remote":"2001:db8::2","mac":"02:00:5e:10:00:01:02"}"#,
+                "n"
+            )
+            .is_err()
+        );
+        // Non-hex octet.
+        assert!(
+            TunnelSpec::from_json(r#"{"remote":"2001:db8::2","mac":"02:00:5e:10:00:zz"}"#, "n")
+                .is_err()
+        );
+        // Multicast (group bit set in the first octet).
+        assert!(
+            TunnelSpec::from_json(r#"{"remote":"2001:db8::2","mac":"01:00:5e:10:00:01"}"#, "n")
+                .is_err()
+        );
+        // All-zero.
+        assert!(
+            TunnelSpec::from_json(r#"{"remote":"2001:db8::2","mac":"00:00:00:00:00:00"}"#, "n")
+                .is_err()
         );
     }
 

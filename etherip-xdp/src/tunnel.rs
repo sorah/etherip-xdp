@@ -236,6 +236,17 @@ impl Manager {
         }
     }
 
+    /// Resolve the local MAC the user-facing interface should present, given its
+    /// current (kernel-assigned) address. `Auto` keeps the current address;
+    /// `Inherit`/`Explicit` force the external device's or a configured address.
+    fn resolve_tunnel_mac(&self, spec: &crate::config::TunnelSpec, current: [u8; 6]) -> [u8; 6] {
+        match spec.mac {
+            crate::config::MacConfig::Auto => current,
+            crate::config::MacConfig::Inherit => self.external.mac,
+            crate::config::MacConfig::Explicit(mac) => mac,
+        }
+    }
+
     fn decap_key(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> etherip_xdp_common::DecapKey {
         etherip_xdp_common::DecapKey {
             remote: dst.octets(),
@@ -356,6 +367,14 @@ impl Manager {
             .link_info(&name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("veth {name} missing after creation"))?;
+        // Set the user-facing MAC before bringing the link up so the address it
+        // first advertises on the L2 domain is already the configured one. This
+        // is also the inner dst MAC the decap path writes, so the two stay equal.
+        let tunnel_mac = self.resolve_tunnel_mac(&spec, user.mac);
+        if tunnel_mac != user.mac {
+            self.nl.set_mac(user.index, tunnel_mac).await?;
+            log::info!("tunnel {name}: local MAC set to {}", fmt_mac(&tunnel_mac));
+        }
         let mtu = tunnel_mtu as u32;
         self.nl.set_mtu_up(user.index, mtu).await?;
         // disable_tx_offload does blocking socket/ioctl syscalls; offload it from
@@ -406,7 +425,7 @@ impl Manager {
         let (config, decap_key, effective_src) = match resolved.src {
             Some(src) => {
                 let config =
-                    self.build_config(&spec, peer_index, src, user.mac, dst_mac, tunnel_mtu);
+                    self.build_config(&spec, peer_index, src, tunnel_mac, dst_mac, tunnel_mtu);
                 let decap_key = Self::decap_key(src, spec.remote);
                 self.bpf.set_encap(peer_index, &config)?;
                 self.bpf.set_decap(&decap_key, &config)?;
@@ -431,7 +450,7 @@ impl Manager {
                     &spec,
                     peer_index,
                     unspecified,
-                    user.mac,
+                    tunnel_mac,
                     dst_mac,
                     tunnel_mtu,
                 );
@@ -486,7 +505,7 @@ impl Manager {
     /// Update a tunnel in place (src/dst/mss/mtu) without veth churn.
     async fn update_tunnel(&mut self, spec: crate::config::TunnelSpec) -> anyhow::Result<()> {
         let name = spec.name.clone();
-        let (peer_index, old_key, old_mtu, tunnel_mac, old_dst_mac, old_src) = {
+        let (peer_index, old_key, old_mtu, cur_tunnel_mac, old_dst_mac, old_src) = {
             let t = self
                 .tunnels
                 .get(&name)
@@ -513,6 +532,20 @@ impl Manager {
                 .ok_or_else(|| anyhow::anyhow!("veth {name} vanished"))?;
             self.nl.set_mtu_up(user_index, tunnel_mtu as u32).await?;
             self.set_peer_mtu_up(peer_index, tunnel_mtu as u32).await?;
+        }
+
+        // Apply a changed local MAC in place. `Auto` keeps the current address, so
+        // switching to auto after an explicit/inherit value does not restore the
+        // original kernel MAC without recreating the veth.
+        let tunnel_mac = self.resolve_tunnel_mac(&spec, cur_tunnel_mac);
+        if tunnel_mac != cur_tunnel_mac {
+            let user_index = self
+                .nl
+                .index_of(&name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("veth {name} vanished"))?;
+            self.nl.set_mac(user_index, tunnel_mac).await?;
+            log::info!("tunnel {name}: local MAC set to {}", fmt_mac(&tunnel_mac));
         }
 
         self.warn_if_src_unassigned(&spec).await;
@@ -805,6 +838,7 @@ mod tests {
             remote: remote.parse().unwrap(),
             mss,
             mtu: None,
+            mac: crate::config::MacConfig::Auto,
         }
     }
 
