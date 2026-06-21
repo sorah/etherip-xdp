@@ -47,10 +47,10 @@ pub enum NextHopOnLink {
 /// it can be unit-tested.
 pub fn choose_next_hop(
     mode: NextHopOnLink,
-    info: Option<crate::netlink::RouteInfo>,
+    info: Option<crate::control::netlink::RouteInfo>,
     dst: std::net::Ipv6Addr,
 ) -> Option<std::net::Ipv6Addr> {
-    if let Some(crate::netlink::RouteInfo {
+    if let Some(crate::control::netlink::RouteInfo {
         gateway: Some(std::net::IpAddr::V6(gw)),
         ..
     }) = info
@@ -86,7 +86,7 @@ pub struct Resolved {
 /// the kernel returned one for an IPv6 route. Pure so it can be unit-tested.
 pub fn choose_src(
     configured: Option<std::net::Ipv6Addr>,
-    info: Option<crate::netlink::RouteInfo>,
+    info: Option<crate::control::netlink::RouteInfo>,
 ) -> Option<std::net::Ipv6Addr> {
     configured.or_else(|| match info.and_then(|i| i.prefsrc) {
         Some(std::net::IpAddr::V6(v6)) => Some(v6),
@@ -116,11 +116,11 @@ pub enum Probe {
 /// constrained to `external_ifindex`, matching the fact that encap egresses
 /// there unconditionally.
 async fn route_get_oif(
-    nl: &crate::netlink::Netlink,
+    nl: &crate::control::netlink::Netlink,
     dst: std::net::Ipv6Addr,
     src: Option<std::net::Ipv6Addr>,
     external_ifindex: u32,
-) -> Option<crate::netlink::RouteInfo> {
+) -> Option<crate::control::netlink::RouteInfo> {
     match nl.route_get(dst, src, Some(external_ifindex)).await {
         Ok(info) => info,
         Err(e) => {
@@ -143,13 +143,13 @@ async fn route_get_oif(
 ///   first that yields a route winning. This supplies the `from` the source rule
 ///   needs, which the kernel cannot bootstrap on its own.
 async fn resolve_route_and_src(
-    nl: &crate::netlink::Netlink,
+    nl: &crate::control::netlink::Netlink,
     external_ifindex: u32,
     configured_src: Option<std::net::Ipv6Addr>,
     dst: std::net::Ipv6Addr,
 ) -> (
     Option<std::net::Ipv6Addr>,
-    Option<crate::netlink::RouteInfo>,
+    Option<crate::control::netlink::RouteInfo>,
 ) {
     if configured_src.is_some() {
         let info = route_get_oif(nl, dst, configured_src, external_ifindex).await;
@@ -184,7 +184,7 @@ async fn resolve_route_and_src(
 /// changes and periodically. `probe` controls how hard neighbour discovery is
 /// driven (see [`Probe`]).
 pub async fn resolve_endpoint(
-    nl: &crate::netlink::Netlink,
+    nl: &crate::control::netlink::Netlink,
     external_ifindex: u32,
     external_name: &str,
     configured_src: Option<std::net::Ipv6Addr>,
@@ -209,7 +209,7 @@ pub async fn resolve_endpoint(
     let current = nl
         .neighbour_mac(external_ifindex, next_hop)
         .await?
-        .filter(crate::netlink::NeighEntry::is_usable)
+        .filter(crate::control::netlink::NeighEntry::is_usable)
         .map(|e| e.mac);
 
     match probe {
@@ -310,22 +310,24 @@ fn probe_next_hop(
 mod tests {
     use super::*;
 
-    fn gw_route(gw: std::net::Ipv6Addr) -> Option<crate::netlink::RouteInfo> {
-        Some(crate::netlink::RouteInfo {
+    fn gw_route(gw: std::net::Ipv6Addr) -> Option<crate::control::netlink::RouteInfo> {
+        Some(crate::control::netlink::RouteInfo {
             gateway: Some(std::net::IpAddr::V6(gw)),
             prefsrc: None,
         })
     }
 
-    fn onlink_route() -> Option<crate::netlink::RouteInfo> {
-        Some(crate::netlink::RouteInfo {
+    fn onlink_route() -> Option<crate::control::netlink::RouteInfo> {
+        Some(crate::control::netlink::RouteInfo {
             gateway: None,
             prefsrc: None,
         })
     }
 
-    fn route_with_prefsrc(prefsrc: std::net::Ipv6Addr) -> Option<crate::netlink::RouteInfo> {
-        Some(crate::netlink::RouteInfo {
+    fn route_with_prefsrc(
+        prefsrc: std::net::Ipv6Addr,
+    ) -> Option<crate::control::netlink::RouteInfo> {
+        Some(crate::control::netlink::RouteInfo {
             gateway: None,
             prefsrc: Some(std::net::IpAddr::V6(prefsrc)),
         })

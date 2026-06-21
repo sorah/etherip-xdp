@@ -86,6 +86,10 @@ cargo_metadata = { workspace = true }
 # features.
 etherip-xdp-ebpf = { path = "../etherip-xdp-ebpf" }
 
+[lib]
+name = "etherip_xdp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "etherip-xdp"
 path = "src/main.rs"

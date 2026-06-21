@@ -42,7 +42,7 @@ impl NetNs {
     }
 
     /// The raw descriptor of the namespace, for `setns_by_fd` when moving a link
-    /// into it (see [`crate::netlink::Netlink::move_link_to_netns`]).
+    /// into it (see [`crate::control::netlink::Netlink::move_link_to_netns`]).
     pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
         std::os::fd::AsRawFd::as_raw_fd(&self.fd)
     }

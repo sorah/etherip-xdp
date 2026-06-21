@@ -85,7 +85,7 @@ pub struct TunnelSpec {
     /// Local MAC address presented on the connected L2 domain.
     pub mac: MacConfig,
     /// On-link policy for the next hop when the route lookup returns no gateway.
-    pub next_hop_on_link: crate::resolver::NextHopOnLink,
+    pub next_hop_on_link: crate::control::resolver::NextHopOnLink,
 }
 
 #[derive(serde::Deserialize)]
@@ -126,13 +126,13 @@ fn convert_mss(raw: Option<RawMss>) -> anyhow::Result<MssConfig> {
     })
 }
 
-fn convert_on_link(raw: Option<String>) -> anyhow::Result<crate::resolver::NextHopOnLink> {
+fn convert_on_link(raw: Option<String>) -> anyhow::Result<crate::control::resolver::NextHopOnLink> {
     Ok(match raw {
-        None => crate::resolver::NextHopOnLink::default(),
+        None => crate::control::resolver::NextHopOnLink::default(),
         Some(k) => match k.to_ascii_lowercase().as_str() {
-            "maybe" => crate::resolver::NextHopOnLink::Maybe,
-            "always" => crate::resolver::NextHopOnLink::Always,
-            "never" => crate::resolver::NextHopOnLink::Never,
+            "maybe" => crate::control::resolver::NextHopOnLink::Maybe,
+            "always" => crate::control::resolver::NextHopOnLink::Always,
+            "never" => crate::control::resolver::NextHopOnLink::Never,
             other => anyhow::bail!(
                 "invalid next_hop_on_link value {other:?} (expected \"maybe\", \"always\", or \"never\")"
             ),
@@ -370,16 +370,16 @@ mod tests {
         // Omitted -> default (maybe).
         assert_eq!(
             spec(r#"{"remote":"2001:db8::2"}"#).next_hop_on_link,
-            crate::resolver::NextHopOnLink::Maybe
+            crate::control::resolver::NextHopOnLink::Maybe
         );
         // Keywords are case-insensitive.
         assert_eq!(
             spec(r#"{"remote":"2001:db8::2","next_hop_on_link":"always"}"#).next_hop_on_link,
-            crate::resolver::NextHopOnLink::Always
+            crate::control::resolver::NextHopOnLink::Always
         );
         assert_eq!(
             spec(r#"{"remote":"2001:db8::2","next_hop_on_link":"NEVER"}"#).next_hop_on_link,
-            crate::resolver::NextHopOnLink::Never
+            crate::control::resolver::NextHopOnLink::Never
         );
         // Unknown keyword is rejected.
         assert!(
