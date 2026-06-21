@@ -1,5 +1,5 @@
-//! Management plane: the `co.0w0.etheripxdp.Management` varlink interface (and,
-//! in later modules, the `etherip-xdp-manager` proxy and the `etheripctl` CLI).
+//! Management plane: the `co.0w0.etheripxdp.Management` varlink interface, the
+//! `etherip-xdp-manager` proxy, and the `etheripctl` CLI.
 
 // Machine-generated varlink bindings (async server trait + client). All lints
 // are silenced because the output is generated, not hand-written (it uses the
@@ -9,5 +9,7 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/co.0w0.etheripxdp.Management.rs"));
 }
 
+pub mod ctl;
 pub mod discovery;
 pub mod proxy;
+pub mod render;
