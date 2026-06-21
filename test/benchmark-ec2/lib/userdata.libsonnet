@@ -43,7 +43,7 @@ local underlayBody = |||
   [IPv6AcceptRA]
   UseMTU=no
 |||;
-// Shared base for all ENAs. Per-link overlay routes (overlayNetworks) reuse the
+// Shared base for all ENAs. Per-link files (eniNetworks) reuse the
 // same body in a Name-matched, earlier-sorting file so they win for that link.
 local underlayNetwork = '[Match]\nDriver=ena\n\n' + underlayBody;
 
@@ -124,9 +124,16 @@ local etheripLink = |||
   MACAddressPolicy=none
 |||;
 
+// `local` is omitted (auto-source): the daemon's resolver passes a configured
+// `local` as the route lookup's `from`, and `ip route get <peer> from <local> oif
+// <uplink>` ignores `oif` when another ENI's default outranks the uplink's (it now
+// does — the uplink's RA default is deprioritised for SSH symmetry above), picking
+// that ENI's gateway and leaving the tunnel with no usable next hop. The sourceless
+// `oif` lookup honours the uplink and prefsrc yields the same outer source (the
+// uplink GUA).
 local etheripJson(inst) =
-  '{ "name": "etherip", "local": "%s", "remote": "%s", "mss": "auto" }\n'
-  % [guaRef(inst.uplinkEni), guaRef(inst.peerUplinkEni)];
+  '{ "name": "etherip", "remote": "%s", "mss": "auto" }\n'
+  % [guaRef(inst.peerUplinkEni)];
 
 // Provisioning runs as a oneshot unit (not cloud-init runcmd) so it is ordered
 // after networkd, retried on transient failure, logged to the journal, and
@@ -274,56 +281,41 @@ local benchTmpl = |||
   rm -f "$CFG"
 |||;
 
-// Shared helper: pin an overlay /128 (+/32) to the ENI carrying `gua`, via that
-// ENI's RA/DHCP-learned gateway.
-// The `via: 'subnet:X'` overlay routes, grouped by the ENI (subnet) that carries
-// them: { subnet, eni, dests:[{v6,v4}] }.
-local routeGroups(key) =
-  local eniBySubnet = { [e.subnet]: e.logical for e in net.enisOf(key) };
-  local routes = net.instances[key].routes;
-  local subnetsWithRoutes = std.set([
-    std.split(r.via, ':')[1]
-    for r in routes
-    if std.startsWith(r.via, 'subnet:')
-  ]);
-  [
-    {
-      subnet: s,
-      eni: eniBySubnet[s],
-      dests: [{ v6: net.v6(r.di, r.ds), v4: net.v4(r.di, r.ds) } for r in routes if r.via == 'subnet:' + s],
-    }
-    for s in subnetsWithRoutes
-  ];
-
 local raRoutes(dests) = std.join('', [
   '\n[Route]\nDestination=%s/128\nGateway=_ipv6ra\n\n[Route]\nDestination=%s/32\nGateway=_dhcp4\n' % [d.v6, d.v4]
   for d in dests
 ]);
 
-// Pin each overlay /128 (+/32) to the ENI on its subnet via systemd-networkd
-// [Route] (Gateway=_ipv6ra/_dhcp4) — networkd owns the routes and resolves the
-// RA link-local / DHCP gateway, reinstalling them across RA refresh and reload.
-// Both underlay ENIs carry an equal-metric RA default route, so without these an
-// overlay packet (notably the decapped inner packet's exit) would ride whichever
-// ENI the kernel's ECMP picks rather than the destination subnet's own ENI. The
-// encap/underlay path stays unpinned: the daemon's resolver constrains it via oif.
+// Per-ENI networkd config, written at runtime because the interface NAME is
+// AWS-assigned (found by the ENI's known GUA). One file per ENI, sorting before
+// 05-underlay so it wins. Two jobs:
 //
-// The only runtime unknown is the AWS-assigned interface NAME, so the per-link
-// .network (Name-matched, sorts before 05-underlay so it wins) is written once
-// setup has found the interface by the ENI's known GUA, then networkctl reload.
-local overlayNetworks(key) =
-  local groups = routeGroups(key);
-  if std.length(groups) == 0 then '' else
-    std.join('', [
-      'UND_IF=$(ip -o -6 addr show to %s/128 scope global | awk \'{print $2; exit}\')\n' % guaRef(g.eni)
-      + '[ -n "$UND_IF" ] || { echo "subnet-%s ENI not up yet"; exit 1; }\n' % g.subnet
-      + 'cat > /etc/systemd/network/04-overlay-%s.network <<EOFNET\n' % g.subnet
-      + '[Match]\nName=$UND_IF\n\n'
-      + underlayBody
-      + raRoutes(g.dests)
-      + 'EOFNET\n'
-      for g in groups
-    ]) + 'networkctl reload\n';
+//   1. RA priority: the device-index-1 (secondary/uplink) ENI gets a higher
+//      RA/DHCP RouteMetric so the device-0 ENI — the one the SSH GUA and stack
+//      outputs use — wins the default route. Otherwise both ENIs install an
+//      equal-metric RA default and the kernel's ECMP can egress replies on the
+//      wrong ENI, which AWS drops as asymmetric (instance unreachable over SSH).
+//      encap is unaffected: the daemon's resolver pins it to the uplink via oif.
+//
+//   2. Overlay routes: pin each `via: 'subnet:X'` /128 (+/32) to its subnet's ENI
+//      via Gateway=_ipv6ra/_dhcp4, so the decapped inner packet's exit rides the
+//      right ENI rather than the ECMP default.
+local eniNetworks(key) =
+  local routes = net.instances[key].routes;
+  std.join('', [
+    local metric = if e.deviceIndex == 0 then '' else 'RouteMetric=2048\n';
+    local dests = [{ v6: net.v6(r.di, r.ds), v4: net.v4(r.di, r.ds) } for r in routes if r.via == 'subnet:' + e.subnet];
+    'UND_IF=$(ip -o -6 addr show to %s/128 scope global | awk \'{print $2; exit}\')\n' % guaRef(e.logical)
+    + '[ -n "$UND_IF" ] || { echo "subnet-%s ENI not up yet"; exit 1; }\n' % e.subnet
+    + 'cat > /etc/systemd/network/04-und-%s.network <<EOFNET\n' % e.subnet
+    + '[Match]\nName=$UND_IF\n\n[Link]\nMTUBytes=1500\n\n[Network]\nDHCP=yes\nIPv6AcceptRA=yes\nIPv4Forwarding=yes\nIPv6Forwarding=yes\n\n[DHCPv4]\nUseMTU=no\n'
+    + metric
+    + '\n[IPv6AcceptRA]\nUseMTU=no\n'
+    + metric
+    + raRoutes(dests)
+    + 'EOFNET\n'
+    for e in net.enisOf(key)
+  ]) + 'networkctl reload\n';
 
 local dutSetup(key) =
   local inst = net.instances[key];
@@ -332,13 +324,13 @@ local dutSetup(key) =
       std.strReplace(dutSetupTmpl, '@@OWN_GUA@@', guaRef(inst.uplinkEni)),
       '@@DEB_URL@@', c.deb_url
     ),
-    '@@PINS@@', overlayNetworks(key)
+    '@@PINS@@', eniNetworks(key)
   );
 
 local generatorSetup(key) =
   std.strReplace(
     std.strReplace(generatorSetupTmpl, '@@TRAFGEN@@', c.trafgen_package),
-    '@@PINS@@', overlayNetworks(key)
+    '@@PINS@@', eniNetworks(key)
   );
 
 local benchScript(inst) =
