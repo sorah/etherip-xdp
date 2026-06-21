@@ -52,6 +52,38 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Turn a connect failure into an actionable message — chiefly so a permission
+/// error on the 0660 control socket isn't reported as "not running".
+fn connect_error(cli: &Cli, e: &varlink::Error) -> String {
+    let path = match &cli.socket {
+        Some(p) => p.clone(),
+        None => crate::manage::discovery::manager_socket_path(),
+    };
+    match e.kind() {
+        varlink::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) => format!(
+            "permission denied on {}: run etheripctl as root or as a member of the \
+             etherip-xdp-sock group",
+            path.display()
+        ),
+        varlink::ErrorKind::Io(std::io::ErrorKind::NotFound) if cli.socket.is_none() => format!(
+            "etherip-xdp-manager not running: no socket at {} \
+             (systemctl enable --now etherip-xdp-manager.socket)",
+            path.display()
+        ),
+        varlink::ErrorKind::Io(std::io::ErrorKind::NotFound) => {
+            format!(
+                "no socket at {}: is its etherip-xdp daemon running?",
+                path.display()
+            )
+        }
+        varlink::ErrorKind::Io(std::io::ErrorKind::ConnectionRefused) => format!(
+            "{} is not accepting connections (the service may be unhealthy)",
+            path.display()
+        ),
+        _ => format!("connect to {}: {e:#}", path.display()),
+    }
+}
+
 /// Connect and fetch the interfaces, applying the `--interface` filter.
 async fn fetch(cli: &Cli) -> anyhow::Result<Vec<crate::manage::generated::InterfaceStatus>> {
     let address = match &cli.socket {
@@ -61,15 +93,7 @@ async fn fetch(cli: &Cli) -> anyhow::Result<Vec<crate::manage::generated::Interf
 
     let connection = match varlink::AsyncConnection::with_address(address.clone()).await {
         Ok(c) => c,
-        Err(e) => {
-            if cli.socket.is_none() {
-                anyhow::bail!(
-                    "etherip-xdp-manager not running ({})",
-                    crate::manage::discovery::manager_socket_path().display()
-                );
-            }
-            anyhow::bail!("connect to {address}: {e:#}");
-        }
+        Err(e) => anyhow::bail!("{}", connect_error(cli, &e)),
     };
 
     let client = crate::manage::generated::VarlinkClient::new(connection);
