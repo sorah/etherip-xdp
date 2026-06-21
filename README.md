@@ -100,9 +100,47 @@ One JSON file per tunnel under `/etc/etherip-xdp/<device>.d/`:
 | `remote` | yes      | Remote outer IPv6 endpoint. |
 | `mss`    | no       | `"auto"` (default), `"off"`, an integer (both families), or `{ "ipv4": N, "ipv6": N }`. |
 | `mtu`    | no       | Tunnel MTU override (default: uplink MTU − 56). |
+| `mac`    | no       | Local MAC the user-facing interface presents on the connected L2 domain. Omit to keep the kernel-assigned address, `"inherit"` to copy the external device's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"`. |
 
 The external device is the process scope, so it is **not** repeated in the
 file (see `packaging/etc/etherip-xdp/eth1.d/` for examples).
+
+## Reload
+
+The daemon re-reads the config directory only on **SIGHUP** (`systemctl reload
+etherip-xdp@<device>`); editing files has no effect until then. A reload is
+graceful: the new set of configs is diffed against the running tunnels **by
+tunnel name**, and only the difference is applied — unchanged tunnels are left
+running and never flap.
+
+Each loaded config falls into one of three cases:
+
+| Case | Trigger | Action |
+|------|---------|--------|
+| Added   | A tunnel name not currently running | Created fresh: veth pair, XDP attach, map entries. |
+| Removed | A running tunnel whose name is gone from the configs | Torn down: programs detached, map entries removed, veth deleted. |
+| Updated | Same name, any field changed | Reconfigured **in place** — the veth is never recreated, because its name is the tunnel's identity. |
+
+Because the tunnel name is the identity, an in-place update covers every other
+attribute without dropping the interface. How each behaves on update:
+
+| Attribute | Behavior on reload |
+|-----------|--------------------|
+| `name`   | This *is* the identity, so it is not an in-place update: the old name is treated as removed and the new one as added (the veth is recreated under the new name, with a brief data interruption). Renaming the file behaves the same, since the name defaults to the file stem. |
+| `local`  | Outer source re-resolved; the decap key and encap/decap map entries are updated. The last-known source is kept if a new one cannot be resolved, so a ready tunnel never flaps back to pending. |
+| `remote` | Outer destination and decap key updated; the next-hop MAC is re-resolved (with an ND probe) for the new endpoint. |
+| `mss`    | Recomputed and rewritten into the map. No veth or attach churn. |
+| `mtu`    | The user-facing veth and its peer are set to the new MTU in place. No recreation. |
+| `mac`    | Applied to the existing veth via netlink. Switching back to the omitted/default keeps the current address — the original kernel-assigned MAC is **not** restored without recreating the veth (rename or remove+add it to do so). |
+
+If applying one tunnel fails during a reload, the error is logged and the
+remaining tunnels are still processed. A tunnel that is still pending (an
+auto-selected `local` with no route yet) records the new spec on reload and is
+installed once a source resolves.
+
+Underlay tracking — re-selecting an auto `local` source and refreshing the
+next-hop MAC — happens continuously on netlink change events and a periodic
+tick, independent of SIGHUP. SIGHUP is only for applying config-file edits.
 
 ## Run
 

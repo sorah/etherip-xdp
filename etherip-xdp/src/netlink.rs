@@ -145,6 +145,20 @@ impl Netlink {
             .map_err(|e| anyhow::anyhow!("delete link {name}: {e}"))
     }
 
+    /// Set a link's hardware (MAC) address.
+    pub async fn set_mac(&self, index: u32, mac: [u8; 6]) -> anyhow::Result<()> {
+        self.handle
+            .link()
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(index)
+                    .address(mac.to_vec())
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("set mac on ifindex {index}: {e}"))
+    }
+
     /// Set a link's MTU and bring it up.
     pub async fn set_mtu_up(&self, index: u32, mtu: u32) -> anyhow::Result<()> {
         self.handle
