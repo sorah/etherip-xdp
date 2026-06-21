@@ -26,26 +26,67 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 
-# The varlink control socket fd is passed by name ("varlink"). The daemon also
-# self-binds it when run outside socket activation, so this is optional.
+# The varlink control socket fd is passed by name ("varlink"). Under the
+# sandboxing below the daemon runs unprivileged and cannot self-bind into the
+# shared runtime dir (ProtectSystem=strict), so socket activation is the supported
+# path for the management interface — enable etherip-xdp-varlink@%i.socket. The
+# data path runs regardless of whether the socket is enabled.
 Sockets=etherip-xdp-varlink@%i.socket
 
-# Search $RUNTIME_DIRECTORY (/run/etherip-xdp) for volatile config drop-ins,
-# ahead of /etc; preserved across restarts, cleared at reboot.
-RuntimeDirectory=etherip-xdp
-RuntimeDirectoryPreserve=yes
+# Run as a dynamic, unprivileged user that joins the static etherip-xdp-sock group
+# (created via sysusers.d). That group owns the 0660 varlink control sockets and
+# the shared /run/etherip-xdp runtime dir (created via tmpfiles.d), so the
+# host-wide manager — a separate dynamic user in the same group — can reach each
+# daemon's per-device socket. (A shared DynamicUser identity can't: systemd parks
+# its RuntimeDirectory under /run/private at 0700, unreachable cross-unit.)
+DynamicUser=yes
+SupplementaryGroups=etherip-xdp-sock
 
-# Loading/attaching XDP, managing veth/neighbours, and ethtool need these.
-# On kernels < 5.8, CAP_BPF does not exist; replace it with CAP_SYS_ADMIN.
-# CAP_PERFMON sets allow_ptr_leaks so the verifier accepts the data-path's
-# variable packet-offset arithmetic; without it newer kernels (6.x/7.0) reject
-# the load with "pointer arithmetic ... prohibited for !root".
-# CAP_SYS_ADMIN is required for unshare(CLONE_NEWNET): by default each tunnel's
-# veth peer is hidden in a daemon-private anonymous netns. Pass
-# --disable-veth-peer-netns to keep peers in the host namespace if you want to
-# drop CAP_SYS_ADMIN.
+# Volatile config drop-ins are searched under $RUNTIME_DIRECTORY (/run/etherip-xdp),
+# created by tmpfiles.d rather than RuntimeDirectory=: with DynamicUser= the latter
+# would relocate it under /run/private (0700), out of the manager's reach and apart
+# from the socket dir. Set the variable explicitly so the search still resolves.
+Environment=RUNTIME_DIRECTORY=/run/etherip-xdp
+
+# Capabilities (kept despite DynamicUser): CAP_BPF/CAP_PERFMON/CAP_NET_ADMIN/
+# CAP_NET_RAW load & attach XDP, manage veth/neighbours and ethtool; CAP_PERFMON
+# also sets allow_ptr_leaks so the verifier accepts the data-path's variable
+# packet-offset arithmetic (6.x/7.0 reject it otherwise). CAP_SYS_RESOURCE: memlock.
+# CAP_SYS_ADMIN: unshare(CLONE_NEWNET) for the hidden veth-peer netns (drop it with
+# --disable-veth-peer-netns). On kernels < 5.8 replace CAP_BPF with CAP_SYS_ADMIN.
 AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN
+
+# Sandboxing (systemd-analyze security ~2.2 OK). The data path (XDP load, veth
+# netns, ethtool, forwarding) is validated under this exact set:
+#  - RestrictNamespaces=net keeps unshare(CLONE_NEWNET) working;
+#  - RestrictAddressFamilies includes AF_INET(6) for the ethtool ioctl socket and
+#    AF_NETLINK/AF_PACKET for netlink/XDP;
+#  - SystemCallFilter keeps bpf/unshare/setns over @system-service.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=net
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_PACKET AF_INET AF_INET6
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+IPAddressDeny=any
+SystemCallFilter=@system-service bpf unshare setns
+SystemCallFilter=~@resources @reboot @swap @cpu-emulation @obsolete
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

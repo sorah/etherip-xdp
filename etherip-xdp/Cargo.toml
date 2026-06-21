@@ -36,6 +36,11 @@ assets = [
     ["../packaging/etherip-xdp-manager.service", "usr/lib/systemd/system/", "644"],
     ["../packaging/etherip-xdp-manager.socket", "usr/lib/systemd/system/", "644"],
     ["../packaging/etherip-xdp-varlink@.socket", "usr/lib/systemd/system/", "644"],
+    # The hardened units run as DynamicUsers sharing the static etherip-xdp-sock
+    # group, which owns the 0660 control sockets and the /run/etherip-xdp dir.
+    # dpkg's systemd triggers run systemd-sysusers / systemd-tmpfiles on these.
+    ["../packaging/etherip-xdp.sysusers", "usr/lib/sysusers.d/etherip-xdp.conf", "644"],
+    ["../packaging/etherip-xdp.tmpfiles", "usr/lib/tmpfiles.d/etherip-xdp.conf", "644"],
     ["../README.md", "usr/share/doc/etherip-xdp/README.md", "644"],
     ["../packaging/etc/etherip-xdp/interfaces.d/eth1/peer.json", "usr/share/doc/etherip-xdp/examples/interfaces.d/eth1/", "644"],
     ["../packaging/etc/etherip-xdp/interfaces.d/eth1/example-explicit-mss.json", "usr/share/doc/etherip-xdp/examples/interfaces.d/eth1/", "644"],

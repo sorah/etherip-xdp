@@ -1,0 +1,6 @@
+# Shared runtime dir for the varlink control sockets (per-device subdirs plus the
+# host-wide manager socket) and for volatile config drop-ins ($RUNTIME_DIRECTORY).
+# setgid + group-owned so socket-activated sockets and their per-device subdirs
+# inherit the etherip-xdp-sock group; mode 2750 keeps it off-limits to other users
+# while letting group members (the daemons and the manager) traverse it.
+d /run/etherip-xdp 2750 root etherip-xdp-sock -

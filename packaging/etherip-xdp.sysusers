@@ -1,0 +1,5 @@
+# Static group shared by the per-device daemons and the host-wide manager (each a
+# distinct DynamicUser). It owns the 0660 varlink control sockets and the
+# /run/etherip-xdp runtime dir (see etherip-xdp.tmpfiles), letting the manager
+# reach the daemons' sockets via group membership rather than running as root.
+g etherip-xdp-sock -

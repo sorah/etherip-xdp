@@ -13,6 +13,9 @@ Service=etherip-xdp-manager.service
 ListenStream=/run/etherip-xdp/co.0w0.etheripxdp.Management
 FileDescriptorName=varlink
 SocketMode=0660
+# Same group as the daemon sockets so etheripctl (run by an admin in the group)
+# and the manager service share one ownership model.
+SocketGroup=etherip-xdp-sock
 Symlinks=/run/varlink/registry/co.0w0.etheripxdp.Management
 
 [Install]

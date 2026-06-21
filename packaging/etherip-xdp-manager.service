@@ -1,6 +1,7 @@
 # Host-wide varlink proxy aggregating every per-device etherip-xdp daemon.
-# Socket-activated via etherip-xdp-manager.socket; runs as root to read the
-# daemons' root-owned 0660 control sockets.
+# Socket-activated via etherip-xdp-manager.socket. Runs as a dynamic, unprivileged
+# user in the etherip-xdp-sock group so it can reach the daemons' group-owned 0660
+# control sockets under /run/etherip-xdp (no root needed).
 #
 #   sudo install -Dm0755 target/release/etherip-xdp-manager /usr/bin/etherip-xdp-manager
 #   sudo systemctl enable --now etherip-xdp-manager.socket
@@ -14,11 +15,43 @@ ExecStart=/usr/bin/etherip-xdp-manager
 Restart=on-failure
 RestartSec=2
 
-# Shared with the daemons; preserved across restarts, cleared at reboot.
-RuntimeDirectory=etherip-xdp
-RuntimeDirectoryPreserve=yes
-
 Sockets=etherip-xdp-manager.socket
+
+# Join the shared socket group to read the daemons' sockets and traverse the
+# group-owned /run/etherip-xdp (created via tmpfiles.d). Its own socket is provided
+# by socket activation, so no RuntimeDirectory is needed.
+DynamicUser=yes
+SupplementaryGroups=etherip-xdp-sock
+
+# The manager only reads unix sockets — no capabilities.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Sandboxing (systemd-analyze security ~0.8 SAFE).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources @reboot @swap @cpu-emulation @obsolete @privileged
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
