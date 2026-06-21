@@ -76,7 +76,13 @@ pub async fn serve(
         vec![handler],
     ));
     let config = varlink::ListenAsyncConfig {
-        idle_timeout: std::time::Duration::from_secs(1),
+        // Run for the daemon's lifetime. A non-zero idle_timeout makes
+        // listen_async return Err(Timeout) as soon as an accept poll finds no
+        // active connections (~100ms after start if no client has connected
+        // yet), which would tear down the management socket. Shutdown is driven
+        // by stop_listening (polled every 100ms because it is set) and the task
+        // is also aborted on stop, so no idle timeout is needed.
+        idle_timeout: std::time::Duration::ZERO,
         stop_listening: Some(stop),
     };
     if let Err(e) = varlink::listen_async(service, address.clone(), &config).await {
