@@ -1,0 +1,20 @@
+# Per-instance varlink control socket for etherip-xdp@<iface>, mirroring the
+# systemd <service>-varlink.socket convention (e.g. systemd-resolved-varlink).
+# The socket file name is the varlink interface name; the per-instance
+# subdirectory under the shared RuntimeDirectory distinguishes daemons. The
+# etherip-xdp-manager proxy discovers and aggregates these sockets.
+#
+#   sudo systemctl enable --now etherip-xdp-varlink@eth1.socket
+[Unit]
+Description=Varlink control socket for XDP EtherIP on %i
+Documentation=https://github.com/sorah/etherip-xdp
+PartOf=etherip-xdp@%i.service
+
+[Socket]
+Service=etherip-xdp@%i.service
+ListenStream=/run/etherip-xdp/%i/co.0w0.etheripxdp.Management
+FileDescriptorName=varlink
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

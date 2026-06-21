@@ -116,6 +116,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     bump_memlock_rlimit();
 
+    let device = opt.device.clone();
     let mut manager = crate::control::tunnel::Manager::start(
         opt.device,
         config_dirs,
@@ -123,6 +124,18 @@ pub async fn run() -> anyhow::Result<()> {
     )
     .await?;
     log::info!("etherip-xdp ready; SIGHUP to reload, SIGINT/SIGTERM to stop");
+
+    // Embedded varlink management server. It runs as a separate task and reaches
+    // the manager only via this channel, serviced in the select! loop below, so
+    // the manager (and its non-Send aya handles) stays confined to this task.
+    let (control_tx, mut control_rx) =
+        tokio::sync::mpsc::channel::<crate::control::types::ControlRequest>(8);
+    let control_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control_server = tokio::spawn(crate::control::server::serve(
+        device,
+        control_tx,
+        control_stop.clone(),
+    ));
 
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -141,6 +154,11 @@ pub async fn run() -> anyhow::Result<()> {
             }
             _ = sigterm.recv() => { log::info!("SIGTERM: shutting down"); break; }
             _ = sigint.recv() => { log::info!("SIGINT: shutting down"); break; }
+            Some(req) = control_rx.recv() => {
+                // Management query from the embedded varlink server; serviced
+                // synchronously (reads live state, including BPF counters).
+                manager.handle_control(req);
+            }
             Some(_) = monitor.recv() => {
                 // Coalesce a burst of neighbour/route changes before re-resolving.
                 tokio::time::sleep(MONITOR_DEBOUNCE).await;
@@ -156,6 +174,11 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
     }
+
+    // Stop the management server (it polls `stop` on its accept idle-timeout);
+    // abort as a backstop since the process is exiting anyway.
+    control_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    control_server.abort();
 
     manager.dump_counters();
     manager.cleanup().await;

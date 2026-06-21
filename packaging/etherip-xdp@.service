@@ -5,6 +5,11 @@
 #   sudo mkdir -p /etc/etherip-xdp/interfaces.d/eth1   # one *.json per tunnel
 #   sudo systemctl enable --now etherip-xdp@eth1
 #   sudo systemctl reload etherip-xdp@eth1  # graceful config reload (SIGHUP)
+#
+# For the varlink management interface (etheripctl / etherip-xdp-manager), also
+# enable the per-instance control socket and the host-wide manager:
+#   sudo systemctl enable --now etherip-xdp-varlink@eth1.socket
+#   sudo systemctl enable --now etherip-xdp-manager.socket
 [Unit]
 Description=XDP EtherIP tunnels on %i
 Documentation=https://github.com/sorah/etherip-xdp
@@ -20,6 +25,10 @@ ExecStart=/usr/bin/etherip-xdp %i
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
+
+# The varlink control socket fd is passed by name ("varlink"). The daemon also
+# self-binds it when run outside socket activation, so this is optional.
+Sockets=etherip-xdp-varlink@%i.socket
 
 # Search $RUNTIME_DIRECTORY (/run/etherip-xdp) for volatile config drop-ins,
 # ahead of /etc; preserved across restarts, cleared at reboot.
