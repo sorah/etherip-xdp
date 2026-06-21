@@ -110,6 +110,28 @@ impl Netlink {
             .map_err(|e| anyhow::anyhow!("create veth {name}/{peer}: {e}"))
     }
 
+    /// Move the link `index` into the network namespace referenced by `fd`
+    /// (equivalent to `ip link set dev DEV netns FD`). The link keeps its name
+    /// but is reassigned a fresh ifindex inside the target namespace, and its
+    /// administrative state is reset to down, so the caller must bring it back up
+    /// from within that namespace.
+    pub async fn move_link_to_netns(
+        &self,
+        index: u32,
+        fd: std::os::fd::RawFd,
+    ) -> anyhow::Result<()> {
+        self.handle
+            .link()
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(index)
+                    .setns_by_fd(fd)
+                    .build(),
+            )
+            .execute()
+            .await
+            .map_err(|e| anyhow::anyhow!("move link {index} to netns: {e}"))
+    }
+
     /// Delete a link by name; a no-op if it doesn't exist.
     pub async fn delete_link(&self, name: &str) -> anyhow::Result<()> {
         let Some(index) = self.index_of(name).await? else {

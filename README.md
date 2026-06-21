@@ -27,17 +27,30 @@ with several enhancements:
 ```
         /etc/etherip-xdp/eth1.d/{peer,office}.json   (one file per tunnel)
                          │  one process per uplink: etherip-xdp@eth1
-   user iface peer  ◄─XDP_PASS             user iface office  ◄─XDP_PASS
+   user iface peer  ◄─XDP_PASS             user iface office  ◄─XDP_PASS   (host netns)
         │ veth                                  │ veth
-   peer-xdp  ◄─ main XDP (encap)           office-xdp  ◄─ main XDP (encap)
+··· hidden netns ·······························│··································
+   peer-xdp  ◄─ xdp_encap                  office-xdp  ◄─ xdp_encap
         │                                       │
-        └──────────── DEVMAP_HASH redirect ─────┴──────────►  eth1 ◄─ main XDP (decap, shared)
+        └──────────── DEVMAP_HASH redirect ─────┴──────────►  eth1 ◄─ xdp_decap (shared)
 ```
 
 A veth pair is created per tunnel; the user-facing end (`<name>`) carries your L2
-traffic, the peer (`<name>-xdp`) runs the main XDP program for encap. The shared
-main program on the uplink handles decap for every tunnel. A minimal `XDP_PASS`
-program on each user-facing end satisfies the kernel's veth redirect peer check.
+traffic, the peer (`<name>-xdp`) runs `xdp_encap`. The shared `xdp_decap` program
+on the uplink handles decap for every tunnel. A minimal `XDP_PASS` program on each
+user-facing end satisfies the kernel's veth redirect peer check.
+
+**Hidden peer namespace:** the `<name>-xdp` peer is purely an internal artefact of
+driving encap through XDP, so by default it is moved into a daemon-private,
+anonymous network namespace — it never shows up in `ip link` (or `ip netns list`)
+and is destroyed when the daemon exits. Only the user-facing `<name>` end stays in
+the host namespace. Decap and encap therefore redirect across the namespace
+boundary, which native-mode XDP supports (the same path container networking uses);
+encap and decap use separate devmaps so the peer's namespace-local ifindex can
+never collide with the uplink's. Pass `--disable-veth-peer-netns` to keep the peer
+in the host namespace instead (for debugging, or on kernels without working
+cross-namespace XDP redirect, where it would otherwise fall back to slower SKB
+mode or fail).
 
 **Why one process per uplink:** only one XDP program may be attached to a given
 interface, so tunnels sharing an uplink must share one program. The process /
