@@ -98,14 +98,16 @@ local sysctlConf = |||
   net.ipv4.conf.default.rp_filter=0
 |||;
 
-// Pin the tunnel config dir so etherip.json can be a static, pre-created file
-// regardless of the uplink interface name (which becomes the `%i` device arg).
+// Read tunnels from a fixed, verbatim --config-dir instead of the default
+// /etc/etherip-xdp/interfaces.d/<device>/ layout, so etherip.json can be a
+// static, pre-created file regardless of the uplink interface name (which
+// becomes the `%i` device arg, only known at boot).
 // CAP_PERFMON is required for the data-path verifier on newer kernels (also set
 // in the packaging unit; harmless if the installed deb already has it).
 local etheripDropin = |||
   [Service]
   ExecStart=
-  ExecStart=/usr/bin/etherip-xdp --config-dir /etc/etherip-xdp/tunnel.d %i
+  ExecStart=/usr/bin/etherip-xdp --config-dir /etc/etherip-xdp/tunnels %i
   AmbientCapabilities=CAP_PERFMON
   CapabilityBoundingSet=CAP_PERFMON
 |||;
@@ -291,7 +293,7 @@ local file(path, content, perm='0644') = { path: path, permissions: perm, conten
     local dutFiles = [
       file('/etc/systemd/network/19-etherip.link', etheripLink),
       file('/etc/systemd/network/20-etherip.network', etheripNetwork(inst)),
-      file('/etc/etherip-xdp/tunnel.d/etherip.json', etheripJson(inst)),
+      file('/etc/etherip-xdp/tunnels/etherip.json', etheripJson(inst)),
       file('/etc/systemd/system/etherip-xdp@.service.d/10-config-dir.conf', etheripDropin),
       file('/usr/local/sbin/etherip-bench-setup', dutSetup(inst), '0755'),
     ];

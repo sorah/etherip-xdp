@@ -19,12 +19,12 @@ XDP-accelerated EtherIP (RFC 3378) over IPv6 tunnels. Ethernet frames are \
 encapsulated in outer-Ethernet + IPv6 + EtherIP and moved between a physical \
 uplink and a veth pair entirely in XDP, with one process per uplink driven by \
 the templated etherip-xdp@<iface>.service unit and JSON config under \
-/etc/etherip-xdp/<iface>.d/."""
+/etc/etherip-xdp/interfaces.d/<iface>/."""
 assets = [
     ["target/release/etherip-xdp", "usr/bin/", "755"],
     ["../README.md", "usr/share/doc/etherip-xdp/README.md", "644"],
-    ["../packaging/etc/etherip-xdp/eth1.d/peer.json", "usr/share/doc/etherip-xdp/examples/eth1.d/", "644"],
-    ["../packaging/etc/etherip-xdp/eth1.d/example-explicit-mss.json", "usr/share/doc/etherip-xdp/examples/eth1.d/", "644"],
+    ["../packaging/etc/etherip-xdp/interfaces.d/eth1/peer.json", "usr/share/doc/etherip-xdp/examples/interfaces.d/eth1/", "644"],
+    ["../packaging/etc/etherip-xdp/interfaces.d/eth1/example-explicit-mss.json", "usr/share/doc/etherip-xdp/examples/interfaces.d/eth1/", "644"],
 ]
 
 # Templated unit (etherip-xdp@.service): no default instance to enable/start, so
@@ -62,6 +62,7 @@ nix = { workspace = true }
 
 [dev-dependencies]
 etherparse = { workspace = true }
+tempfile = { workspace = true }
 # The `host` feature adds `data_path::HostPacket`, which the data-path tests run
 # alongside BPF_PROG_TEST_RUN to assert the eBPF program and the shared core agree
 # byte for byte. Enabled only for test builds, so the daemon binary stays slim.

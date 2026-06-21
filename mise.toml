@@ -61,7 +61,7 @@ description = "Format the workspace"
 run = "cargo fmt"
 
 [tasks.run]
-description = "Run against an interface locally (requires root); reads /etc/etherip-xdp/<iface>.d"
+description = "Run against an interface locally (requires root); reads /etc/etherip-xdp/interfaces.d/<iface>"
 run = 'cargo build --release && sudo -E ./target/release/etherip-xdp {{arg(name="iface", default="eth1")}}'
 
 [tasks.install]

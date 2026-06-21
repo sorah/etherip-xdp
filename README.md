@@ -25,7 +25,7 @@ with several enhancements:
 ## How it works
 
 ```
-        /etc/etherip-xdp/eth1.d/{peer,office}.json   (one file per tunnel)
+  /etc/etherip-xdp/interfaces.d/eth1/{peer,office}.json   (one file per tunnel)
                          │  one process per uplink: etherip-xdp@eth1
    user iface peer  ◄─XDP_PASS             user iface office  ◄─XDP_PASS   (host netns)
         │ veth                                  │ veth
@@ -90,7 +90,7 @@ The eBPF object is compiled and embedded automatically by `etherip-xdp/build.rs`
 
 ## Configure
 
-One JSON file per tunnel under `/etc/etherip-xdp/<device>.d/`:
+One JSON file per tunnel under `/etc/etherip-xdp/interfaces.d/<device>/`:
 
 ```json
 {
@@ -111,11 +111,35 @@ One JSON file per tunnel under `/etc/etherip-xdp/<device>.d/`:
 | `next_hop_on_link` | no | On-link policy when the route lookup returns no gateway: `"maybe"` (default), `"always"`, or `"never"`. See [Next-hop resolution](#next-hop-resolution--the-on-link-policy). |
 
 The external device is the process scope, so it is **not** repeated in the
-file (see `packaging/etc/etherip-xdp/eth1.d/` for examples).
+file (see `packaging/etc/etherip-xdp/interfaces.d/eth1/` for examples).
+
+### Config directories
+
+The daemon reads tunnels from `/etc/etherip-xdp/interfaces.d/<device>/` — that
+is all most setups need; drop one `*.json` per tunnel there.
+
+To point somewhere else, use one of two mutually-exclusive flags, both
+repeatable:
+
+- `--config-root <dir>` replaces the config root; the `interfaces.d/<device>`
+  layout is still appended (so the directory becomes
+  `<dir>/interfaces.d/<device>/`).
+- `--config-dir <dir>` names a directory to read verbatim, without the
+  `interfaces.d/<device>` layout.
+
+When several directories are given (or searched by default), they follow systemd
+drop-in precedence: a file name found in an earlier (higher-precedence) directory
+shadows the same name in later ones.
+
+> **Tip (advanced):** if the unit sets systemd `RuntimeDirectory=`, the granted
+> `$RUNTIME_DIRECTORY` is searched as an additional root *ahead* of
+> `/etc/etherip-xdp`. This lets a generator or orchestration layer write volatile
+> tunnel drop-ins under `/run` that override (or extend) the on-disk `/etc`
+> config without touching it.
 
 ## Reload
 
-The daemon re-reads the config directory only on **SIGHUP** (`systemctl reload
+The daemon re-reads the config directories only on **SIGHUP** (`systemctl reload
 etherip-xdp@<device>`); editing files has no effect until then. A reload is
 graceful: the new set of configs is diffed against the running tunnels **by
 tunnel name**, and only the difference is applied — unchanged tunnels are left
