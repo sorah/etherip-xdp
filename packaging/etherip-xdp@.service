@@ -58,7 +58,7 @@ SystemCallArchitectures=native
 MemoryDenyWriteExecute=yes
 IPAddressDeny=any
 SystemCallFilter=@system-service bpf unshare setns
-SystemCallFilter=~@resources @reboot @swap @cpu-emulation @obsolete
+SystemCallFilter=~@keyring @resources @setuid @reboot @swap @cpu-emulation @obsolete
 UMask=0077
 
 [Install]

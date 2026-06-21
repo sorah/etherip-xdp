@@ -40,6 +40,6 @@ SystemCallArchitectures=native
 MemoryDenyWriteExecute=yes
 IPAddressDeny=any
 SystemCallFilter=@system-service
-SystemCallFilter=~@resources @reboot @swap @cpu-emulation @obsolete @privileged
+SystemCallFilter=~@keyring @resources @setuid @reboot @swap @cpu-emulation @obsolete @privileged
 UMask=0077
 # No [Install]: started on demand via etherip-xdp-manager.socket.
