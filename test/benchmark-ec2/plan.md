@@ -255,7 +255,7 @@ dut-1 etherip: `local = Dut1BEni GUA` (subnet b), `remote = Dut2CEni GUA`
 (subnet c). dut-2 is the mirror. The route from dut-1 to dut-2's subnet-c GUA is
 **not on-link** (different subnet), so it resolves to the VPC-router gateway on
 subnet b — exactly the next-hop MAC resolution etherip-xdp re-tracks on netlink
-changes. `--next-hop-on-link` stays default `maybe` (the route lookup returns a
+changes. `next_hop_on_link` stays default `maybe` (the route lookup returns a
 gateway, which always wins).
 
 Both ENIs carry an RA default route, so a plain route lookup to the peer could

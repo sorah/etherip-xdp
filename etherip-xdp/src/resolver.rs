@@ -27,7 +27,7 @@ const PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(
 /// Policy for treating the remote endpoint as its own next hop ("on-link") when
 /// the route lookup returns no gateway. The on-link assumption is dangerous when
 /// the peer is actually reached via a router, so it must be chosen explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NextHopOnLink {
     /// On-link only when the routing table actually returns a gatewayless
     /// (connected) route for the destination. No route -> not resolved. (default)

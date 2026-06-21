@@ -16,6 +16,8 @@
 //! `mac` sets the user-facing interface's MAC on the connected L2 domain: omit to
 //! keep the kernel-assigned address (default), `"inherit"` to copy the external
 //! device's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"` address.
+//! `next_hop_on_link` selects how the remote endpoint is treated when the route
+//! lookup returns no gateway: `"maybe"` (default), `"always"`, or `"never"`.
 
 /// How to clamp the inner TCP MSS for a tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -77,6 +79,8 @@ pub struct TunnelSpec {
     pub mtu: Option<u32>,
     /// Local MAC address presented on the connected L2 domain.
     pub mac: MacConfig,
+    /// On-link policy for the next hop when the route lookup returns no gateway.
+    pub next_hop_on_link: crate::resolver::NextHopOnLink,
 }
 
 #[derive(serde::Deserialize)]
@@ -88,6 +92,7 @@ struct RawTunnel {
     mss: Option<RawMss>,
     mtu: Option<u32>,
     mac: Option<String>,
+    next_hop_on_link: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -113,6 +118,20 @@ fn convert_mss(raw: Option<RawMss>) -> anyhow::Result<MssConfig> {
         },
         Some(RawMss::Value(v)) => MssConfig::Both(v),
         Some(RawMss::PerFamily { ipv4, ipv6 }) => MssConfig::PerFamily { ipv4, ipv6 },
+    })
+}
+
+fn convert_on_link(raw: Option<String>) -> anyhow::Result<crate::resolver::NextHopOnLink> {
+    Ok(match raw {
+        None => crate::resolver::NextHopOnLink::default(),
+        Some(k) => match k.to_ascii_lowercase().as_str() {
+            "maybe" => crate::resolver::NextHopOnLink::Maybe,
+            "always" => crate::resolver::NextHopOnLink::Always,
+            "never" => crate::resolver::NextHopOnLink::Never,
+            other => anyhow::bail!(
+                "invalid next_hop_on_link value {other:?} (expected \"maybe\", \"always\", or \"never\")"
+            ),
+        },
     })
 }
 
@@ -173,6 +192,7 @@ impl TunnelSpec {
             mss: convert_mss(raw.mss)?,
             mtu: raw.mtu,
             mac: convert_mac(raw.mac)?,
+            next_hop_on_link: convert_on_link(raw.next_hop_on_link)?,
         })
     }
 
@@ -325,6 +345,32 @@ mod tests {
         assert_eq!(
             spec(r#"{"remote":"2001:db8::2","mac":"02:00:5e:10:00:01"}"#).mac,
             MacConfig::Explicit([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn next_hop_on_link_variants() {
+        // Omitted -> default (maybe).
+        assert_eq!(
+            spec(r#"{"remote":"2001:db8::2"}"#).next_hop_on_link,
+            crate::resolver::NextHopOnLink::Maybe
+        );
+        // Keywords are case-insensitive.
+        assert_eq!(
+            spec(r#"{"remote":"2001:db8::2","next_hop_on_link":"always"}"#).next_hop_on_link,
+            crate::resolver::NextHopOnLink::Always
+        );
+        assert_eq!(
+            spec(r#"{"remote":"2001:db8::2","next_hop_on_link":"NEVER"}"#).next_hop_on_link,
+            crate::resolver::NextHopOnLink::Never
+        );
+        // Unknown keyword is rejected.
+        assert!(
+            TunnelSpec::from_json(
+                r#"{"remote":"2001:db8::2","next_hop_on_link":"sometimes"}"#,
+                "n"
+            )
+            .is_err()
         );
     }
 

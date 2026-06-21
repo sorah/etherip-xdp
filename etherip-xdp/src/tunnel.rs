@@ -96,7 +96,6 @@ pub struct Manager {
     external: ExternalInterface,
     external_decap_link: aya::programs::xdp::XdpLinkId,
     config_dir: std::path::PathBuf,
-    on_link: crate::resolver::NextHopOnLink,
     /// When `Some`, each tunnel's `<name>-xdp` peer is moved into this private
     /// anonymous namespace to hide it from userland; when `None`, peers stay in
     /// the host namespace alongside the user-facing ends.
@@ -143,7 +142,6 @@ impl Manager {
     pub async fn start(
         external_name: String,
         config_dir: std::path::PathBuf,
-        on_link: crate::resolver::NextHopOnLink,
         hide_peer: bool,
     ) -> anyhow::Result<Self> {
         let nl = crate::netlink::Netlink::connect()?;
@@ -185,7 +183,6 @@ impl Manager {
             external,
             external_decap_link,
             config_dir,
-            on_link,
             netns,
             tunnels: std::collections::HashMap::new(),
         };
@@ -401,7 +398,7 @@ impl Manager {
             &self.external.name,
             spec.local,
             spec.remote,
-            self.on_link,
+            spec.next_hop_on_link,
             crate::resolver::Probe::Bringup,
         )
         .await
@@ -558,7 +555,7 @@ impl Manager {
             &self.external.name,
             spec.local,
             spec.remote,
-            self.on_link,
+            spec.next_hop_on_link,
             crate::resolver::Probe::Bringup,
         )
         .await
@@ -709,7 +706,7 @@ impl Manager {
                 &self.external.name,
                 spec.local,
                 spec.remote,
-                self.on_link,
+                spec.next_hop_on_link,
                 probe,
             )
             .await
@@ -839,6 +836,7 @@ mod tests {
             mss,
             mtu: None,
             mac: crate::config::MacConfig::Auto,
+            next_hop_on_link: crate::resolver::NextHopOnLink::default(),
         }
     }
 

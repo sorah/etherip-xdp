@@ -27,12 +27,6 @@ struct Opt {
     #[arg(long)]
     config_dir: Option<std::path::PathBuf>,
 
-    /// When to treat the remote endpoint as its own next hop ("on-link") if the
-    /// route lookup returns no gateway: `maybe` (only when a connected route
-    /// exists), `always`, or `never` (require a gateway).
-    #[arg(long, value_enum, default_value = "maybe")]
-    next_hop_on_link: resolver::NextHopOnLink,
-
     /// Keep each tunnel's internal `<name>-xdp` veth peer in the host namespace
     /// instead of hiding it in a daemon-private anonymous network namespace. By
     /// default the peer is hidden so it does not appear in `ip link`; pass this to
@@ -68,13 +62,8 @@ async fn main() -> anyhow::Result<()> {
 
     bump_memlock_rlimit();
 
-    let mut manager = tunnel::Manager::start(
-        opt.device,
-        config_dir,
-        opt.next_hop_on_link,
-        !opt.disable_veth_peer_netns,
-    )
-    .await?;
+    let mut manager =
+        tunnel::Manager::start(opt.device, config_dir, !opt.disable_veth_peer_netns).await?;
     log::info!("etherip-xdp ready; SIGHUP to reload, SIGINT/SIGTERM to stop");
 
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
