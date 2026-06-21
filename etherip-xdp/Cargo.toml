@@ -52,13 +52,20 @@ tokio = { workspace = true, features = [
     "time",
     "sync",
     "fs",
+    # `process` is required by varlink's tokio feature (AsyncConnection::with_activate
+    # /with_bridge); enabling it here turns it on for the unified tokio dependency.
+    "process",
 ] }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The varlink-generated bindings reference `serde_derive` and `async_trait` directly.
+serde_derive = "1"
 rtnetlink = { workspace = true }
 futures-util = { workspace = true }
 nix = { workspace = true }
+varlink = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 etherparse = { workspace = true }
@@ -85,6 +92,8 @@ cargo_metadata = { workspace = true }
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
 etherip-xdp-ebpf = { path = "../etherip-xdp-ebpf" }
+# Generates the varlink management-interface bindings into OUT_DIR.
+varlink_generator = { workspace = true }
 
 [lib]
 name = "etherip_xdp"
