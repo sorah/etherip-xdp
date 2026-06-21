@@ -93,11 +93,31 @@ struct Opt {
     /// TCP phase behaviour (echo for Linux↔Linux, connect for interop peers).
     #[arg(long, value_enum, default_value = "echo")]
     tcp: TcpMode,
+
+    /// Run the daemon under the in-process sandbox (non-root uid + ambient caps +
+    /// no-new-privs) mirroring packaging/etherip-xdp@.service.
+    #[arg(long, default_value_t = false)]
+    sandbox: bool,
 }
+
+mod sandbox;
 
 const PAYLOAD: &[u8] = b"etherip-xdp integration payload; the quick brown fox jumps; 0123456789";
 
 fn main() {
+    // Wrapper subcommand: `etherip-xdp-e2e __sandbox <daemon> [args...]` drops
+    // privileges and execs the daemon (see sandbox.rs). Intercept before clap and
+    // before any threads start.
+    let mut raw = std::env::args();
+    let _ = raw.next();
+    if raw.next().as_deref() == Some("__sandbox") {
+        if let Err(e) = sandbox::exec(&raw.collect::<Vec<_>>()) {
+            eprintln!("sandbox: {e:#}");
+            std::process::exit(127);
+        }
+        unreachable!();
+    }
+
     let opt = <Opt as clap::Parser>::parse();
     let role = match opt.role {
         Role::Server => "server",
@@ -403,12 +423,29 @@ fn write_config(
         "{{\"name\":\"{}\",\"local\":\"{}\",\"remote\":\"{}\",\"mss\":\"auto\"}}\n",
         opt.tunnel_name, uplink_ip, peer_uplink
     );
-    std::fs::write(&path, json).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))
+    std::fs::write(&path, json).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+    if opt.sandbox {
+        let uid = Some(nix::unistd::Uid::from_raw(sandbox::DAEMON_UID));
+        let gid = Some(nix::unistd::Gid::from_raw(sandbox::DAEMON_GID));
+        nix::unistd::chown(&opt.config_dir, uid, gid)
+            .and_then(|()| nix::unistd::chown(&path, uid, gid))
+            .map_err(|e| anyhow::anyhow!("chown config to sandbox uid: {e}"))?;
+    }
+    Ok(())
 }
 
 fn spawn_daemon(opt: &Opt) -> anyhow::Result<tokio::process::Child> {
-    tokio::process::Command::new(&opt.daemon_path)
-        .arg(&opt.uplink)
+    let mut cmd = if opt.sandbox {
+        // Re-exec ourselves as the sandbox wrapper, which drops privileges and
+        // execs the daemon (see sandbox.rs).
+        let me = std::env::current_exe().map_err(|e| anyhow::anyhow!("current_exe: {e}"))?;
+        let mut cmd = tokio::process::Command::new(me);
+        cmd.arg("__sandbox").arg(&opt.daemon_path);
+        cmd
+    } else {
+        tokio::process::Command::new(&opt.daemon_path)
+    };
+    cmd.arg(&opt.uplink)
         .arg("--config-dir")
         .arg(&opt.config_dir)
         .env("RUST_LOG", "info")

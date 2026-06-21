@@ -17,9 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+caps = "0.5"
 clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context"] }
 futures-util = { workspace = true }
-nix = { workspace = true, features = ["signal"] }
+nix = { workspace = true, features = ["signal", "user", "process", "fs"] }
 rtnetlink = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "process"] }

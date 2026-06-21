@@ -11,6 +11,11 @@ pub(crate) struct Options {
     /// Per-role scenario deadline, in seconds.
     #[clap(long, default_value_t = 60)]
     timeout_secs: u64,
+
+    /// Run the daemon unsandboxed; by default it runs under the hardened
+    /// (non-root + ambient caps + no-new-privs) sandbox.
+    #[clap(long)]
+    no_sandbox: bool,
 }
 
 const NS_A: &str = "etxa";
@@ -93,8 +98,8 @@ fn spawn_scenario(
     uplink: &str,
 ) -> anyhow::Result<std::process::Child> {
     let config_dir = opts.work_dir.join(role);
-    std::process::Command::new("ip")
-        .args(["netns", "exec", netns])
+    let mut cmd = std::process::Command::new("ip");
+    cmd.args(["netns", "exec", netns])
         .arg(scenario)
         .args(["--role", role, "--uplink", uplink])
         .arg("--daemon-path")
@@ -102,8 +107,11 @@ fn spawn_scenario(
         .arg("--config-dir")
         .arg(&config_dir)
         .arg("--timeout-secs")
-        .arg(opts.timeout_secs.to_string())
-        .env("RUST_LOG", "info")
+        .arg(opts.timeout_secs.to_string());
+    if !opts.no_sandbox {
+        cmd.arg("--sandbox");
+    }
+    cmd.env("RUST_LOG", "info")
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn scenario ({role}) in {netns}: {e}"))
 }
