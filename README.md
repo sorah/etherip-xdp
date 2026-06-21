@@ -108,6 +108,7 @@ One JSON file per tunnel under `/etc/etherip-xdp/<device>.d/`:
 | `mss`    | no       | `"auto"` (default), `"off"`, an integer (both families), or `{ "ipv4": N, "ipv6": N }`. |
 | `mtu`    | no       | Tunnel MTU override (default: uplink MTU − 56). |
 | `mac`    | no       | Local MAC the user-facing interface presents on the connected L2 domain. Omit to keep the kernel-assigned address, `"inherit"` to copy the external device's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"`. |
+| `next_hop_on_link` | no | On-link policy when the route lookup returns no gateway: `"maybe"` (default), `"always"`, or `"never"`. See [Next-hop resolution](#next-hop-resolution--the-on-link-policy). |
 
 The external device is the process scope, so it is **not** repeated in the
 file (see `packaging/etc/etherip-xdp/eth1.d/` for examples).
@@ -139,6 +140,7 @@ attribute without dropping the interface. How each behaves on update:
 | `mss`    | Recomputed and rewritten into the map. No veth or attach churn. |
 | `mtu`    | The user-facing veth and its peer are set to the new MTU in place. No recreation. |
 | `mac`    | Applied to the existing veth via netlink. Switching back to the omitted/default keeps the current address — the original kernel-assigned MAC is **not** restored without recreating the veth (rename or remove+add it to do so). |
+| `next_hop_on_link` | Next-hop MAC re-resolved under the new policy; the encap/decap map entries are updated. No veth or attach churn. |
 
 If applying one tunnel fails during a reload, the error is logged and the
 remaining tunnels are still processed. A tunnel that is still pending (an
@@ -193,7 +195,8 @@ yet) the tunnel is still created and self-heals once the underlay is ready — t
 daemon also waits for the uplink interface to appear instead of crash-looping.
 
 When the route lookup returns **no gateway**, whether the remote endpoint is
-treated as its own next hop ("on-link") is controlled by `--next-hop-on-link`:
+treated as its own next hop ("on-link") is controlled per tunnel by the
+`next_hop_on_link` config field:
 
 | Value | Behaviour |
 |-------|-----------|
