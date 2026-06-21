@@ -21,10 +21,8 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 
-# Grants /run/etherip-xdp and exports it as $RUNTIME_DIRECTORY, which the daemon
-# searches (ahead of /etc/etherip-xdp) for volatile per-tunnel config drop-ins.
-# Preserve it across restarts so drop-ins written by external tooling survive a
-# daemon restart (it is still cleared at reboot, being under /run).
+# Search $RUNTIME_DIRECTORY (/run/etherip-xdp) for volatile config drop-ins,
+# ahead of /etc; preserved across restarts, cleared at reboot.
 RuntimeDirectory=etherip-xdp
 RuntimeDirectoryPreserve=yes
 

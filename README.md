@@ -131,11 +131,13 @@ When several directories are given (or searched by default), they follow systemd
 drop-in precedence: a file name found in an earlier (higher-precedence) directory
 shadows the same name in later ones.
 
-> **Tip (advanced):** if the unit sets systemd `RuntimeDirectory=`, the granted
-> `$RUNTIME_DIRECTORY` is searched as an additional root *ahead* of
-> `/etc/etherip-xdp`. This lets a generator or orchestration layer write volatile
-> tunnel drop-ins under `/run` that override (or extend) the on-disk `/etc`
-> config without touching it.
+The bundled `etherip-xdp@.service` sets `RuntimeDirectory=etherip-xdp` by
+default, so a systemd-managed daemon also searches
+`/run/etherip-xdp/interfaces.d/<device>/` *ahead* of `/etc` (via the exported
+`$RUNTIME_DIRECTORY`). This lets a generator or orchestration layer write
+volatile tunnel drop-ins under `/run` that override (or extend) the on-disk
+`/etc` config without touching it; the directory is kept across daemon restarts
+(`RuntimeDirectoryPreserve=yes`) and cleared only at reboot.
 
 ## Reload
 
