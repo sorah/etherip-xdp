@@ -27,17 +27,35 @@ pub const DAEMON_UID: u32 = UID;
 pub const DAEMON_GID: u32 = GID;
 
 /// `argv` is the daemon command (`<path> [args...]`). Applies the sandbox and
-/// execve()s it, so this returns only on error.
+/// execs it, so this returns only on error.
 pub fn exec(argv: &[String]) -> anyhow::Result<()> {
     let first = argv.first().context("sandbox: missing daemon argv")?;
+    // Open the binary while still privileged, then fexecve it after dropping to
+    // the sandbox uid: a path component of the (root-built) binary may not be
+    // traversable by that uid, but an already-open fd execs fine — the inode
+    // itself is world-executable.
+    let fd = nix::fcntl::open(
+        first.as_str(),
+        nix::fcntl::OFlag::O_RDONLY,
+        nix::sys::stat::Mode::empty(),
+    )
+    .with_context(|| format!("sandbox: open {first}"))?;
     apply()?;
     let cargs: Vec<std::ffi::CString> = argv
         .iter()
         .map(|s| std::ffi::CString::new(s.as_bytes()))
         .collect::<Result<_, _>>()
         .context("sandbox: argv has NUL")?;
-    let prog = std::ffi::CString::new(first.as_bytes())?;
-    nix::unistd::execvp(&prog, &cargs).context("sandbox: execvp")?;
+    let env: Vec<std::ffi::CString> = std::env::vars_os()
+        .map(|(k, v)| {
+            let mut kv = k.into_encoded_bytes();
+            kv.push(b'=');
+            kv.extend_from_slice(v.into_encoded_bytes().as_slice());
+            std::ffi::CString::new(kv)
+        })
+        .collect::<Result<_, _>>()
+        .context("sandbox: env has NUL")?;
+    nix::unistd::fexecve(fd, &cargs, &env).context("sandbox: fexecve")?;
     unreachable!()
 }
 
