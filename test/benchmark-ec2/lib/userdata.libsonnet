@@ -186,7 +186,18 @@ local dutSetupTmpl = |||
     curl -fsSL -o /tmp/etherip-xdp.deb '@@DEB_URL@@'
     apt-get install -y /tmp/etherip-xdp.deb
   fi
+  # Apply the shipped sysusers/tmpfiles before the (DynamicUser) units start, so
+  # the etherip-xdp-sock group and the /run/etherip-xdp dir exist regardless of
+  # dpkg trigger ordering on first install.
+  systemd-sysusers /usr/lib/sysusers.d/etherip-xdp.conf
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/etherip-xdp.conf
+  # The hardened daemon runs unprivileged and can't self-bind under ProtectSystem=
+  # strict, so the control socket comes from socket activation — start it before the
+  # daemon (which adopts the fd via Sockets=). The manager aggregates the per-device
+  # sockets via the shared group.
+  systemctl enable --now etherip-xdp-varlink@"$UPLINK_IF".socket
   systemctl enable --now etherip-xdp@"$UPLINK_IF"
+  systemctl enable --now etherip-xdp-manager.socket
   echo "=== etherip-bench-setup done ==="
 |||;
 
