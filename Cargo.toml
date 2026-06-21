@@ -12,6 +12,9 @@ members = [
     "test/integration-test",
 ]
 default-members = ["etherip-xdp", "etherip-xdp-common"]
+# The cargo-fuzz harness is its own workspace (nightly + sanitizer only); keep it
+# out of the root workspace so a plain `cargo build`/`cargo test` never touches it.
+exclude = ["test/fuzzing"]
 
 [workspace.package]
 license = "MIT"

@@ -3,10 +3,21 @@
 
 //! Types and helpers shared between the userspace daemon and the eBPF program.
 //!
+//! [`data_path`] holds the packet-processing core, generic over a packet-memory
+//! abstraction so the same code runs in the kernel (XDP) and on the host (tests,
+//! fuzzing).
+//!
 //! The wire/config structs here are `#[repr(C)]` and used verbatim as BPF map
 //! values, so both sides see an identical byte layout. Pure scalar helpers
 //! ([`mss_clamp_from_mtu`], [`checksum_update`]) are unit-tested on the host and
 //! reused by both the daemon and the kernel program.
+
+// The host `Packet` implementation in `data_path` needs an allocator while the
+// crate stays `no_std` for the kernel build.
+#[cfg(feature = "host")]
+extern crate alloc;
+
+pub mod data_path;
 
 /// IP protocol number for EtherIP (RFC 3378).
 pub const ETHERIP_PROTO: u8 = 97;
