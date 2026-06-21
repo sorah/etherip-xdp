@@ -4,8 +4,9 @@
 
 // `generated` is referenced throughout; a module alias keeps the wire-type
 // paths readable.
-use crate::manage::generated;
 use std::fmt::Write as _;
+
+use crate::manage::generated;
 
 /// Render the `list` view: every interface with its tunnel table and non-zero
 /// counters.
