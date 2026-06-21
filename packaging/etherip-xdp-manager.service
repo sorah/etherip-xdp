@@ -1,0 +1,24 @@
+# Host-wide varlink proxy aggregating every per-device etherip-xdp daemon.
+# Socket-activated via etherip-xdp-manager.socket; runs as root to read the
+# daemons' root-owned 0660 control sockets.
+#
+#   sudo install -Dm0755 target/release/etherip-xdp-manager /usr/bin/etherip-xdp-manager
+#   sudo systemctl enable --now etherip-xdp-manager.socket
+[Unit]
+Description=etherip-xdp varlink manager (host-wide status proxy)
+Documentation=https://github.com/sorah/etherip-xdp
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/etherip-xdp-manager
+Restart=on-failure
+RestartSec=2
+
+# Shared with the daemons; preserved across restarts, cleared at reboot.
+RuntimeDirectory=etherip-xdp
+RuntimeDirectoryPreserve=yes
+
+Sockets=etherip-xdp-manager.socket
+
+[Install]
+WantedBy=multi-user.target

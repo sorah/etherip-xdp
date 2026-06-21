@@ -10,3 +10,4 @@ pub mod generated {
 }
 
 pub mod discovery;
+pub mod proxy;

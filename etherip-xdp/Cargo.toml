@@ -102,3 +102,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "etherip-xdp"
 path = "src/main.rs"
+
+[[bin]]
+name = "etherip-xdp-manager"
+path = "src/bin/manager.rs"
