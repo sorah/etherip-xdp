@@ -142,18 +142,15 @@ async fn route_get_oif(
     }
 }
 
-/// Whether a route result egresses the interface the lookup was pinned to. A
-/// `from`+`oif` lookup can silently ignore `oif` when another interface has a
-/// better-metric matching route (the kernel takes an input-route path against the
-/// global FIB); the returned `RTA_OIF` then points at the wrong link. A route
-/// reporting no output interface, or no route at all, is treated as honouring the
-/// pin — there is nothing contradicting it to act on. Pure so it can be
+/// Whether a route's output interface (`RTA_OIF`) honours the interface the
+/// lookup was pinned to. A `from`+`oif` lookup can silently ignore `oif` when
+/// another interface has a better-metric matching route (the kernel takes an
+/// input-route path against the global FIB); the returned `RTA_OIF` then points at
+/// the wrong link. A route reporting no output interface is treated as honouring
+/// the pin — there is nothing contradicting it to act on. Pure so it can be
 /// unit-tested.
-fn route_honours_oif(
-    info: Option<crate::control::netlink::RouteInfo>,
-    external_ifindex: u32,
-) -> bool {
-    match info.and_then(|i| i.oif) {
+fn route_honours_oif(route_oif: Option<u32>, external_ifindex: u32) -> bool {
+    match route_oif {
         Some(got) => got == external_ifindex,
         None => true,
     }
@@ -174,11 +171,11 @@ async fn route_get_oif_pinned(
     external_ifindex: u32,
 ) -> Option<crate::control::netlink::RouteInfo> {
     let info = route_get_oif(nl, dst, src, external_ifindex).await;
-    if src.is_some() && !route_honours_oif(info, external_ifindex) {
+    let got_oif = info.and_then(|i| i.oif);
+    if src.is_some() && !route_honours_oif(got_oif, external_ifindex) {
         log::debug!(
-            "route lookup for {dst} (src {src:?}) egressed ifindex {:?}, not the uplink \
-             {external_ifindex}; redoing sourcelessly to honour oif",
-            info.and_then(|i| i.oif)
+            "route lookup for {dst} (src {src:?}) egressed ifindex {got_oif:?}, not the uplink \
+             {external_ifindex}; redoing sourcelessly to honour oif"
         );
         return route_get_oif(nl, dst, None, external_ifindex).await;
     }
@@ -421,14 +418,6 @@ mod tests {
         })
     }
 
-    fn route_on_oif(oif: u32) -> Option<crate::control::netlink::RouteInfo> {
-        Some(crate::control::netlink::RouteInfo {
-            gateway: None,
-            prefsrc: None,
-            oif: Some(oif),
-        })
-    }
-
     #[test]
     fn gateway_always_wins_regardless_of_policy() {
         let gw: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
@@ -477,12 +466,11 @@ mod tests {
     #[test]
     fn oif_pin_detects_ignored_oif() {
         // The lookup egressed the uplink we pinned to: honoured.
-        assert!(route_honours_oif(route_on_oif(7), 7));
+        assert!(route_honours_oif(Some(7), 7));
         // The kernel ignored `oif` and resolved on another interface (the
         // `from`+`oif` quirk): not honoured, so the caller re-resolves sourcelessly.
-        assert!(!route_honours_oif(route_on_oif(9), 7));
-        // No output interface reported, or no route: nothing contradicts the pin.
-        assert!(route_honours_oif(gw_route("fe80::1".parse().unwrap()), 7));
+        assert!(!route_honours_oif(Some(9), 7));
+        // No output interface reported: nothing contradicts the pin.
         assert!(route_honours_oif(None, 7));
     }
 
