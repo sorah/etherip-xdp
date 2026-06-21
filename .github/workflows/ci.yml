@@ -27,6 +27,11 @@ jobs:
       contents: read
     uses: ./.github/workflows/_integration.yml
 
+  fuzz:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_fuzz.yml
+
   # Nightly .deb packages uploaded as artifacts (deb-amd64 / deb-arm64). Built on
   # main pushes and the nightly schedule; skipped on PRs (no artifact consumers).
   deb:

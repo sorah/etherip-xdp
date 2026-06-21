@@ -62,6 +62,10 @@ nix = { workspace = true }
 
 [dev-dependencies]
 etherparse = { workspace = true }
+# The `host` feature adds `data_path::HostPacket`, which the data-path tests run
+# alongside BPF_PROG_TEST_RUN to assert the eBPF program and the shared core agree
+# byte for byte. Enabled only for test builds, so the daemon binary stays slim.
+etherip-xdp-common = { path = "../etherip-xdp-common", features = ["host"] }
 
 [build-dependencies]
 anyhow = { workspace = true }

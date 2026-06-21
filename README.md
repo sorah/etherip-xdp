@@ -231,6 +231,24 @@ mise run test-bpf   # byte-exact data-path tests via BPF_PROG_TEST_RUN (root, ke
 The data-path tests drive the XDP program with `BPF_PROG_TEST_RUN` and assert the
 exact encap/decap output and action, mirroring the upstream Go test suite.
 
+### Fuzzing
+
+The packet parsing/transform logic lives in `etherip_xdp_common::data_path`,
+generic over a packet-memory abstraction so it compiles both as the kernel XDP
+program and against a plain byte buffer on the host. The `BPF_PROG_TEST_RUN` tests
+above assert the two agree byte for byte, so coverage-guided fuzzing of the host
+core carries over to the kernel program — without needing root or a BPF-capable
+kernel:
+
+```shell
+mise run fuzz roundtrip   # encap∘decap round-trip property (default target)
+mise run fuzz encap       # outer header/flow-label invariants on arbitrary inner frames
+mise run fuzz decap       # IPv6 ext-header walking + EtherIP strip on arbitrary frames
+```
+
+Targets live under [`test/fuzzing/`](test/fuzzing/) (its own [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
+workspace; needs nightly). CI runs a short bounded pass of each on every change.
+
 ### Integration tests
 
 End-to-end tests run the **real** daemon on two peers and tunnel between them,

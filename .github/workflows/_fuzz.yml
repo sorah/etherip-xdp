@@ -1,0 +1,56 @@
+name: fuzz
+
+# Reusable workflow: a short coverage-guided fuzzing pass over the EtherIP
+# data-path core (`etherip_xdp_common::data_path`) via cargo-fuzz. The same
+# generic core runs in the kernel XDP program; the byte-exact BPF_PROG_TEST_RUN
+# tests assert the two agree, so a finding here is a finding in the kernel
+# program. Runs unprivileged (no BPF, no root), unlike the data-path tests.
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions: {}
+
+jobs:
+  fuzz:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - decap
+          - encap
+          - roundtrip
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # cargo-fuzz builds the targets with the nightly-only sanitizer/SanCov
+      # passes, so it requires the nightly toolchain.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: test/fuzzing
+
+      - uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-fuzz
+
+      # A bounded smoke run: long enough to catch a regression that crashes early,
+      # short enough for PR CI. Deeper campaigns run locally (`mise run fuzz`).
+      #
+      # `--target` is pinned to the GNU host: cargo-fuzz otherwise defaults to its
+      # own build triple, and the prebuilt cargo-fuzz is musl — where the sanitizer
+      # can't link (static libc) and `std` isn't installed.
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo +nightly fuzz run --fuzz-dir test/fuzzing --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=60 -rss_limit_mb=4096

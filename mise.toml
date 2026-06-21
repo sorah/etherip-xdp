@@ -5,6 +5,8 @@
 actionlint = "latest"
 # bpf-linker is required to build the eBPF object (see build.rs / aya-build).
 "cargo:bpf-linker" = "latest"
+# cargo-fuzz drives the data-path fuzz targets under fuzz/ (needs nightly).
+"cargo:cargo-fuzz" = "latest"
 pinact = "latest"
 zizmor = "latest"
 
@@ -26,6 +28,15 @@ sudo -E "$(ls -t target/debug/deps/data_path-* | grep -vE '\.(d|so)$' | head -1)
 [tasks.lint]
 description = "Clippy (must pass before commit)"
 run = "cargo clippy --all-targets --workspace --exclude etherip-xdp-ebpf -- -D warnings"
+
+[tasks.fuzz]
+description = "Coverage-guided fuzzing of the data-path core (cargo-fuzz; needs nightly). Target: decap|encap|roundtrip"
+# Pin --target to the rustc host triple: the mise-provided (cargo-binstall'd)
+# cargo-fuzz is a musl build and otherwise defaults to its own musl triple, where
+# the sanitizer can't link (static libc) and std isn't installed.
+run = '''
+cargo +nightly fuzz run --fuzz-dir test/fuzzing --target "$(rustc -vV | sed -n 's/^host: //p')" {{arg(name="target", default="roundtrip")}}
+'''
 
 [tasks.integration-vm]
 description = "Download mainline kernels (6.5/6.8/7.0) and run the 2-VM integration test"

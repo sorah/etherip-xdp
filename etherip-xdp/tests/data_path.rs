@@ -150,6 +150,31 @@ fn run(
     (result.return_value, data_out)
 }
 
+/// Run the shared host data-path core (`data_path::encap`) over `input`,
+/// returning the outcome and the transformed buffer. Each test asserts this
+/// matches the eBPF program's `BPF_PROG_TEST_RUN` output byte for byte, so the
+/// coverage-guided fuzzing of this same core (see `test/fuzzing/`) carries over to the
+/// kernel program.
+fn host_encap(input: &[u8]) -> (etherip_xdp_common::data_path::EncapOutcome, Vec<u8>) {
+    let mut pkt = etherip_xdp_common::data_path::HostPacket::new(input.to_vec());
+    let outcome = etherip_xdp_common::data_path::encap(&mut pkt, &test_config());
+    (outcome, pkt.into_inner())
+}
+
+/// Run the shared host data-path core (`data_path::decap`) over `input`, backing
+/// the tunnel demux with the single test tunnel (so the lookup matches the same
+/// (remote, local) pair the eBPF `DECAP_CONFIG` map holds).
+fn host_decap(input: &[u8]) -> (etherip_xdp_common::data_path::DecapOutcome, Vec<u8>) {
+    let cfg = test_config();
+    let key = etherip_xdp_common::DecapKey {
+        remote: remote().octets(),
+        local: local().octets(),
+    };
+    let mut pkt = etherip_xdp_common::data_path::HostPacket::new(input.to_vec());
+    let outcome = etherip_xdp_common::data_path::decap(&mut pkt, |k| (*k == key).then_some(cfg));
+    (outcome, pkt.into_inner())
+}
+
 /// An inner Ethernet frame: IPv4 TCP SYN with a single MSS option.
 fn ipv4_tcp_syn(mss: u16) -> Vec<u8> {
     let payload = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
@@ -204,6 +229,13 @@ fn encap_ipv4_tcp_syn_is_clamped_and_redirected() {
     expected.extend_from_slice(&expected_inner);
     assert_eq!(out.len(), expected.len(), "output length");
     assert_eq!(out, expected, "byte-exact encap output");
+
+    let (outcome, host_out) = host_encap(&input);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::EncapOutcome::Redirect
+    );
+    assert_eq!(host_out, out, "host core matches eBPF byte-exact (encap)");
 }
 
 #[test]
@@ -216,6 +248,13 @@ fn encap_mss_not_raised_when_below_clamp() {
     assert_eq!(action, 4);
     // Inner (offset 56..) is byte-identical to the input.
     assert_eq!(&out[etherip_xdp_common::OUTER_OVERHEAD..], &input[..]);
+
+    let (outcome, host_out) = host_encap(&input);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::EncapOutcome::Redirect
+    );
+    assert_eq!(host_out, out, "host core matches eBPF byte-exact (encap)");
 }
 
 fn etherip_wrap(inner: &[u8], src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> Vec<u8> {
@@ -249,6 +288,15 @@ fn decap_strips_outer_and_rewrites_inner_dst_mac() {
     let mut expected = inner.clone();
     expected[0..6].copy_from_slice(&TUNNEL_MAC); // inner dst MAC rewritten
     assert_eq!(out, expected, "byte-exact decap output");
+
+    let (outcome, host_out) = host_decap(&input);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::Redirect {
+            internal_ifindex: PEER_IFINDEX
+        }
+    );
+    assert_eq!(host_out, out, "host core matches eBPF byte-exact (decap)");
 }
 
 #[test]
@@ -259,6 +307,18 @@ fn decap_passes_non_etherip() {
     let input = ipv4_tcp_syn(1460);
     let (action, _out) = run(&mut ebpf, "xdp_decap", &input, EXTERNAL_IFINDEX);
     assert_eq!(action, 2, "expected XDP_PASS");
+
+    // Outer EtherType is IPv4, not IPv6, so the core bails at the first check and
+    // leaves the buffer untouched.
+    let (outcome, host_out) = host_decap(&input);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::NotIpv6
+    );
+    assert_eq!(
+        host_out, input,
+        "decap must not mutate a passed-through frame"
+    );
 }
 
 #[test]
@@ -271,4 +331,16 @@ fn decap_passes_unknown_tunnel_pair() {
     let input = etherip_wrap(&inner, local(), local());
     let (action, _out) = run(&mut ebpf, "xdp_decap", &input, EXTERNAL_IFINDEX);
     assert_eq!(action, 2, "expected XDP_PASS for an unknown tunnel pair");
+
+    // (remote=local, local=local) matches no tunnel, so the core passes it
+    // through unchanged before the loopback guard is even reached.
+    let (outcome, host_out) = host_decap(&input);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::NoTunnel
+    );
+    assert_eq!(
+        host_out, input,
+        "decap must not mutate a passed-through frame"
+    );
 }

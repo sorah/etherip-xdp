@@ -8,6 +8,8 @@ license.workspace = true
 [features]
 default = []
 user = ["aya"]
+# Host `Packet` implementation (`data_path::HostPacket`) for tests and fuzzing.
+host = []
 
 [dependencies]
 aya = { workspace = true, optional = true }

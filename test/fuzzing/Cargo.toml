@@ -1,0 +1,50 @@
+# cargo-fuzz harness for the EtherIP data-path core
+# (`etherip_xdp_common::data_path`). The same generic core runs in the kernel
+# XDP program; the byte-exact BPF_PROG_TEST_RUN tests assert the two agree, so
+# coverage-guided fuzzing here exercises the kernel program's logic on the host.
+#
+# Its own workspace (the `[workspace]` table below) so a plain `cargo build` at
+# the repo root never pulls in the nightly/sanitizer-only fuzz dependencies.
+[package]
+name = "etherip-xdp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+# etherparse builds well-formed inner frames from fuzzer-chosen fields, reaching
+# the deep TCP-option / IPv6-extension-header parsing the raw-byte targets only
+# stumble into. It is already the project's packet builder (used in the tests).
+etherparse = "0.20"
+etherip-xdp-common = { path = "../../etherip-xdp-common", features = ["host"] }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "decap"
+path = "fuzz_targets/decap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encap"
+path = "fuzz_targets/encap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
