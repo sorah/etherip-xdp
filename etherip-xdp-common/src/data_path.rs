@@ -353,8 +353,11 @@ pub enum DecapOutcome {
 }
 
 /// Decapsulate the outer frame in `pkt`: demux by the outer IPv6 (source,
-/// destination) pair via `find`, strip the outer headers, and rewrite the inner
-/// destination MAC. `find` returns the tunnel config for a [`DecapKey`] (the
+/// destination) pair via `find` and strip the outer headers, delivering the inner
+/// Ethernet frame unchanged. The inner MACs are left intact (encap is likewise
+/// transparent), so the path is a transparent L2 pseudo-wire: it works both for an
+/// L3 endpoint (whose MAC inner frames reach via ARP/ND) and for a `<name>`
+/// enslaved to a bridge. `find` returns the tunnel config for a [`DecapKey`] (the
 /// eBPF program backs it with the `DECAP_CONFIG` map; the host backs it with a
 /// fixed table).
 #[inline(always)]
@@ -414,10 +417,6 @@ where
     }
 
     if pkt.adjust_head(strip_len as i32).is_err() {
-        return DecapOutcome::Abort;
-    }
-
-    if pkt.store(0, cfg.tunnel_mac).is_err() {
         return DecapOutcome::Abort;
     }
 

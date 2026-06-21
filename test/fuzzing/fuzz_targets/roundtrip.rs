@@ -1,7 +1,7 @@
 //! Round-trip property: encapsulating a well-formed inner frame at the A end and
-//! decapsulating it at the B end must reconstruct the original frame, save for
-//! the inner destination MAC that decap rewrites to the tunnel MAC. MSS clamping
-//! is disabled on the encap side so the inner bytes are preserved exactly.
+//! decapsulating it at the B end must reconstruct the original frame exactly —
+//! neither side touches the inner MACs. MSS clamping is disabled on the encap side
+//! so the inner bytes are preserved exactly.
 //!
 //! The inner frame is built from fuzzer-chosen fields (`InnerSpec`) via
 //! etherparse, so this also drives the inner IPv4/IPv6 + TCP-option parsing with
@@ -31,12 +31,10 @@ libfuzzer_sys::fuzz_target!(|spec: etherip_xdp_fuzz::InnerSpec| {
     match outcome {
         etherip_xdp_common::data_path::DecapOutcome::Redirect { internal_ifindex } => {
             assert_eq!(internal_ifindex, dec_cfg.internal_ifindex);
-            let mut expected = inner.clone();
-            expected[0..6].copy_from_slice(&dec_cfg.tunnel_mac);
             assert_eq!(
                 pkt.as_slice(),
-                expected.as_slice(),
-                "encap+decap must round-trip the inner frame (dst MAC aside)"
+                inner.as_slice(),
+                "encap+decap must round-trip the inner frame exactly"
             );
         }
         other => panic!("expected a round-trip redirect, got {other:?}"),

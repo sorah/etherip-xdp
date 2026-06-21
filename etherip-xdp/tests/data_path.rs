@@ -276,7 +276,7 @@ fn etherip_wrap(inner: &[u8], src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) 
 
 #[test]
 #[ignore = "requires root and kernel >= 5.15"]
-fn decap_strips_outer_and_rewrites_inner_dst_mac() {
+fn decap_strips_outer_and_preserves_inner() {
     let mut ebpf = load_and_setup();
     let inner = ipv4_tcp_syn(1460); // any inner frame; decap doesn't clamp
     // Packet arrives from remote (src) to us (dst=local).
@@ -285,9 +285,8 @@ fn decap_strips_outer_and_rewrites_inner_dst_mac() {
     let (action, out) = run(&mut ebpf, "xdp_decap", &input, EXTERNAL_IFINDEX);
     assert_eq!(action, 4, "expected XDP_REDIRECT");
 
-    let mut expected = inner.clone();
-    expected[0..6].copy_from_slice(&TUNNEL_MAC); // inner dst MAC rewritten
-    assert_eq!(out, expected, "byte-exact decap output");
+    // The inner frame is delivered unchanged — the inner MACs are not rewritten.
+    assert_eq!(out, inner, "byte-exact decap output");
 
     let (outcome, host_out) = host_decap(&input);
     assert_eq!(

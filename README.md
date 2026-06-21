@@ -40,6 +40,13 @@ traffic, the peer (`<name>-xdp`) runs `xdp_encap`. The shared `xdp_decap` progra
 on the uplink handles decap for every tunnel. A minimal `XDP_PASS` program on each
 user-facing end satisfies the kernel's veth redirect peer check.
 
+**Transparent L2:** both directions preserve the inner Ethernet frame byte for
+byte — encap only prepends the outer headers (and optionally clamps the inner TCP
+MSS), and decap only strips them; neither rewrites the inner MACs. So `<name>` is a
+plain L2 interface: give it an IP to use as a host endpoint (the far side reaches
+its MAC via ordinary ARP/ND), or enslave it to a Linux bridge to extend an L2
+segment. The `mac` option below only sets `<name>`'s own address.
+
 **Hidden peer namespace:** the `<name>-xdp` peer is purely an internal artefact of
 driving encap through XDP, so by default it is moved into a daemon-private,
 anonymous network namespace — it never shows up in `ip link` (or `ip netns list`)
