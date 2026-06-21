@@ -221,6 +221,16 @@ local benchTmpl = |||
   SIZE=$1; [ -n "$SIZE" ] || SIZE=1000
   DUR=$2; [ -n "$DUR" ] || DUR=20
 
+  # Inner IPv6+UDP packet is SIZE + 48 (IPv6 40 + UDP 8). The tunnel MTU is
+  # 1444 (uplink 1500 - 56 EtherIP overhead), so anything larger is dropped by
+  # dut-1 with ICMPv6 Packet Too Big before it ever reaches encap (the run would
+  # report ~0 looped back). Fail loudly instead of silently measuring nothing.
+  MAXSIZE=1396
+  if [ "$SIZE" -gt "$MAXSIZE" ]; then
+    echo "payload $SIZE too large: inner packet $((SIZE + 48)) > tunnel MTU 1444; max payload is $MAXSIZE" >&2
+    exit 1
+  fi
+
   DEV=$(ip -o -6 addr show to @@GEN_A@@/128 scope global | awk '{print $2; exit}')
   SINK=$(ip -o -6 addr show to @@GEN_D@@/128 scope global | awk '{print $2; exit}')
   DUT1_A=@@DUT1_A@@
