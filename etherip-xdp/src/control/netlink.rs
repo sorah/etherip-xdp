@@ -41,6 +41,65 @@ impl NeighEntry {
                 | rtnetlink::packet_route::neighbour::NeighbourState::Permanent
         )
     }
+
+    /// The kernel neighbour state as a stable, reportable value.
+    pub fn neigh_state(&self) -> NeighState {
+        NeighState::from(self.state)
+    }
+}
+
+/// A stable, `Copy` mirror of the kernel `NUD_*` neighbour states, decoupling
+/// the resolver and the management interface from the rtnetlink enum and giving
+/// a fixed reporting string. `Other` collapses any future/unknown kernel state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeighState {
+    Incomplete,
+    Reachable,
+    Stale,
+    Delay,
+    Probe,
+    Failed,
+    Noarp,
+    Permanent,
+    None,
+    Other,
+}
+
+impl NeighState {
+    /// A lowercase, stable name for reporting (e.g. over the varlink interface).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NeighState::Incomplete => "incomplete",
+            NeighState::Reachable => "reachable",
+            NeighState::Stale => "stale",
+            NeighState::Delay => "delay",
+            NeighState::Probe => "probe",
+            NeighState::Failed => "failed",
+            NeighState::Noarp => "noarp",
+            NeighState::Permanent => "permanent",
+            NeighState::None => "none",
+            NeighState::Other => "other",
+        }
+    }
+}
+
+impl From<rtnetlink::packet_route::neighbour::NeighbourState> for NeighState {
+    fn from(state: rtnetlink::packet_route::neighbour::NeighbourState) -> Self {
+        match state {
+            rtnetlink::packet_route::neighbour::NeighbourState::Incomplete => {
+                NeighState::Incomplete
+            }
+            rtnetlink::packet_route::neighbour::NeighbourState::Reachable => NeighState::Reachable,
+            rtnetlink::packet_route::neighbour::NeighbourState::Stale => NeighState::Stale,
+            rtnetlink::packet_route::neighbour::NeighbourState::Delay => NeighState::Delay,
+            rtnetlink::packet_route::neighbour::NeighbourState::Probe => NeighState::Probe,
+            rtnetlink::packet_route::neighbour::NeighbourState::Failed => NeighState::Failed,
+            rtnetlink::packet_route::neighbour::NeighbourState::Noarp => NeighState::Noarp,
+            rtnetlink::packet_route::neighbour::NeighbourState::Permanent => NeighState::Permanent,
+            rtnetlink::packet_route::neighbour::NeighbourState::None => NeighState::None,
+            _ => NeighState::Other,
+        }
+    }
 }
 
 /// A thin wrapper around an rtnetlink `Handle` whose connection task is driven

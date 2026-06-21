@@ -21,6 +21,10 @@ pub struct ExternalInterface {
 /// A tunnel that is currently set up in the data plane.
 pub struct RunningTunnel {
     spec: crate::control::config::TunnelSpec,
+    /// Absolute path of the drop-in config file this tunnel was loaded from, if
+    /// known (reported over the management interface). `None` for tunnels added
+    /// other than from a file.
+    config_path: Option<std::path::PathBuf>,
     peer_index: u32,
     tunnel_mtu: i32,
     config: etherip_xdp_common::TunnelConfig,
@@ -30,6 +34,14 @@ pub struct RunningTunnel {
     /// encap/decap map entries are deliberately withheld so the data path never
     /// encapsulates with a bogus source.
     effective_src: Option<std::net::Ipv6Addr>,
+    /// Resolved next hop (gateway, or the remote itself when on-link); `None`
+    /// while unresolved. Diagnostic only — reported over the management
+    /// interface; the data path uses `config.dst_mac`.
+    next_hop: Option<std::net::Ipv6Addr>,
+    /// Whether the resolved next hop is the remote endpoint itself (on-link).
+    next_hop_on_link: bool,
+    /// Observed kernel neighbour state for the next hop, if looked up.
+    neigh_state: Option<crate::control::netlink::NeighState>,
     encap_link: aya::programs::xdp::XdpLinkId,
     pass_link: aya::programs::xdp::XdpLinkId,
 }
@@ -194,8 +206,8 @@ impl Manager {
                 manager.config_dirs_display()
             );
         }
-        for spec in specs {
-            if let Err(e) = manager.add_tunnel(spec).await {
+        for (path, spec) in specs {
+            if let Err(e) = manager.add_tunnel(Some(path), spec).await {
                 log::error!("failed to create tunnel: {e:#}");
             }
         }
@@ -359,7 +371,11 @@ impl Manager {
     }
 
     /// Create a new tunnel: veth pair, MTU/offload, map population, attach.
-    async fn add_tunnel(&mut self, spec: crate::control::config::TunnelSpec) -> anyhow::Result<()> {
+    async fn add_tunnel(
+        &mut self,
+        config_path: Option<std::path::PathBuf>,
+        spec: crate::control::config::TunnelSpec,
+    ) -> anyhow::Result<()> {
         validate_name(&spec.name)?;
         let name = spec.name.clone();
         let peer = peer_name(&name);
@@ -480,11 +496,15 @@ impl Manager {
             name,
             RunningTunnel {
                 spec,
+                config_path,
                 peer_index,
                 tunnel_mtu,
                 config,
                 decap_key,
                 effective_src,
+                next_hop: resolved.next_hop,
+                next_hop_on_link: resolved.on_link,
+                neigh_state: resolved.neigh_state,
                 encap_link,
                 pass_link,
             },
@@ -517,6 +537,7 @@ impl Manager {
     /// Update a tunnel in place (src/dst/mss/mtu) without veth churn.
     async fn update_tunnel(
         &mut self,
+        config_path: Option<std::path::PathBuf>,
         spec: crate::control::config::TunnelSpec,
     ) -> anyhow::Result<()> {
         let name = spec.name.clone();
@@ -602,10 +623,14 @@ impl Manager {
             );
             if let Some(t) = self.tunnels.get_mut(&name) {
                 t.spec = spec;
+                t.config_path = config_path;
                 t.tunnel_mtu = tunnel_mtu;
                 t.config = config;
                 t.decap_key = Self::decap_key(unspecified, t.spec.remote);
                 t.effective_src = None;
+                t.next_hop = resolved.next_hop;
+                t.next_hop_on_link = resolved.on_link;
+                t.neigh_state = resolved.neigh_state;
             }
             log::info!("tunnel {name} updated (pending: no source address yet)");
             return Ok(());
@@ -636,10 +661,14 @@ impl Manager {
 
         if let Some(t) = self.tunnels.get_mut(&name) {
             t.spec = spec;
+            t.config_path = config_path;
             t.tunnel_mtu = tunnel_mtu;
             t.config = config;
             t.decap_key = new_key;
             t.effective_src = Some(src);
+            t.next_hop = resolved.next_hop;
+            t.next_hop_on_link = resolved.on_link;
+            t.neigh_state = resolved.neigh_state;
         }
         Ok(())
     }
@@ -647,12 +676,20 @@ impl Manager {
     /// Reload the config directories and apply the diff gracefully.
     pub async fn reload(&mut self) -> anyhow::Result<()> {
         let new_specs = crate::control::config::load_dirs(&self.config_dirs).await?;
+        // The winning config-file path per tunnel name, to pass through to
+        // add/update so each running tunnel can report its source file.
+        let paths: std::collections::HashMap<String, std::path::PathBuf> = new_specs
+            .iter()
+            .map(|(p, s)| (s.name.clone(), p.clone()))
+            .collect();
+        let bare: Vec<crate::control::config::TunnelSpec> =
+            new_specs.into_iter().map(|(_, s)| s).collect();
         let old: std::collections::HashMap<String, crate::control::config::TunnelSpec> = self
             .tunnels
             .iter()
             .map(|(k, t)| (k.clone(), t.spec.clone()))
             .collect();
-        let diff = diff_specs(&old, &new_specs);
+        let diff = diff_specs(&old, &bare);
         log::info!(
             "reload: {} added, {} removed, {} updated",
             diff.added.len(),
@@ -666,13 +703,15 @@ impl Manager {
         }
         for spec in diff.added {
             let n = spec.name.clone();
-            if let Err(e) = self.add_tunnel(spec).await {
+            let path = paths.get(&n).cloned();
+            if let Err(e) = self.add_tunnel(path, spec).await {
                 log::error!("reload: add {n}: {e:#}");
             }
         }
         for spec in diff.updated {
             let n = spec.name.clone();
-            if let Err(e) = self.update_tunnel(spec).await {
+            let path = paths.get(&n).cloned();
+            if let Err(e) = self.update_tunnel(path, spec).await {
                 log::error!("reload: update {n}: {e:#}");
             }
         }
@@ -736,6 +775,15 @@ impl Manager {
                 }
             };
 
+            // Record the freshly-observed next-hop diagnostics (reported over the
+            // management interface) regardless of whether the data-path entries
+            // change below, so the reported state never lags behind reality.
+            if let Some(t) = self.tunnels.get_mut(&name) {
+                t.next_hop = resolved.next_hop;
+                t.next_hop_on_link = resolved.on_link;
+                t.neigh_state = resolved.neigh_state;
+            }
+
             // Keep the last-known source on a transient unresolution so a ready
             // tunnel never flaps back to pending; likewise keep the last MAC.
             let Some(src) = resolved.src.or(eff_src) else {
@@ -791,6 +839,45 @@ impl Manager {
         }
     }
 
+    /// Service a control-plane request from the embedded varlink server. Runs
+    /// synchronously on the main loop, which owns `&mut self`, so the snapshot
+    /// can read the live BPF counters; the reply is sent back over the oneshot.
+    pub fn handle_control(&mut self, req: crate::control::types::ControlRequest) {
+        match req {
+            crate::control::types::ControlRequest::Snapshot(reply) => {
+                // The receiver may have hung up (client gone); ignore the result.
+                let _ = reply.send(self.build_snapshot());
+            }
+        }
+    }
+
+    /// Build an owned status snapshot of this daemon for the management
+    /// interface. Tunnel/external data is collected first (immutable borrows),
+    /// then the per-CPU debug counters are read (mutable borrow of the BPF maps).
+    fn build_snapshot(&mut self) -> crate::control::types::StatusSnapshot {
+        let external = crate::control::types::ExternalSnapshot {
+            name: self.external.name.clone(),
+            index: self.external.index,
+            mac: self.external.mac,
+            mtu: self.external.mtu,
+        };
+        let tunnels: Vec<_> = self.tunnels.values().map(snapshot_tunnel).collect();
+        let raw = self
+            .bpf
+            .read_counters()
+            .unwrap_or([0u64; etherip_xdp_common::DBG_MAX as usize]);
+        let counters = etherip_xdp_common::COUNTER_NAMES
+            .iter()
+            .copied()
+            .zip(raw)
+            .collect();
+        crate::control::types::StatusSnapshot {
+            external,
+            counters,
+            tunnels,
+        }
+    }
+
     /// Log the per-CPU debug counters (non-zero only).
     pub fn dump_counters(&mut self) {
         match self.bpf.read_counters() {
@@ -840,6 +927,43 @@ fn fmt_mac(mac: &[u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+/// Snapshot one running tunnel's config and live runtime state for the
+/// management interface.
+fn snapshot_tunnel(t: &RunningTunnel) -> crate::control::types::TunnelSnapshot {
+    let mac_policy = match t.spec.mac {
+        crate::control::config::MacConfig::Auto => "auto",
+        crate::control::config::MacConfig::Inherit => "inherit",
+        crate::control::config::MacConfig::Explicit(_) => "explicit",
+    };
+    let next_hop_on_link_policy = match t.spec.next_hop_on_link {
+        crate::control::resolver::NextHopOnLink::Maybe => "maybe",
+        crate::control::resolver::NextHopOnLink::Always => "always",
+        crate::control::resolver::NextHopOnLink::Never => "never",
+    };
+    // A non-zero installed dst_mac means the next hop is resolved.
+    let next_hop_mac = (t.config.dst_mac != [0u8; 6]).then_some(t.config.dst_mac);
+    crate::control::types::TunnelSnapshot {
+        name: t.spec.name.clone(),
+        config_path: t.config_path.clone(),
+        configured_local: t.spec.local,
+        remote: t.spec.remote,
+        effective_src: t.effective_src,
+        state: crate::control::types::derive_state(t.effective_src, t.config.dst_mac),
+        tunnel_mtu: t.tunnel_mtu,
+        mtu_override: t.spec.mtu,
+        mac_policy,
+        tunnel_mac: t.config.tunnel_mac,
+        next_hop_on_link_policy,
+        mss_clamp_ipv4: t.config.mss_clamp_ipv4,
+        mss_clamp_ipv6: t.config.mss_clamp_ipv6,
+        peer_ifindex: t.peer_index,
+        next_hop: t.next_hop,
+        next_hop_on_link: t.next_hop_on_link,
+        next_hop_mac,
+        neigh_state: t.neigh_state.map(|s| s.as_str()),
+    }
 }
 
 #[cfg(test)]

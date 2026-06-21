@@ -215,7 +215,12 @@ impl TunnelSpec {
 /// wins and the rest are shadowed. Surviving files are processed in file-name
 /// order for determinism. A missing directory is skipped (not every searched
 /// root is present); duplicate tunnel names (after shadowing) are an error.
-pub async fn load_dirs(dirs: &[std::path::PathBuf]) -> anyhow::Result<Vec<TunnelSpec>> {
+///
+/// Each spec is returned paired with the absolute path of the winning file it
+/// was loaded from, so the daemon can report it over the management interface.
+pub async fn load_dirs(
+    dirs: &[std::path::PathBuf],
+) -> anyhow::Result<Vec<(std::path::PathBuf, TunnelSpec)>> {
     // File name -> winning path, kept ordered by file name for a deterministic
     // load order regardless of directory iteration order.
     let mut chosen: std::collections::BTreeMap<std::ffi::OsString, std::path::PathBuf> =
@@ -240,7 +245,7 @@ pub async fn load_dirs(dirs: &[std::path::PathBuf]) -> anyhow::Result<Vec<Tunnel
         }
     }
 
-    let mut specs: Vec<TunnelSpec> = Vec::with_capacity(chosen.len());
+    let mut specs: Vec<(std::path::PathBuf, TunnelSpec)> = Vec::with_capacity(chosen.len());
     let mut seen = std::collections::HashSet::new();
     for path in chosen.into_values() {
         let stem = path
@@ -259,7 +264,7 @@ pub async fn load_dirs(dirs: &[std::path::PathBuf]) -> anyhow::Result<Vec<Tunnel
                 path.display()
             );
         }
-        specs.push(spec);
+        specs.push((path, spec));
     }
     Ok(specs)
 }
@@ -447,8 +452,8 @@ mod tests {
         std::fs::write(dir.join(name), contents).unwrap();
     }
 
-    fn names(specs: &[TunnelSpec]) -> Vec<&str> {
-        specs.iter().map(|s| s.name.as_str()).collect()
+    fn names(specs: &[(std::path::PathBuf, TunnelSpec)]) -> Vec<&str> {
+        specs.iter().map(|(_, s)| s.name.as_str()).collect()
     }
 
     #[tokio::test]
@@ -485,9 +490,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names(&specs), vec!["office", "peer"]);
-        let peer = specs.iter().find(|s| s.name == "peer").unwrap();
+        let peer = specs.iter().find(|(_, s)| s.name == "peer").unwrap();
         let expected: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
-        assert_eq!(peer.remote, expected);
+        assert_eq!(peer.1.remote, expected);
     }
 
     #[tokio::test]

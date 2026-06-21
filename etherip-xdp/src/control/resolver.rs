@@ -79,6 +79,16 @@ pub struct Resolved {
     /// Next-hop link-layer address. `None` when unresolved (e.g. peer unreachable
     /// or no next hop under the on-link policy).
     pub dst_mac: Option<[u8; 6]>,
+    /// The chosen next hop: the gateway, or the remote itself when on-link.
+    /// `None` when no next hop resolved under the on-link policy.
+    pub next_hop: Option<std::net::Ipv6Addr>,
+    /// Whether the next hop is the remote endpoint itself (on-link) rather than a
+    /// gateway.
+    pub on_link: bool,
+    /// Observed kernel neighbour state for the next hop, if one was looked up.
+    /// Captured regardless of usability (an `incomplete`/`failed` state is itself
+    /// useful diagnostic information).
+    pub neigh_state: Option<crate::control::netlink::NeighState>,
 }
 
 /// Pick the effective outer source address. An explicit configuration always
@@ -202,13 +212,22 @@ pub async fn resolve_endpoint(
             "no next hop for {dst} (no gateway and on-link policy is {on_link:?}); \
              leaving unresolved until a route appears"
         );
-        return Ok(Resolved { src, dst_mac: None });
+        return Ok(Resolved {
+            src,
+            dst_mac: None,
+            next_hop: None,
+            on_link: false,
+            neigh_state: None,
+        });
     };
+    // On-link iff the chosen next hop is the destination itself (no gateway).
+    let on_link = next_hop == dst;
 
-    // Current usable MAC from the neighbour table, if any.
-    let current = nl
-        .neighbour_mac(external_ifindex, next_hop)
-        .await?
+    // Read the neighbour entry once: its state is reported regardless of
+    // usability, while only a usable entry yields a MAC for the data path.
+    let entry = nl.neighbour_mac(external_ifindex, next_hop).await?;
+    let neigh_state = entry.map(|e| e.neigh_state());
+    let current = entry
         .filter(crate::control::netlink::NeighEntry::is_usable)
         .map(|e| e.mac);
 
@@ -217,6 +236,9 @@ pub async fn resolve_endpoint(
         Probe::Passive => Ok(Resolved {
             src,
             dst_mac: current,
+            next_hop: Some(next_hop),
+            on_link,
+            neigh_state,
         }),
         // One probe to keep a usable entry fresh (or nudge a missing one); the
         // periodic cadence retries and the neighbour monitor picks up the result.
@@ -225,6 +247,9 @@ pub async fn resolve_endpoint(
             Ok(Resolved {
                 src,
                 dst_mac: current,
+                next_hop: Some(next_hop),
+                on_link,
+                neigh_state,
             })
         }
         // Synchronous bring-up: probe and re-check up to PROBE_ATTEMPTS.
@@ -233,6 +258,9 @@ pub async fn resolve_endpoint(
                 return Ok(Resolved {
                     src,
                     dst_mac: current,
+                    next_hop: Some(next_hop),
+                    on_link,
+                    neigh_state,
                 });
             }
             for _ in 0..PROBE_ATTEMPTS {
@@ -244,10 +272,19 @@ pub async fn resolve_endpoint(
                     return Ok(Resolved {
                         src,
                         dst_mac: Some(entry.mac),
+                        next_hop: Some(next_hop),
+                        on_link,
+                        neigh_state: Some(entry.neigh_state()),
                     });
                 }
             }
-            Ok(Resolved { src, dst_mac: None })
+            Ok(Resolved {
+                src,
+                dst_mac: None,
+                next_hop: Some(next_hop),
+                on_link,
+                neigh_state,
+            })
         }
     }
 }
