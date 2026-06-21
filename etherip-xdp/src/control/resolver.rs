@@ -4,7 +4,9 @@
 //! derives both the outer source address and the next-hop MAC. Every route
 //! lookup is constrained to the external interface (`oif`), since encap always
 //! egresses there, and carries no `iif` so the kernel routes it as the
-//! locally-originated packet it is (`iif lo`).
+//! locally-originated packet it is (`iif lo`). The `oif` constraint is enforced
+//! even against the kernel quirk where a `from`+`oif` lookup ignores `oif` (see
+//! [`route_get_oif_pinned`]).
 //!
 //! - **Source address.** When a tunnel configures an explicit `src`, it is used
 //!   verbatim (and passed as the route lookup's source hint so policy routing and
@@ -140,11 +142,57 @@ async fn route_get_oif(
     }
 }
 
+/// Whether a route result egresses the interface the lookup was pinned to. A
+/// `from`+`oif` lookup can silently ignore `oif` when another interface has a
+/// better-metric matching route (the kernel takes an input-route path against the
+/// global FIB); the returned `RTA_OIF` then points at the wrong link. A route
+/// reporting no output interface, or no route at all, is treated as honouring the
+/// pin — there is nothing contradicting it to act on. Pure so it can be
+/// unit-tested.
+fn route_honours_oif(
+    info: Option<crate::control::netlink::RouteInfo>,
+    external_ifindex: u32,
+) -> bool {
+    match info.and_then(|i| i.oif) {
+        Some(got) => got == external_ifindex,
+        None => true,
+    }
+}
+
+/// Route lookup pinned to `external_ifindex`, working around the kernel quirk
+/// where a `from`+`oif` lookup ignores `oif` and resolves the gateway on whichever
+/// interface owns the better-metric default — fatal for an encap path that always
+/// egresses the uplink. When a source hint is supplied and the result egresses a
+/// different interface, the `oif` was ignored, so the lookup is redone sourcelessly
+/// (which the kernel routes as locally-originated and honours `oif`). The source
+/// hint is dropped only for gateway selection; the caller keeps the configured or
+/// preferred source for the outer header.
+async fn route_get_oif_pinned(
+    nl: &crate::control::netlink::Netlink,
+    dst: std::net::Ipv6Addr,
+    src: Option<std::net::Ipv6Addr>,
+    external_ifindex: u32,
+) -> Option<crate::control::netlink::RouteInfo> {
+    let info = route_get_oif(nl, dst, src, external_ifindex).await;
+    if src.is_some() && !route_honours_oif(info, external_ifindex) {
+        log::debug!(
+            "route lookup for {dst} (src {src:?}) egressed ifindex {:?}, not the uplink \
+             {external_ifindex}; redoing sourcelessly to honour oif",
+            info.and_then(|i| i.oif)
+        );
+        return route_get_oif(nl, dst, None, external_ifindex).await;
+    }
+    info
+}
+
 /// Resolve the route to `dst` and the effective outer source together, applying
 /// policy routing accurately. Returns `(src, route_info)`; either may be `None`
 /// when unresolved. The source hint is chosen so source-keyed `ip rule`s match:
 ///
-/// - **Explicit `src`:** used as the hint verbatim.
+/// - **Explicit `src`:** used as the hint verbatim, subject to the `oif` pin (see
+///   [`route_get_oif_pinned`]): if the `from`+`oif` lookup egresses another
+///   interface, the gateway is re-resolved sourcelessly while the configured
+///   source is still adopted for the outer header.
 /// - **Auto `src`, kernel-selected:** a sourceless lookup lets the kernel apply
 ///   destination-keyed rules and its own RFC 6724 selection (`RTA_PREFSRC`).
 /// - **Auto `src`, seeded:** when that yields no source — the host's policy
@@ -162,7 +210,7 @@ async fn resolve_route_and_src(
     Option<crate::control::netlink::RouteInfo>,
 ) {
     if configured_src.is_some() {
-        let info = route_get_oif(nl, dst, configured_src, external_ifindex).await;
+        let info = route_get_oif_pinned(nl, dst, configured_src, external_ifindex).await;
         return (choose_src(configured_src, info), info);
     }
 
@@ -174,7 +222,7 @@ async fn resolve_route_and_src(
     match nl.interface_global_addrs(external_ifindex).await {
         Ok(addrs) => {
             for cand in addrs {
-                let info = route_get_oif(nl, dst, Some(cand), external_ifindex).await;
+                let info = route_get_oif_pinned(nl, dst, Some(cand), external_ifindex).await;
                 if info.is_some() {
                     return (Some(cand), info);
                 }
@@ -351,6 +399,7 @@ mod tests {
         Some(crate::control::netlink::RouteInfo {
             gateway: Some(std::net::IpAddr::V6(gw)),
             prefsrc: None,
+            oif: None,
         })
     }
 
@@ -358,6 +407,7 @@ mod tests {
         Some(crate::control::netlink::RouteInfo {
             gateway: None,
             prefsrc: None,
+            oif: None,
         })
     }
 
@@ -367,6 +417,15 @@ mod tests {
         Some(crate::control::netlink::RouteInfo {
             gateway: None,
             prefsrc: Some(std::net::IpAddr::V6(prefsrc)),
+            oif: None,
+        })
+    }
+
+    fn route_on_oif(oif: u32) -> Option<crate::control::netlink::RouteInfo> {
+        Some(crate::control::netlink::RouteInfo {
+            gateway: None,
+            prefsrc: None,
+            oif: Some(oif),
         })
     }
 
@@ -413,6 +472,18 @@ mod tests {
             None
         );
         assert_eq!(choose_next_hop(NextHopOnLink::Never, None, dst), None);
+    }
+
+    #[test]
+    fn oif_pin_detects_ignored_oif() {
+        // The lookup egressed the uplink we pinned to: honoured.
+        assert!(route_honours_oif(route_on_oif(7), 7));
+        // The kernel ignored `oif` and resolved on another interface (the
+        // `from`+`oif` quirk): not honoured, so the caller re-resolves sourcelessly.
+        assert!(!route_honours_oif(route_on_oif(9), 7));
+        // No output interface reported, or no route: nothing contradicts the pin.
+        assert!(route_honours_oif(gw_route("fe80::1".parse().unwrap()), 7));
+        assert!(route_honours_oif(None, 7));
     }
 
     #[test]
