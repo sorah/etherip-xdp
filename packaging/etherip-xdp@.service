@@ -2,7 +2,7 @@
 #
 #   sudo install -Dm0644 packaging/etherip-xdp@.service /etc/systemd/system/etherip-xdp@.service
 #   sudo install -Dm0755 target/release/etherip-xdp /usr/bin/etherip-xdp
-#   sudo mkdir -p /etc/etherip-xdp/eth1.d   # one *.json per tunnel
+#   sudo mkdir -p /etc/etherip-xdp/interfaces.d/eth1   # one *.json per tunnel
 #   sudo systemctl enable --now etherip-xdp@eth1
 #   sudo systemctl reload etherip-xdp@eth1  # graceful config reload (SIGHUP)
 [Unit]
@@ -20,6 +20,11 @@ ExecStart=/usr/bin/etherip-xdp %i
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
+
+# Search $RUNTIME_DIRECTORY (/run/etherip-xdp) for volatile config drop-ins,
+# ahead of /etc; preserved across restarts, cleared at reboot.
+RuntimeDirectory=etherip-xdp
+RuntimeDirectoryPreserve=yes
 
 # Loading/attaching XDP, managing veth/neighbours, and ethtool need these.
 # On kernels < 5.8, CAP_BPF does not exist; replace it with CAP_SYS_ADMIN.

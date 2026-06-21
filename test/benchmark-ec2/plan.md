@@ -291,9 +291,10 @@ generation); a slim `runcmd` script handles only the genuinely runtime bits.
   `169.254.0.{1,2}/30`, forwarding on, and the `via etherip` routes from §6b.
   networkd applies it whenever the daemon creates the veth.
 - `etherip-xdp@.service.d/10-config-dir.conf` (DUTs) — drop-in pinning
-  `--config-dir /etc/etherip-xdp/tunnel.d`, so the config path doesn't depend on
-  the (AWS-assigned) interface name.
-- `/etc/etherip-xdp/tunnel.d/etherip.json` (DUTs) — **pre-created**; both endpoint
+  `--config-dir /etc/etherip-xdp/tunnels` (read verbatim, bypassing the default
+  `interfaces.d/<device>/` layout), so the config path doesn't depend on the
+  (AWS-assigned) interface name.
+- `/etc/etherip-xdp/tunnels/etherip.json` (DUTs) — **pre-created**; both endpoint
   GUAs are known at deploy time, injected by `Fn::Sub`:
   ```json
   { "name": "etherip", "local": "${<own uplink Eni>.PrimaryIpv6Address}", "remote": "${<peer uplink Eni>.PrimaryIpv6Address}", "mss": "auto" }

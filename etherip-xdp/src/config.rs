@@ -1,11 +1,16 @@
 //! JSON tunnel configuration.
 //!
-//! Each tunnel is a drop-in file under the config directory (default
-//! `/etc/etherip-xdp/<device>.d/`), one tunnel per file:
+//! Each tunnel is a drop-in file under the per-interface config directory
+//! (default `/etc/etherip-xdp/interfaces.d/<device>/`), one tunnel per file:
 //!
 //! ```json
 //! { "name": "peer", "local": "2001:db8::1", "remote": "2001:db8::2", "mss": "auto" }
 //! ```
+//!
+//! Directories are searched with systemd drop-in precedence (the runtime root
+//! from `$RUNTIME_DIRECTORY`, then `/etc/etherip-xdp`, overridable via
+//! `--config-root`/`--config-dir`): a file name found in a higher-precedence
+//! directory shadows the same name lower down.
 //!
 //! The external device is the process scope (CLI `device` argument / systemd
 //! instance `%i`), so it is not repeated per file. `name` defaults to the file
@@ -204,28 +209,40 @@ impl TunnelSpec {
     }
 }
 
-/// Load and validate every `*.json` tunnel definition in `dir`, sorted by file
-/// name for determinism. Duplicate tunnel names are an error.
-pub async fn load_dir(dir: &std::path::Path) -> anyhow::Result<Vec<TunnelSpec>> {
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    let mut entries = tokio::fs::read_dir(dir)
-        .await
-        .map_err(|e| anyhow::anyhow!("read config dir {}: {e}", dir.display()))?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| anyhow::anyhow!("read config dir {}: {e}", dir.display()))?
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json") {
-            files.push(path);
+/// Load and validate every `*.json` tunnel definition across `dirs`, applying
+/// systemd-style drop-in precedence: when the same file name appears in more
+/// than one directory, the copy in the earlier (higher-precedence) directory
+/// wins and the rest are shadowed. Surviving files are processed in file-name
+/// order for determinism. A missing directory is skipped (not every searched
+/// root is present); duplicate tunnel names (after shadowing) are an error.
+pub async fn load_dirs(dirs: &[std::path::PathBuf]) -> anyhow::Result<Vec<TunnelSpec>> {
+    // File name -> winning path, kept ordered by file name for a deterministic
+    // load order regardless of directory iteration order.
+    let mut chosen: std::collections::BTreeMap<std::ffi::OsString, std::path::PathBuf> =
+        std::collections::BTreeMap::new();
+    for dir in dirs {
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(anyhow::anyhow!("read config dir {}: {e}", dir.display())),
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| anyhow::anyhow!("read config dir {}: {e}", dir.display()))?
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                // The first directory to claim a file name wins; later (lower
+                // precedence) directories with the same name are shadowed.
+                chosen.entry(entry.file_name()).or_insert(path);
+            }
         }
     }
-    files.sort();
 
-    let mut specs: Vec<TunnelSpec> = Vec::with_capacity(files.len());
+    let mut specs: Vec<TunnelSpec> = Vec::with_capacity(chosen.len());
     let mut seen = std::collections::HashSet::new();
-    for path in files {
+    for path in chosen.into_values() {
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -424,6 +441,70 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn write(dir: &std::path::Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).unwrap();
+    }
+
+    fn names(specs: &[TunnelSpec]) -> Vec<&str> {
+        specs.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn load_dirs_skips_missing_and_non_json() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "peer.json", r#"{"remote":"2001:db8::2"}"#);
+        write(dir.path(), "notes.txt", "ignored");
+        let missing = dir.path().join("does-not-exist");
+        let specs = load_dirs(&[missing, dir.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert_eq!(names(&specs), vec!["peer"]);
+    }
+
+    #[tokio::test]
+    async fn load_dirs_sorts_surviving_files_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "b.json", r#"{"remote":"2001:db8::2"}"#);
+        write(dir.path(), "a.json", r#"{"remote":"2001:db8::3"}"#);
+        let specs = load_dirs(&[dir.path().to_path_buf()]).await.unwrap();
+        assert_eq!(names(&specs), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn load_dirs_shadows_by_file_name_with_first_dir_winning() {
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        // Same file name in both dirs: the higher-precedence (first) one wins.
+        write(high.path(), "peer.json", r#"{"remote":"2001:db8::1"}"#);
+        write(low.path(), "peer.json", r#"{"remote":"2001:db8::2"}"#);
+        // A name only present in the lower-precedence dir still loads.
+        write(low.path(), "office.json", r#"{"remote":"2001:db8::3"}"#);
+        let specs = load_dirs(&[high.path().to_path_buf(), low.path().to_path_buf()])
+            .await
+            .unwrap();
+        assert_eq!(names(&specs), vec!["office", "peer"]);
+        let peer = specs.iter().find(|s| s.name == "peer").unwrap();
+        let expected: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_eq!(peer.remote, expected);
+    }
+
+    #[tokio::test]
+    async fn load_dirs_rejects_duplicate_tunnel_names_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Different file names, same explicit tunnel name.
+        write(
+            dir.path(),
+            "a.json",
+            r#"{"name":"dup","remote":"2001:db8::2"}"#,
+        );
+        write(
+            dir.path(),
+            "b.json",
+            r#"{"name":"dup","remote":"2001:db8::3"}"#,
+        );
+        assert!(load_dirs(&[dir.path().to_path_buf()]).await.is_err());
     }
 
     #[test]

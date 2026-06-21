@@ -92,7 +92,7 @@ interface": tunnels sharing an uplink share one program + maps.
     `effective_src` (pending vs ready), reload diff (`diff_specs`, pure + tests),
     `wait_for_external`, `reresolve_all(refresh: bool)`, `warn_if_src_unassigned`.
   - `tests/data_path.rs` — byte-exact `BPF_PROG_TEST_RUN` tests (`#[ignore]`, root).
-- `packaging/etherip-xdp@.service`, `packaging/etc/etherip-xdp/eth1.d/*.json` (examples).
+- `packaging/etherip-xdp@.service`, `packaging/etc/etherip-xdp/interfaces.d/eth1/*.json` (examples).
 - `mise.toml` — task runner (migrated from justfile, which was deleted) + pins
   `cargo:bpf-linker`. Tasks: build/test/test-bpf/lint/fmt/run/install.
 - `.github/workflows/ci.yml` (entry) → `_test.yml` (reusable; matrix
@@ -155,8 +155,10 @@ mise run lint                # clippy -D warnings
 mise run test-bpf            # ROOT + kernel>=5.15: byte-exact data-path tests
 sudo ./target/release/etherip-xdp eth1   # or: mise run run eth1
 ```
-Config: `/etc/etherip-xdp/<device>.d/*.json` (one tunnel per file; `name` defaults
-to file stem; `local`/`remote` IPv6; `mss` auto/off/int/{ipv4,ipv6}; optional `mtu`).
+Config: `/etc/etherip-xdp/interfaces.d/<device>/*.json` (one tunnel per file; `name`
+defaults to file stem; `local`/`remote` IPv6; `mss` auto/off/int/{ipv4,ipv6}; optional
+`mtu`). Searched with systemd drop-in precedence (`$RUNTIME_DIRECTORY` then `/etc`);
+overridable via repeatable `--config-root`/`--config-dir`.
 
 ## Open risks / TODO for next agent
 

@@ -95,7 +95,7 @@ pub struct Manager {
     nl: crate::netlink::Netlink,
     external: ExternalInterface,
     external_decap_link: aya::programs::xdp::XdpLinkId,
-    config_dir: std::path::PathBuf,
+    config_dirs: Vec<std::path::PathBuf>,
     /// When `Some`, each tunnel's `<name>-xdp` peer is moved into this private
     /// anonymous namespace to hide it from userland; when `None`, peers stay in
     /// the host namespace alongside the user-facing ends.
@@ -141,7 +141,7 @@ impl Manager {
     /// all tunnels from the config directory.
     pub async fn start(
         external_name: String,
-        config_dir: std::path::PathBuf,
+        config_dirs: Vec<std::path::PathBuf>,
         hide_peer: bool,
     ) -> anyhow::Result<Self> {
         let nl = crate::netlink::Netlink::connect()?;
@@ -182,16 +182,16 @@ impl Manager {
             nl,
             external,
             external_decap_link,
-            config_dir,
+            config_dirs,
             netns,
             tunnels: std::collections::HashMap::new(),
         };
 
-        let specs = crate::config::load_dir(&manager.config_dir).await?;
+        let specs = crate::config::load_dirs(&manager.config_dirs).await?;
         if specs.is_empty() {
             log::warn!(
                 "no tunnel configs found in {}",
-                manager.config_dir.display()
+                manager.config_dirs_display()
             );
         }
         for spec in specs {
@@ -200,6 +200,15 @@ impl Manager {
             }
         }
         Ok(manager)
+    }
+
+    /// Render the searched config directories for log messages.
+    fn config_dirs_display(&self) -> String {
+        self.config_dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn tunnel_mtu(&self, spec: &crate::config::TunnelSpec) -> i32 {
@@ -626,9 +635,9 @@ impl Manager {
         Ok(())
     }
 
-    /// Reload the config directory and apply the diff gracefully.
+    /// Reload the config directories and apply the diff gracefully.
     pub async fn reload(&mut self) -> anyhow::Result<()> {
-        let new_specs = crate::config::load_dir(&self.config_dir).await?;
+        let new_specs = crate::config::load_dirs(&self.config_dirs).await?;
         let old: std::collections::HashMap<String, crate::config::TunnelSpec> = self
             .tunnels
             .iter()

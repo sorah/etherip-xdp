@@ -1,9 +1,9 @@
 //! XDP EtherIP (RFC 3378) tunnel daemon.
 //!
 //! One process owns one external (uplink) network device and every tunnel
-//! configured on it (`/etc/etherip-xdp/<device>.d/*.json`), so it maps cleanly
-//! onto a templated `etherip-xdp@<device>.service`. SIGHUP reloads the config dir
-//! gracefully; SIGINT/SIGTERM tear everything down.
+//! configured on it (`/etc/etherip-xdp/interfaces.d/<device>/*.json`), so it maps
+//! cleanly onto a templated `etherip-xdp@<device>.service`. SIGHUP reloads the
+//! config gracefully; SIGINT/SIGTERM tear everything down.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 mod bpf;
@@ -23,9 +23,20 @@ struct Opt {
     /// External (uplink) network device facing the tunnel peers.
     device: String,
 
-    /// Directory of per-tunnel JSON configs (default /etc/etherip-xdp/<device>.d).
+    /// Directory of per-tunnel JSON configs, used verbatim (the
+    /// `interfaces.d/<device>` layout is not applied). Repeatable: earlier
+    /// directories take precedence, and a file name found in one shadows the
+    /// same name in later directories (systemd drop-in semantics). Mutually
+    /// exclusive with --config-root.
+    #[arg(long, conflicts_with = "config_root")]
+    config_dir: Vec<std::path::PathBuf>,
+
+    /// Config root replacing the default search roots; the effective directory
+    /// is `<root>/interfaces.d/<device>`. Repeatable with the same precedence
+    /// and shadowing rules as --config-dir. Defaults to the systemd
+    /// `$RUNTIME_DIRECTORY` directories (when set) then `/etc/etherip-xdp`.
     #[arg(long)]
-    config_dir: Option<std::path::PathBuf>,
+    config_root: Vec<std::path::PathBuf>,
 
     /// Keep each tunnel's internal `<name>-xdp` veth peer in the host namespace
     /// instead of hiding it in a daemon-private anonymous network namespace. By
@@ -48,6 +59,54 @@ fn bump_memlock_rlimit() {
     }
 }
 
+/// Resolve the ordered list of directories to search for tunnel configs.
+///
+/// `--config-dir` values are used verbatim. Otherwise each root (the
+/// `--config-root` values, or the defaults when none are given) is expanded to
+/// `<root>/interfaces.d/<device>`. Precedence follows list order: earlier
+/// directories win on a file-name collision (see [`config::load_dirs`]).
+fn resolve_config_dirs(
+    device: &str,
+    config_dir: Vec<std::path::PathBuf>,
+    config_root: Vec<std::path::PathBuf>,
+    runtime_directory: Option<&std::ffi::OsStr>,
+) -> Vec<std::path::PathBuf> {
+    if !config_dir.is_empty() {
+        return config_dir;
+    }
+    let roots = if config_root.is_empty() {
+        default_config_roots(runtime_directory)
+    } else {
+        config_root
+    };
+    roots
+        .into_iter()
+        .map(|root| root.join("interfaces.d").join(device))
+        .collect()
+}
+
+/// Default config roots, in precedence order: the systemd runtime directories
+/// ahead of the system-wide `/etc/etherip-xdp`, mirroring systemd's `/run` >
+/// `/etc` drop-in precedence. `RuntimeDirectory=` exports `RUNTIME_DIRECTORY` as
+/// a colon-separated list of the granted `/run/<name>` directories; each is a
+/// root verbatim (it is already the service's own directory, so no extra suffix
+/// is appended).
+fn default_config_roots(runtime_directory: Option<&std::ffi::OsStr>) -> Vec<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut roots = Vec::new();
+    if let Some(dirs) = runtime_directory {
+        for dir in dirs
+            .as_bytes()
+            .split(|&b| b == b':')
+            .filter(|s| !s.is_empty())
+        {
+            roots.push(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(dir)));
+        }
+    }
+    roots.push(std::path::PathBuf::from("/etc/etherip-xdp"));
+    roots
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::new()
@@ -56,14 +115,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let opt = <Opt as clap::Parser>::parse();
-    let config_dir = opt
-        .config_dir
-        .unwrap_or_else(|| std::path::PathBuf::from(format!("/etc/etherip-xdp/{}.d", opt.device)));
+    let config_dirs = resolve_config_dirs(
+        &opt.device,
+        opt.config_dir,
+        opt.config_root,
+        std::env::var_os("RUNTIME_DIRECTORY").as_deref(),
+    );
 
     bump_memlock_rlimit();
 
     let mut manager =
-        tunnel::Manager::start(opt.device, config_dir, !opt.disable_veth_peer_netns).await?;
+        tunnel::Manager::start(opt.device, config_dirs, !opt.disable_veth_peer_netns).await?;
     log::info!("etherip-xdp ready; SIGHUP to reload, SIGINT/SIGTERM to stop");
 
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -102,4 +164,93 @@ async fn main() -> anyhow::Result<()> {
     manager.dump_counters();
     manager.cleanup().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pb(s: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(s)
+    }
+
+    #[test]
+    fn default_roots_prepend_runtime_directory_when_set() {
+        // RUNTIME_DIRECTORY is the service's own /run dir, used verbatim as a root.
+        assert_eq!(
+            resolve_config_dirs(
+                "eth1",
+                vec![],
+                vec![],
+                Some(std::ffi::OsStr::new("/run/etherip-xdp"))
+            ),
+            vec![
+                pb("/run/etherip-xdp/interfaces.d/eth1"),
+                pb("/etc/etherip-xdp/interfaces.d/eth1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn default_roots_split_runtime_directory_colon_list() {
+        // systemd exports multiple RuntimeDirectory= entries colon-separated.
+        assert_eq!(
+            resolve_config_dirs(
+                "eth1",
+                vec![],
+                vec![],
+                Some(std::ffi::OsStr::new(
+                    "/run/etherip-xdp:/run/host/etherip-xdp"
+                )),
+            ),
+            vec![
+                pb("/run/etherip-xdp/interfaces.d/eth1"),
+                pb("/run/host/etherip-xdp/interfaces.d/eth1"),
+                pb("/etc/etherip-xdp/interfaces.d/eth1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn default_roots_without_runtime_directory_are_etc_only() {
+        // Unset and empty both fall back to the system root alone.
+        assert_eq!(
+            resolve_config_dirs("eth1", vec![], vec![], None),
+            vec![pb("/etc/etherip-xdp/interfaces.d/eth1")]
+        );
+        assert_eq!(
+            resolve_config_dirs("eth1", vec![], vec![], Some(std::ffi::OsStr::new(""))),
+            vec![pb("/etc/etherip-xdp/interfaces.d/eth1")]
+        );
+    }
+
+    #[test]
+    fn config_root_replaces_defaults_and_expands_per_device() {
+        assert_eq!(
+            resolve_config_dirs(
+                "wan0",
+                vec![],
+                vec![pb("/srv/a"), pb("/srv/b")],
+                Some(std::ffi::OsStr::new("/run/etherip-xdp")),
+            ),
+            vec![
+                pb("/srv/a/interfaces.d/wan0"),
+                pb("/srv/b/interfaces.d/wan0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn config_dir_is_used_verbatim_and_wins_over_root() {
+        // --config-dir bypasses the interfaces.d/<device> layout entirely.
+        assert_eq!(
+            resolve_config_dirs(
+                "eth1",
+                vec![pb("/tmp/x"), pb("/tmp/y")],
+                vec![pb("/ignored")],
+                Some(std::ffi::OsStr::new("/run/etherip-xdp")),
+            ),
+            vec![pb("/tmp/x"), pb("/tmp/y")]
+        );
+    }
 }
