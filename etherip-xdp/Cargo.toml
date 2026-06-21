@@ -10,6 +10,8 @@ repository.workspace = true
 
 [package.metadata.deb]
 maintainer = "Sorah Fukumori <her@sorah.jp>"
+# postinst runs systemd-sysusers (no dpkg trigger exists for sysusers.d).
+maintainer-scripts = "../packaging/maintainer-scripts"
 copyright = "2021 Takeru Hayasaka; 2026 Sorah Fukumori"
 license-file = ["../LICENSE-MIT", "0"]
 section = "net"
@@ -36,9 +38,8 @@ assets = [
     ["../packaging/etherip-xdp-manager.service", "usr/lib/systemd/system/", "644"],
     ["../packaging/etherip-xdp-manager.socket", "usr/lib/systemd/system/", "644"],
     ["../packaging/etherip-xdp-varlink@.socket", "usr/lib/systemd/system/", "644"],
-    # The hardened units run as DynamicUsers sharing the static etherip-xdp-sock
-    # group, which owns the 0660 control sockets and the /run/etherip-xdp dir.
-    # dpkg's systemd triggers run systemd-sysusers / systemd-tmpfiles on these.
+    # Static group + setgid runtime dir backing the DynamicUser units (postinst
+    # applies the sysusers one; tmpfiles.d has a dpkg trigger).
     ["../packaging/etherip-xdp.sysusers", "usr/lib/sysusers.d/etherip-xdp.conf", "644"],
     ["../packaging/etherip-xdp.tmpfiles", "usr/lib/tmpfiles.d/etherip-xdp.conf", "644"],
     ["../README.md", "usr/share/doc/etherip-xdp/README.md", "644"],

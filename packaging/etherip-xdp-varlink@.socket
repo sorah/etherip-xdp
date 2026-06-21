@@ -15,9 +15,7 @@ Service=etherip-xdp@%i.service
 ListenStream=/run/etherip-xdp/%i/co.0w0.etheripxdp.Management
 FileDescriptorName=varlink
 SocketMode=0660
-# Group-owned so the host-wide manager (a different dynamic user in this group)
-# can connect; the per-device subdir inherits the group from the setgid
-# /run/etherip-xdp (tmpfiles.d).
+# Group-owned so the manager (a different dynamic user in this group) can connect.
 SocketGroup=etherip-xdp-sock
 
 [Install]

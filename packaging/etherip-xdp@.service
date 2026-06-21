@@ -1,68 +1,41 @@
-# Templated systemd unit: one instance per external (uplink) interface.
-#
-#   sudo install -Dm0644 packaging/etherip-xdp@.service /etc/systemd/system/etherip-xdp@.service
-#   sudo install -Dm0755 target/release/etherip-xdp /usr/bin/etherip-xdp
-#   sudo mkdir -p /etc/etherip-xdp/interfaces.d/eth1   # one *.json per tunnel
+# One instance per uplink interface:
 #   sudo systemctl enable --now etherip-xdp@eth1
-#   sudo systemctl reload etherip-xdp@eth1  # graceful config reload (SIGHUP)
-#
-# For the varlink management interface (etheripctl / etherip-xdp-manager), also
-# enable the per-instance control socket and the host-wide manager:
-#   sudo systemctl enable --now etherip-xdp-varlink@eth1.socket
-#   sudo systemctl enable --now etherip-xdp-manager.socket
+#   sudo systemctl reload etherip-xdp@eth1   # graceful config reload (SIGHUP)
+# For etheripctl / the host-wide manager: systemctl enable --now etherip-xdp-manager.socket
 [Unit]
 Description=XDP EtherIP tunnels on %i
 Documentation=https://github.com/sorah/etherip-xdp
 After=network-pre.target sys-subsystem-net-devices-%i.device
 Wants=network-pre.target
 BindsTo=sys-subsystem-net-devices-%i.device
+# Pull in & order after the control socket; its fd is adopted via Sockets=.
+Wants=etherip-xdp-varlink@%i.socket
+After=etherip-xdp-varlink@%i.socket
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/etherip-xdp %i
-# `systemctl reload` applies config changes gracefully (no data-path interruption
-# for unaffected tunnels).
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
-
-# The varlink control socket fd is passed by name ("varlink"). Under the
-# sandboxing below the daemon runs unprivileged and cannot self-bind into the
-# shared runtime dir (ProtectSystem=strict), so socket activation is the supported
-# path for the management interface — enable etherip-xdp-varlink@%i.socket. The
-# data path runs regardless of whether the socket is enabled.
 Sockets=etherip-xdp-varlink@%i.socket
 
-# Run as a dynamic, unprivileged user that joins the static etherip-xdp-sock group
-# (created via sysusers.d). That group owns the 0660 varlink control sockets and
-# the shared /run/etherip-xdp runtime dir (created via tmpfiles.d), so the
-# host-wide manager — a separate dynamic user in the same group — can reach each
-# daemon's per-device socket. (A shared DynamicUser identity can't: systemd parks
-# its RuntimeDirectory under /run/private at 0700, unreachable cross-unit.)
+# Own dynamic user joining the static etherip-xdp-sock group, which owns the 0660
+# sockets and /run/etherip-xdp so the manager (another dynamic user in the group)
+# can reach them. A shared DynamicUser can't: systemd parks its RuntimeDirectory
+# under /run/private 0700. RuntimeDirectory= is dropped for the same reason, so
+# $RUNTIME_DIRECTORY (the config drop-in search path) is set explicitly.
 DynamicUser=yes
 SupplementaryGroups=etherip-xdp-sock
-
-# Volatile config drop-ins are searched under $RUNTIME_DIRECTORY (/run/etherip-xdp),
-# created by tmpfiles.d rather than RuntimeDirectory=: with DynamicUser= the latter
-# would relocate it under /run/private (0700), out of the manager's reach and apart
-# from the socket dir. Set the variable explicitly so the search still resolves.
 Environment=RUNTIME_DIRECTORY=/run/etherip-xdp
 
-# Capabilities (kept despite DynamicUser): CAP_BPF/CAP_PERFMON/CAP_NET_ADMIN/
-# CAP_NET_RAW load & attach XDP, manage veth/neighbours and ethtool; CAP_PERFMON
-# also sets allow_ptr_leaks so the verifier accepts the data-path's variable
-# packet-offset arithmetic (6.x/7.0 reject it otherwise). CAP_SYS_RESOURCE: memlock.
-# CAP_SYS_ADMIN: unshare(CLONE_NEWNET) for the hidden veth-peer netns (drop it with
-# --disable-veth-peer-netns). On kernels < 5.8 replace CAP_BPF with CAP_SYS_ADMIN.
+# CAP_SYS_ADMIN: unshare(CLONE_NEWNET) for the hidden veth peer (dropped by
+# --disable-veth-peer-netns). CAP_PERFMON also sets allow_ptr_leaks for the
+# data-path verifier. Pre-5.8: swap CAP_BPF for CAP_SYS_ADMIN.
 AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN
 
-# Sandboxing (systemd-analyze security ~2.2 OK). The data path (XDP load, veth
-# netns, ethtool, forwarding) is validated under this exact set:
-#  - RestrictNamespaces=net keeps unshare(CLONE_NEWNET) working;
-#  - RestrictAddressFamilies includes AF_INET(6) for the ethtool ioctl socket and
-#    AF_NETLINK/AF_PACKET for netlink/XDP;
-#  - SystemCallFilter keeps bpf/unshare/setns over @system-service.
+# systemd-analyze security 2.2. AF_INET(6) is needed for the ethtool ioctl socket.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

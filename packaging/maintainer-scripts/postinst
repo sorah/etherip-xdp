@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# No dpkg trigger exists for sysusers.d (unlike tmpfiles.d), so create the group
+# here — otherwise it appears only at the next boot and the units fail to start.
+if [ "$1" = "configure" ]; then
+    if [ -x /usr/bin/systemd-sysusers ]; then
+        systemd-sysusers /usr/lib/sysusers.d/etherip-xdp.conf
+    fi
+    if [ -x /usr/bin/systemd-tmpfiles ]; then
+        systemd-tmpfiles --create /usr/lib/tmpfiles.d/etherip-xdp.conf || true
+    fi
+fi
+
+#DEBHELPER#
