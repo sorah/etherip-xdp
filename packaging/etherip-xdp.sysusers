@@ -1,0 +1,3 @@
+# Shared group owning the 0660 control sockets and /run/etherip-xdp, so the
+# manager (a separate DynamicUser) reaches the daemons' sockets without root.
+g etherip-xdp-sock -

@@ -20,7 +20,11 @@ pub struct ExternalInterface {
 
 /// A tunnel that is currently set up in the data plane.
 pub struct RunningTunnel {
-    spec: crate::config::TunnelSpec,
+    spec: crate::control::config::TunnelSpec,
+    /// Absolute path of the drop-in config file this tunnel was loaded from, if
+    /// known (reported over the management interface). `None` for tunnels added
+    /// other than from a file.
+    config_path: Option<std::path::PathBuf>,
     peer_index: u32,
     tunnel_mtu: i32,
     config: etherip_xdp_common::TunnelConfig,
@@ -30,6 +34,14 @@ pub struct RunningTunnel {
     /// encap/decap map entries are deliberately withheld so the data path never
     /// encapsulates with a bogus source.
     effective_src: Option<std::net::Ipv6Addr>,
+    /// Resolved next hop (gateway, or the remote itself when on-link); `None`
+    /// while unresolved. Diagnostic only — reported over the management
+    /// interface; the data path uses `config.dst_mac`.
+    next_hop: Option<std::net::Ipv6Addr>,
+    /// Whether the resolved next hop is the remote endpoint itself (on-link).
+    next_hop_on_link: bool,
+    /// Observed kernel neighbour state for the next hop, if looked up.
+    neigh_state: Option<crate::control::netlink::NeighState>,
     encap_link: aya::programs::xdp::XdpLinkId,
     pass_link: aya::programs::xdp::XdpLinkId,
 }
@@ -54,9 +66,9 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
 /// The set of config changes between the running tunnels and a new config.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Diff {
-    pub added: Vec<crate::config::TunnelSpec>,
+    pub added: Vec<crate::control::config::TunnelSpec>,
     pub removed: Vec<String>,
-    pub updated: Vec<crate::config::TunnelSpec>,
+    pub updated: Vec<crate::control::config::TunnelSpec>,
 }
 
 /// Compute the diff between currently-running specs and the newly-loaded specs.
@@ -64,8 +76,8 @@ pub struct Diff {
 /// with a changed spec is an in-place update (never needs veth recreation since
 /// the veth name is the key).
 pub fn diff_specs(
-    old: &std::collections::HashMap<String, crate::config::TunnelSpec>,
-    new: &[crate::config::TunnelSpec],
+    old: &std::collections::HashMap<String, crate::control::config::TunnelSpec>,
+    new: &[crate::control::config::TunnelSpec],
 ) -> Diff {
     let mut diff = Diff::default();
     let new_names: std::collections::HashSet<&str> = new.iter().map(|s| s.name.as_str()).collect();
@@ -91,15 +103,15 @@ pub fn diff_specs(
 
 /// Owns the data plane and drives tunnel lifecycle + reloads.
 pub struct Manager {
-    bpf: crate::bpf::Bpf,
-    nl: crate::netlink::Netlink,
+    bpf: crate::control::bpf::Bpf,
+    nl: crate::control::netlink::Netlink,
     external: ExternalInterface,
     external_decap_link: aya::programs::xdp::XdpLinkId,
     config_dirs: Vec<std::path::PathBuf>,
     /// When `Some`, each tunnel's `<name>-xdp` peer is moved into this private
     /// anonymous namespace to hide it from userland; when `None`, peers stay in
     /// the host namespace alongside the user-facing ends.
-    netns: Option<crate::netns::NetNs>,
+    netns: Option<crate::control::netns::NetNs>,
     tunnels: std::collections::HashMap<String, RunningTunnel>,
 }
 
@@ -109,9 +121,9 @@ pub struct Manager {
 /// handlers are installed during `start`, so SIGINT/SIGTERM (`systemctl stop`)
 /// still terminate the process while it waits.
 async fn wait_for_external(
-    nl: &crate::netlink::Netlink,
+    nl: &crate::control::netlink::Netlink,
     name: &str,
-) -> anyhow::Result<crate::netlink::LinkInfo> {
+) -> anyhow::Result<crate::control::netlink::LinkInfo> {
     const MAX_BACKOFF_SECS: u64 = 5;
     let mut attempt: u64 = 0;
     loop {
@@ -144,11 +156,11 @@ impl Manager {
         config_dirs: Vec<std::path::PathBuf>,
         hide_peer: bool,
     ) -> anyhow::Result<Self> {
-        let nl = crate::netlink::Netlink::connect()?;
-        let mut bpf = crate::bpf::Bpf::load()?;
+        let nl = crate::control::netlink::Netlink::connect()?;
+        let mut bpf = crate::control::bpf::Bpf::load()?;
 
         let netns = if hide_peer {
-            let ns = crate::netns::NetNs::create()?;
+            let ns = crate::control::netns::NetNs::create()?;
             log::info!("hiding veth peers in a private anonymous network namespace");
             Some(ns)
         } else {
@@ -187,15 +199,15 @@ impl Manager {
             tunnels: std::collections::HashMap::new(),
         };
 
-        let specs = crate::config::load_dirs(&manager.config_dirs).await?;
+        let specs = crate::control::config::load_dirs(&manager.config_dirs).await?;
         if specs.is_empty() {
             log::warn!(
                 "no tunnel configs found in {}",
                 manager.config_dirs_display()
             );
         }
-        for spec in specs {
-            if let Err(e) = manager.add_tunnel(spec).await {
+        for (path, spec) in specs {
+            if let Err(e) = manager.add_tunnel(Some(path), spec).await {
                 log::error!("failed to create tunnel: {e:#}");
             }
         }
@@ -211,7 +223,7 @@ impl Manager {
             .join(", ")
     }
 
-    fn tunnel_mtu(&self, spec: &crate::config::TunnelSpec) -> i32 {
+    fn tunnel_mtu(&self, spec: &crate::control::config::TunnelSpec) -> i32 {
         match spec.mtu {
             Some(m) => m as i32,
             None => self.external.mtu as i32 - etherip_xdp_common::OUTER_OVERHEAD as i32,
@@ -220,7 +232,7 @@ impl Manager {
 
     fn build_config(
         &self,
-        spec: &crate::config::TunnelSpec,
+        spec: &crate::control::config::TunnelSpec,
         peer_index: u32,
         src: std::net::Ipv6Addr,
         tunnel_mac: [u8; 6],
@@ -245,11 +257,15 @@ impl Manager {
     /// Resolve the local MAC the user-facing interface should present, given its
     /// current (kernel-assigned) address. `Auto` keeps the current address;
     /// `Inherit`/`Explicit` force the external device's or a configured address.
-    fn resolve_tunnel_mac(&self, spec: &crate::config::TunnelSpec, current: [u8; 6]) -> [u8; 6] {
+    fn resolve_tunnel_mac(
+        &self,
+        spec: &crate::control::config::TunnelSpec,
+        current: [u8; 6],
+    ) -> [u8; 6] {
         match spec.mac {
-            crate::config::MacConfig::Auto => current,
-            crate::config::MacConfig::Inherit => self.external.mac,
-            crate::config::MacConfig::Explicit(mac) => mac,
+            crate::control::config::MacConfig::Auto => current,
+            crate::control::config::MacConfig::Inherit => self.external.mac,
+            crate::control::config::MacConfig::Explicit(mac) => mac,
         }
     }
 
@@ -264,7 +280,7 @@ impl Manager {
     /// host. The source is still used (operator intent), but an unassigned source
     /// usually means a typo or a since-removed address and tends to be dropped by
     /// reverse-path filtering. Auto-selected sources are always local, so skip.
-    async fn warn_if_src_unassigned(&self, spec: &crate::config::TunnelSpec) {
+    async fn warn_if_src_unassigned(&self, spec: &crate::control::config::TunnelSpec) {
         let Some(src) = spec.local else { return };
         match self.nl.is_local_address(src).await {
             Ok(true) => {}
@@ -320,7 +336,7 @@ impl Manager {
                         .build()
                         .map_err(|e| anyhow::anyhow!("build hidden-netns runtime: {e}"))?;
                     let peer_index = rt.block_on(async {
-                        let nl = crate::netlink::Netlink::connect()?;
+                        let nl = crate::control::netlink::Netlink::connect()?;
                         let idx = nl.index_of(peer).await?.ok_or_else(|| {
                             anyhow::anyhow!("veth peer {peer} missing in hidden netns")
                         })?;
@@ -347,7 +363,7 @@ impl Manager {
                     .build()
                     .map_err(|e| anyhow::anyhow!("build hidden-netns runtime: {e}"))?;
                 rt.block_on(async {
-                    let nl = crate::netlink::Netlink::connect()?;
+                    let nl = crate::control::netlink::Netlink::connect()?;
                     nl.set_mtu_up(peer_index, mtu).await
                 })
             }),
@@ -355,7 +371,11 @@ impl Manager {
     }
 
     /// Create a new tunnel: veth pair, MTU/offload, map population, attach.
-    async fn add_tunnel(&mut self, spec: crate::config::TunnelSpec) -> anyhow::Result<()> {
+    async fn add_tunnel(
+        &mut self,
+        config_path: Option<std::path::PathBuf>,
+        spec: crate::control::config::TunnelSpec,
+    ) -> anyhow::Result<()> {
         validate_name(&spec.name)?;
         let name = spec.name.clone();
         let peer = peer_name(&name);
@@ -387,9 +407,11 @@ impl Manager {
         // the async runtime. The user-facing end stays in the host namespace, so
         // this is unaffected by peer hiding.
         let offload_name = name.clone();
-        tokio::task::spawn_blocking(move || crate::offload::disable_tx_offload(&offload_name))
-            .await
-            .map_err(|e| anyhow::anyhow!("tx-offload task failed to join: {e}"))??;
+        tokio::task::spawn_blocking(move || {
+            crate::control::offload::disable_tx_offload(&offload_name)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("tx-offload task failed to join: {e}"))??;
 
         // Bring the peer up, attach encap, and register its decap redirect target.
         // Attach/redirect are registered unconditionally; the encap/decap map
@@ -401,21 +423,21 @@ impl Manager {
         let (peer_index, encap_link) = self.setup_peer(&peer, mtu).await?;
 
         self.warn_if_src_unassigned(&spec).await;
-        let resolved = match crate::resolver::resolve_endpoint(
+        let resolved = match crate::control::resolver::resolve_endpoint(
             &self.nl,
             self.external.index,
             &self.external.name,
             spec.local,
             spec.remote,
             spec.next_hop_on_link,
-            crate::resolver::Probe::Bringup,
+            crate::control::resolver::Probe::Bringup,
         )
         .await
         {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("tunnel {name}: endpoint resolution error: {e:#}");
-                crate::resolver::Resolved::default()
+                crate::control::resolver::Resolved::default()
             }
         };
         let dst_mac = resolved.dst_mac.unwrap_or([0u8; 6]);
@@ -474,11 +496,15 @@ impl Manager {
             name,
             RunningTunnel {
                 spec,
+                config_path,
                 peer_index,
                 tunnel_mtu,
                 config,
                 decap_key,
                 effective_src,
+                next_hop: resolved.next_hop,
+                next_hop_on_link: resolved.on_link,
+                neigh_state: resolved.neigh_state,
                 encap_link,
                 pass_link,
             },
@@ -509,7 +535,11 @@ impl Manager {
     }
 
     /// Update a tunnel in place (src/dst/mss/mtu) without veth churn.
-    async fn update_tunnel(&mut self, spec: crate::config::TunnelSpec) -> anyhow::Result<()> {
+    async fn update_tunnel(
+        &mut self,
+        config_path: Option<std::path::PathBuf>,
+        spec: crate::control::config::TunnelSpec,
+    ) -> anyhow::Result<()> {
         let name = spec.name.clone();
         let (peer_index, old_key, old_mtu, cur_tunnel_mac, old_dst_mac, old_src) = {
             let t = self
@@ -558,21 +588,21 @@ impl Manager {
         // Re-resolve the endpoint for the new spec. Keep the last-known source and
         // MAC on a transient resolution failure rather than tearing the tunnel
         // down; a ready tunnel never flaps back to pending.
-        let resolved = match crate::resolver::resolve_endpoint(
+        let resolved = match crate::control::resolver::resolve_endpoint(
             &self.nl,
             self.external.index,
             &self.external.name,
             spec.local,
             spec.remote,
             spec.next_hop_on_link,
-            crate::resolver::Probe::Bringup,
+            crate::control::resolver::Probe::Bringup,
         )
         .await
         {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("tunnel {name}: endpoint resolution error: {e:#}");
-                crate::resolver::Resolved::default()
+                crate::control::resolver::Resolved::default()
             }
         };
         let dst_mac = resolved.dst_mac.unwrap_or(old_dst_mac);
@@ -593,10 +623,14 @@ impl Manager {
             );
             if let Some(t) = self.tunnels.get_mut(&name) {
                 t.spec = spec;
+                t.config_path = config_path;
                 t.tunnel_mtu = tunnel_mtu;
                 t.config = config;
                 t.decap_key = Self::decap_key(unspecified, t.spec.remote);
                 t.effective_src = None;
+                t.next_hop = resolved.next_hop;
+                t.next_hop_on_link = resolved.on_link;
+                t.neigh_state = resolved.neigh_state;
             }
             log::info!("tunnel {name} updated (pending: no source address yet)");
             return Ok(());
@@ -627,23 +661,35 @@ impl Manager {
 
         if let Some(t) = self.tunnels.get_mut(&name) {
             t.spec = spec;
+            t.config_path = config_path;
             t.tunnel_mtu = tunnel_mtu;
             t.config = config;
             t.decap_key = new_key;
             t.effective_src = Some(src);
+            t.next_hop = resolved.next_hop;
+            t.next_hop_on_link = resolved.on_link;
+            t.neigh_state = resolved.neigh_state;
         }
         Ok(())
     }
 
     /// Reload the config directories and apply the diff gracefully.
     pub async fn reload(&mut self) -> anyhow::Result<()> {
-        let new_specs = crate::config::load_dirs(&self.config_dirs).await?;
-        let old: std::collections::HashMap<String, crate::config::TunnelSpec> = self
+        let new_specs = crate::control::config::load_dirs(&self.config_dirs).await?;
+        // The winning config-file path per tunnel name, to pass through to
+        // add/update so each running tunnel can report its source file.
+        let paths: std::collections::HashMap<String, std::path::PathBuf> = new_specs
+            .iter()
+            .map(|(p, s)| (s.name.clone(), p.clone()))
+            .collect();
+        let bare: Vec<crate::control::config::TunnelSpec> =
+            new_specs.into_iter().map(|(_, s)| s).collect();
+        let old: std::collections::HashMap<String, crate::control::config::TunnelSpec> = self
             .tunnels
             .iter()
             .map(|(k, t)| (k.clone(), t.spec.clone()))
             .collect();
-        let diff = diff_specs(&old, &new_specs);
+        let diff = diff_specs(&old, &bare);
         log::info!(
             "reload: {} added, {} removed, {} updated",
             diff.added.len(),
@@ -657,13 +703,15 @@ impl Manager {
         }
         for spec in diff.added {
             let n = spec.name.clone();
-            if let Err(e) = self.add_tunnel(spec).await {
+            let path = paths.get(&n).cloned();
+            if let Err(e) = self.add_tunnel(path, spec).await {
                 log::error!("reload: add {n}: {e:#}");
             }
         }
         for spec in diff.updated {
             let n = spec.name.clone();
-            if let Err(e) = self.update_tunnel(spec).await {
+            let path = paths.get(&n).cloned();
+            if let Err(e) = self.update_tunnel(path, spec).await {
                 log::error!("reload: update {n}: {e:#}");
             }
         }
@@ -701,15 +749,15 @@ impl Manager {
                 continue;
             };
             let probe = if refresh {
-                crate::resolver::Probe::Refresh
+                crate::control::resolver::Probe::Refresh
             } else if cur_config.dst_mac == [0u8; 6] {
                 // Reactive, but still without a MAC: nudge bring-up on the event.
-                crate::resolver::Probe::Refresh
+                crate::control::resolver::Probe::Refresh
             } else {
                 // Reactive with a MAC in hand: read only, no probe feedback.
-                crate::resolver::Probe::Passive
+                crate::control::resolver::Probe::Passive
             };
-            let resolved = match crate::resolver::resolve_endpoint(
+            let resolved = match crate::control::resolver::resolve_endpoint(
                 &self.nl,
                 self.external.index,
                 &self.external.name,
@@ -726,6 +774,15 @@ impl Manager {
                     continue;
                 }
             };
+
+            // Record the freshly-observed next-hop diagnostics (reported over the
+            // management interface) regardless of whether the data-path entries
+            // change below, so the reported state never lags behind reality.
+            if let Some(t) = self.tunnels.get_mut(&name) {
+                t.next_hop = resolved.next_hop;
+                t.next_hop_on_link = resolved.on_link;
+                t.neigh_state = resolved.neigh_state;
+            }
 
             // Keep the last-known source on a transient unresolution so a ready
             // tunnel never flaps back to pending; likewise keep the last MAC.
@@ -782,6 +839,45 @@ impl Manager {
         }
     }
 
+    /// Service a control-plane request from the embedded varlink server. Runs
+    /// synchronously on the main loop, which owns `&mut self`, so the snapshot
+    /// can read the live BPF counters; the reply is sent back over the oneshot.
+    pub fn handle_control(&mut self, req: crate::control::types::ControlRequest) {
+        match req {
+            crate::control::types::ControlRequest::Snapshot(reply) => {
+                // The receiver may have hung up (client gone); ignore the result.
+                let _ = reply.send(self.build_snapshot());
+            }
+        }
+    }
+
+    /// Build an owned status snapshot of this daemon for the management
+    /// interface. Tunnel/external data is collected first (immutable borrows),
+    /// then the per-CPU debug counters are read (mutable borrow of the BPF maps).
+    fn build_snapshot(&mut self) -> crate::control::types::StatusSnapshot {
+        let external = crate::control::types::ExternalSnapshot {
+            name: self.external.name.clone(),
+            index: self.external.index,
+            mac: self.external.mac,
+            mtu: self.external.mtu,
+        };
+        let tunnels: Vec<_> = self.tunnels.values().map(snapshot_tunnel).collect();
+        let raw = self
+            .bpf
+            .read_counters()
+            .unwrap_or([0u64; etherip_xdp_common::DBG_MAX as usize]);
+        let counters = etherip_xdp_common::COUNTER_NAMES
+            .iter()
+            .copied()
+            .zip(raw)
+            .collect();
+        crate::control::types::StatusSnapshot {
+            external,
+            counters,
+            tunnels,
+        }
+    }
+
     /// Log the per-CPU debug counters (non-zero only).
     pub fn dump_counters(&mut self) {
         match self.bpf.read_counters() {
@@ -833,34 +929,75 @@ fn fmt_mac(mac: &[u8; 6]) -> String {
     )
 }
 
+/// Snapshot one running tunnel's config and live runtime state for the
+/// management interface.
+fn snapshot_tunnel(t: &RunningTunnel) -> crate::control::types::TunnelSnapshot {
+    let mac_policy = match t.spec.mac {
+        crate::control::config::MacConfig::Auto => "auto",
+        crate::control::config::MacConfig::Inherit => "inherit",
+        crate::control::config::MacConfig::Explicit(_) => "explicit",
+    };
+    let next_hop_on_link_policy = match t.spec.next_hop_on_link {
+        crate::control::resolver::NextHopOnLink::Maybe => "maybe",
+        crate::control::resolver::NextHopOnLink::Always => "always",
+        crate::control::resolver::NextHopOnLink::Never => "never",
+    };
+    // A non-zero installed dst_mac means the next hop is resolved.
+    let next_hop_mac = (t.config.dst_mac != [0u8; 6]).then_some(t.config.dst_mac);
+    crate::control::types::TunnelSnapshot {
+        name: t.spec.name.clone(),
+        config_path: t.config_path.clone(),
+        configured_local: t.spec.local,
+        remote: t.spec.remote,
+        effective_src: t.effective_src,
+        state: crate::control::types::derive_state(t.effective_src, t.config.dst_mac),
+        tunnel_mtu: t.tunnel_mtu,
+        mtu_override: t.spec.mtu,
+        mac_policy,
+        tunnel_mac: t.config.tunnel_mac,
+        next_hop_on_link_policy,
+        mss_clamp_ipv4: t.config.mss_clamp_ipv4,
+        mss_clamp_ipv6: t.config.mss_clamp_ipv6,
+        peer_ifindex: t.peer_index,
+        next_hop: t.next_hop,
+        next_hop_on_link: t.next_hop_on_link,
+        next_hop_mac,
+        neigh_state: t.neigh_state.map(|s| s.as_str()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn spec(name: &str, remote: &str, mss: crate::config::MssConfig) -> crate::config::TunnelSpec {
-        crate::config::TunnelSpec {
+    fn spec(
+        name: &str,
+        remote: &str,
+        mss: crate::control::config::MssConfig,
+    ) -> crate::control::config::TunnelSpec {
+        crate::control::config::TunnelSpec {
             name: name.to_string(),
             local: Some("2001:db8::1".parse().unwrap()),
             remote: remote.parse().unwrap(),
             mss,
             mtu: None,
-            mac: crate::config::MacConfig::Auto,
-            next_hop_on_link: crate::resolver::NextHopOnLink::default(),
+            mac: crate::control::config::MacConfig::Auto,
+            next_hop_on_link: crate::control::resolver::NextHopOnLink::default(),
         }
     }
 
     fn running(
-        specs: &[crate::config::TunnelSpec],
-    ) -> std::collections::HashMap<String, crate::config::TunnelSpec> {
+        specs: &[crate::control::config::TunnelSpec],
+    ) -> std::collections::HashMap<String, crate::control::config::TunnelSpec> {
         specs.iter().map(|s| (s.name.clone(), s.clone())).collect()
     }
 
     #[test]
     fn diff_add_remove_update_noop() {
-        let a = spec("a", "2001:db8::2", crate::config::MssConfig::Auto);
-        let b = spec("b", "2001:db8::3", crate::config::MssConfig::Auto);
-        let b_changed = spec("b", "2001:db8::9", crate::config::MssConfig::Auto);
-        let c = spec("c", "2001:db8::4", crate::config::MssConfig::Auto);
+        let a = spec("a", "2001:db8::2", crate::control::config::MssConfig::Auto);
+        let b = spec("b", "2001:db8::3", crate::control::config::MssConfig::Auto);
+        let b_changed = spec("b", "2001:db8::9", crate::control::config::MssConfig::Auto);
+        let c = spec("c", "2001:db8::4", crate::control::config::MssConfig::Auto);
 
         let old = running(&[a.clone(), b.clone()]);
         // new: a unchanged, b changed, c added, (b removed? no) -> a noop, b updated, c added
@@ -880,8 +1017,8 @@ mod tests {
 
     #[test]
     fn diff_mss_change_is_update() {
-        let a1 = spec("a", "2001:db8::2", crate::config::MssConfig::Auto);
-        let a2 = spec("a", "2001:db8::2", crate::config::MssConfig::Off);
+        let a1 = spec("a", "2001:db8::2", crate::control::config::MssConfig::Auto);
+        let a2 = spec("a", "2001:db8::2", crate::control::config::MssConfig::Off);
         let old = running(&[a1]);
         let diff = diff_specs(&old, std::slice::from_ref(&a2));
         assert_eq!(diff.updated, vec![a2]);

@@ -51,6 +51,11 @@ rtnetlink = "0.21"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 nix = { version = "0.31", default-features = false, features = ["ioctl", "net", "resource", "sched", "socket"] }
 etherparse = "0.20"
+# varlink management interface (etheripctl / etherip-xdp-manager). Pinned by git
+# rev like aya; the async server/client live behind the `tokio` feature.
+varlink = { git = "https://github.com/varlink/rust", rev = "08bcf3f46d41a9bdcabef82c6259a36c5cd0b964", features = ["tokio"] }
+varlink_generator = { git = "https://github.com/varlink/rust", rev = "08bcf3f46d41a9bdcabef82c6259a36c5cd0b964" }
+async-trait = "0.1"
 
 # Integration-test harness dependencies. Module/.deb decompression uses
 # pure-Rust codecs (no C) so the guest binaries link cleanly as static musl.

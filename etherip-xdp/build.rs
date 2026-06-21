@@ -2,6 +2,16 @@ use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 
 fn main() -> anyhow::Result<()> {
+    // Generate the varlink management-interface bindings (async server + client)
+    // into OUT_DIR; `manage::generated` includes the result.
+    varlink_generator::cargo_build_options(
+        "src/manage/co.0w0.etheripxdp.Management.varlink",
+        &varlink_generator::GeneratorOptions {
+            generate_async: true,
+            ..Default::default()
+        },
+    );
+
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()

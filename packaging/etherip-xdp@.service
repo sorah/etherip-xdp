@@ -1,38 +1,65 @@
-# Templated systemd unit: one instance per external (uplink) interface.
-#
-#   sudo install -Dm0644 packaging/etherip-xdp@.service /etc/systemd/system/etherip-xdp@.service
-#   sudo install -Dm0755 target/release/etherip-xdp /usr/bin/etherip-xdp
-#   sudo mkdir -p /etc/etherip-xdp/interfaces.d/eth1   # one *.json per tunnel
+# One instance per uplink interface:
 #   sudo systemctl enable --now etherip-xdp@eth1
-#   sudo systemctl reload etherip-xdp@eth1  # graceful config reload (SIGHUP)
+#   sudo systemctl reload etherip-xdp@eth1   # graceful config reload (SIGHUP)
+# For etheripctl / the host-wide manager: systemctl enable --now etherip-xdp-manager.socket
 [Unit]
 Description=XDP EtherIP tunnels on %i
 Documentation=https://github.com/sorah/etherip-xdp
 After=network-pre.target sys-subsystem-net-devices-%i.device
 Wants=network-pre.target
 BindsTo=sys-subsystem-net-devices-%i.device
+# Pull in & order after the control socket; its fd is adopted via Sockets=.
+Wants=etherip-xdp-varlink@%i.socket
+After=etherip-xdp-varlink@%i.socket
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/etherip-xdp %i
-# `systemctl reload` applies config changes gracefully (no data-path interruption
-# for unaffected tunnels).
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
+Sockets=etherip-xdp-varlink@%i.socket
 
-# Search $RUNTIME_DIRECTORY (/run/etherip-xdp) for volatile config drop-ins,
-# ahead of /etc; preserved across restarts, cleared at reboot.
-RuntimeDirectory=etherip-xdp
-RuntimeDirectoryPreserve=yes
+# Own dynamic user joining the static etherip-xdp-sock group, which owns the 0660
+# sockets and /run/etherip-xdp so the manager (another dynamic user in the group)
+# can reach them. A shared DynamicUser can't: systemd parks its RuntimeDirectory
+# under /run/private 0700. RuntimeDirectory= is dropped for the same reason, so
+# $RUNTIME_DIRECTORY (the config drop-in search path) is set explicitly.
+DynamicUser=yes
+SupplementaryGroups=etherip-xdp-sock
+Environment=RUNTIME_DIRECTORY=/run/etherip-xdp
 
-# Loading/attaching XDP, managing veth/neighbours, and ethtool need these.
-# On kernels < 5.8, CAP_BPF does not exist; replace it with CAP_SYS_ADMIN.
-# CAP_PERFMON sets allow_ptr_leaks so the verifier accepts the data-path's
-# variable packet-offset arithmetic; without it newer kernels (6.x/7.0) reject
-# the load with "pointer arithmetic ... prohibited for !root".
-AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW
+# CAP_SYS_ADMIN: unshare(CLONE_NEWNET) for the hidden veth peer (dropped by
+# --disable-veth-peer-netns). CAP_PERFMON also sets allow_ptr_leaks for the
+# data-path verifier. Pre-5.8: swap CAP_BPF for CAP_SYS_ADMIN.
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN
+
+# systemd-analyze security 2.2. AF_INET(6) is needed for the ethtool ioctl socket.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=net
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_PACKET AF_INET AF_INET6
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+IPAddressDeny=any
+SystemCallFilter=@system-service bpf unshare setns
+SystemCallFilter=~@keyring @resources @setuid @reboot @swap @cpu-emulation @obsolete
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

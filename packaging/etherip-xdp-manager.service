@@ -1,0 +1,45 @@
+# Host-wide varlink proxy aggregating every per-device etherip-xdp daemon.
+#   sudo systemctl enable --now etherip-xdp-manager.socket
+[Unit]
+Description=etherip-xdp varlink manager (host-wide status proxy)
+Documentation=https://github.com/sorah/etherip-xdp
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/etherip-xdp-manager
+Restart=on-failure
+RestartSec=2
+Sockets=etherip-xdp-manager.socket
+
+# Dynamic user in the shared group to read the daemons' 0660 sockets; no root.
+DynamicUser=yes
+SupplementaryGroups=etherip-xdp-sock
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# systemd-analyze security 0.8.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallFilter=~@keyring @resources @setuid @reboot @swap @cpu-emulation @obsolete @privileged
+UMask=0077
+# No [Install]: started on demand via etherip-xdp-manager.socket.

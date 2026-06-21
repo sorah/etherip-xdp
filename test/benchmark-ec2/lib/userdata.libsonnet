@@ -27,10 +27,7 @@ local guaRef(eni) = '${' + eni + '.PrimaryIpv6Address}';
 // (cloud-init's `network: {config: disabled}` can't prevent the first-boot
 // render), since networkd applies the first matching .network per link — hence
 // the `05-` prefix so this `Driver=ena` match wins over netplan's per-NIC files.
-local underlayNetwork = |||
-  [Match]
-  Driver=ena
-
+local underlayBody = |||
   [Link]
   MTUBytes=1500
 
@@ -46,6 +43,9 @@ local underlayNetwork = |||
   [IPv6AcceptRA]
   UseMTU=no
 |||;
+// Shared base for all ENAs. Per-link files (eniNetworks) reuse the
+// same body in a Name-matched, earlier-sorting file so they win for that link.
+local underlayNetwork = '[Match]\nDriver=ena\n\n' + underlayBody;
 
 local loopbackHeader = |||
   [Match]
@@ -124,9 +124,16 @@ local etheripLink = |||
   MACAddressPolicy=none
 |||;
 
+// `local` is omitted (auto-source): the daemon's resolver passes a configured
+// `local` as the route lookup's `from`, and `ip route get <peer> from <local> oif
+// <uplink>` ignores `oif` when another ENI's default outranks the uplink's (it now
+// does — the uplink's RA default is deprioritised for SSH symmetry above), picking
+// that ENI's gateway and leaving the tunnel with no usable next hop. The sourceless
+// `oif` lookup honours the uplink and prefsrc yields the same outer source (the
+// uplink GUA).
 local etheripJson(inst) =
-  '{ "name": "etherip", "local": "%s", "remote": "%s", "mss": "auto" }\n'
-  % [guaRef(inst.uplinkEni), guaRef(inst.peerUplinkEni)];
+  '{ "name": "etherip", "remote": "%s", "mss": "auto" }\n'
+  % [guaRef(inst.peerUplinkEni)];
 
 // Provisioning runs as a oneshot unit (not cloud-init runcmd) so it is ordered
 // after networkd, retried on transient failure, logged to the journal, and
@@ -179,17 +186,16 @@ local dutSetupTmpl = |||
   HALF=$((MAXQ / 2))
   [ "$HALF" -ge 1 ] && ethtool -L "$UPLINK_IF" combined "$HALF" || true
 
-  # No route to the peer is pinned: both ENIs carry RA default routes, but
-  # etherip-xdp's resolver constrains its lookup to the uplink (oif), so it picks
-  # the uplink's gateway regardless of which default route has the lower metric.
-
+  @@PINS@@
   export DEBIAN_FRONTEND=noninteractive
   if ! dpkg -s etherip-xdp >/dev/null 2>&1; then
     apt-get update
     curl -fsSL -o /tmp/etherip-xdp.deb '@@DEB_URL@@'
     apt-get install -y /tmp/etherip-xdp.deb
   fi
+  # postinst seeds the group/dir; the daemon Wants= its control socket.
   systemctl enable --now etherip-xdp@"$UPLINK_IF"
+  systemctl enable --now etherip-xdp-manager.socket
   echo "=== etherip-bench-setup done ==="
 |||;
 
@@ -201,6 +207,7 @@ local generatorSetupTmpl = |||
   networkctl reload 2>/dev/null || systemctl restart systemd-networkd
   sysctl --system >/dev/null
   for _ in $(seq 1 60); do ip -6 route show default | grep -q . && break; sleep 2; done
+  @@PINS@@
   export DEBIAN_FRONTEND=noninteractive
   if ! dpkg -s @@TRAFGEN@@ >/dev/null 2>&1; then
     apt-get update
@@ -220,6 +227,16 @@ local benchTmpl = |||
   set -euo pipefail
   SIZE=$1; [ -n "$SIZE" ] || SIZE=1000
   DUR=$2; [ -n "$DUR" ] || DUR=20
+
+  # Inner IPv6+UDP packet is SIZE + 48 (IPv6 40 + UDP 8). The tunnel MTU is
+  # 1444 (uplink 1500 - 56 EtherIP overhead), so anything larger is dropped by
+  # dut-1 with ICMPv6 Packet Too Big before it ever reaches encap (the run would
+  # report ~0 looped back). Fail loudly instead of silently measuring nothing.
+  MAXSIZE=1396
+  if [ "$SIZE" -gt "$MAXSIZE" ]; then
+    echo "payload $SIZE too large: inner packet $((SIZE + 48)) > tunnel MTU 1444; max payload is $MAXSIZE" >&2
+    exit 1
+  fi
 
   DEV=$(ip -o -6 addr show to @@GEN_A@@/128 scope global | awk '{print $2; exit}')
   SINK=$(ip -o -6 addr show to @@GEN_D@@/128 scope global | awk '{print $2; exit}')
@@ -264,10 +281,57 @@ local benchTmpl = |||
   rm -f "$CFG"
 |||;
 
-local dutSetup(inst) =
-  std.strReplace(std.strReplace(dutSetupTmpl, '@@OWN_GUA@@', guaRef(inst.uplinkEni)), '@@DEB_URL@@', c.deb_url);
+local raRoutes(dests) = std.join('', [
+  '\n[Route]\nDestination=%s/128\nGateway=_ipv6ra\n\n[Route]\nDestination=%s/32\nGateway=_dhcp4\n' % [d.v6, d.v4]
+  for d in dests
+]);
 
-local generatorSetup = std.strReplace(generatorSetupTmpl, '@@TRAFGEN@@', c.trafgen_package);
+// Per-ENI networkd config, written at runtime because the interface NAME is
+// AWS-assigned (found by the ENI's known GUA). One file per ENI, sorting before
+// 05-underlay so it wins. Two jobs:
+//
+//   1. RA priority: the device-index-1 (secondary/uplink) ENI gets a higher
+//      RA/DHCP RouteMetric so the device-0 ENI — the one the SSH GUA and stack
+//      outputs use — wins the default route. Otherwise both ENIs install an
+//      equal-metric RA default and the kernel's ECMP can egress replies on the
+//      wrong ENI, which AWS drops as asymmetric (instance unreachable over SSH).
+//      encap is unaffected: the daemon's resolver pins it to the uplink via oif.
+//
+//   2. Overlay routes: pin each `via: 'subnet:X'` /128 (+/32) to its subnet's ENI
+//      via Gateway=_ipv6ra/_dhcp4, so the decapped inner packet's exit rides the
+//      right ENI rather than the ECMP default.
+local eniNetworks(key) =
+  local routes = net.instances[key].routes;
+  std.join('', [
+    local metric = if e.deviceIndex == 0 then '' else 'RouteMetric=2048\n';
+    local dests = [{ v6: net.v6(r.di, r.ds), v4: net.v4(r.di, r.ds) } for r in routes if r.via == 'subnet:' + e.subnet];
+    'UND_IF=$(ip -o -6 addr show to %s/128 scope global | awk \'{print $2; exit}\')\n' % guaRef(e.logical)
+    + '[ -n "$UND_IF" ] || { echo "subnet-%s ENI not up yet"; exit 1; }\n' % e.subnet
+    + 'cat > /etc/systemd/network/04-und-%s.network <<EOFNET\n' % e.subnet
+    + '[Match]\nName=$UND_IF\n\n[Link]\nMTUBytes=1500\n\n[Network]\nDHCP=yes\nIPv6AcceptRA=yes\nIPv4Forwarding=yes\nIPv6Forwarding=yes\n\n[DHCPv4]\nUseMTU=no\n'
+    + metric
+    + '\n[IPv6AcceptRA]\nUseMTU=no\n'
+    + metric
+    + raRoutes(dests)
+    + 'EOFNET\n'
+    for e in net.enisOf(key)
+  ]) + 'networkctl reload\n';
+
+local dutSetup(key) =
+  local inst = net.instances[key];
+  std.strReplace(
+    std.strReplace(
+      std.strReplace(dutSetupTmpl, '@@OWN_GUA@@', guaRef(inst.uplinkEni)),
+      '@@DEB_URL@@', c.deb_url
+    ),
+    '@@PINS@@', eniNetworks(key)
+  );
+
+local generatorSetup(key) =
+  std.strReplace(
+    std.strReplace(generatorSetupTmpl, '@@TRAFGEN@@', c.trafgen_package),
+    '@@PINS@@', eniNetworks(key)
+  );
 
 local benchScript(inst) =
   std.strReplace(
@@ -295,10 +359,10 @@ local file(path, content, perm='0644') = { path: path, permissions: perm, conten
       file('/etc/systemd/network/20-etherip.network', etheripNetwork(inst)),
       file('/etc/etherip-xdp/tunnels/etherip.json', etheripJson(inst)),
       file('/etc/systemd/system/etherip-xdp@.service.d/10-config-dir.conf', etheripDropin),
-      file('/usr/local/sbin/etherip-bench-setup', dutSetup(inst), '0755'),
+      file('/usr/local/sbin/etherip-bench-setup', dutSetup(key), '0755'),
     ];
     local generatorFiles = [
-      file('/usr/local/sbin/etherip-bench-setup', generatorSetup, '0755'),
+      file('/usr/local/sbin/etherip-bench-setup', generatorSetup(key), '0755'),
       file('/usr/local/bin/etherip-bench', benchScript(inst), '0755'),
     ];
     // Optional root password for EC2 Serial Console recovery if SSH is lost.

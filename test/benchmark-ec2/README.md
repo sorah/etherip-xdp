@@ -68,8 +68,13 @@ ssh ubuntu@<GeneratorIpv6>
 SSH (over IPv6) to the generator and run:
 
 ```sh
-sudo etherip-bench [payload_bytes=1400] [duration_s=20]
+sudo etherip-bench [payload_bytes=1000] [duration_s=20]
 ```
+
+`payload_bytes` is the UDP payload (default 1000); the inner IPv6+UDP packet is
+`payload + 48`, which must stay within the **1444** tunnel MTU, so the **max is
+1396**. Larger values are rejected (they would be dropped as ICMPv6 Packet Too
+Big before encap, looping back ~nothing).
 
 It resolves dut-1's on-link MAC, blasts trafgen from `fd00:ffff::0:0` →
 `fd00:ffff::0:3` (which loops through both DUTs and the tunnel), and reports the

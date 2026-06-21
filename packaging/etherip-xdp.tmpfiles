@@ -1,0 +1,3 @@
+# Shared runtime dir for the control sockets and config drop-ins. setgid so
+# socket-activated per-device subdirs inherit the group; 2750 keeps out other users.
+d /run/etherip-xdp 2750 root etherip-xdp-sock -

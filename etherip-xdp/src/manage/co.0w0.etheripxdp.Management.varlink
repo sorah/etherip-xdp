@@ -1,0 +1,87 @@
+# Read-only management interface for etherip-xdp.
+# A per-device daemon returns its own single InterfaceStatus; the
+# etherip-xdp-manager proxy returns one per running daemon.
+interface co.0w0.etheripxdp.Management
+
+type TunnelState (
+  # Outer source not yet resolved (auto-select found no route); data path inert.
+  pending,
+  # Source resolved and map entries installed, but next-hop MAC unresolved;
+  # frames are dropped until a neighbour resolves.
+  noNextHop,
+  # Fully resolved and forwarding.
+  up
+)
+
+# Configured local-MAC policy for the user-facing interface.
+type MacPolicy ( auto, inherit, explicit )
+
+# Configured on-link policy when the route returns no gateway.
+type NextHopOnLinkPolicy ( maybe, always, never )
+
+type ExternalInterface (
+  name: string,
+  ifindex: int,
+  mac: string,
+  mtu: int
+)
+
+# A daemon-global per-CPU debug counter, summed across CPUs.
+type Counter (
+  name: string,
+  value: int
+)
+
+# Live next-hop resolution for a tunnel.
+type NextHop (
+  # Resolved next hop: the gateway, or the remote itself when on-link;
+  # null when none has resolved yet.
+  address: ?string,
+  # Whether the next hop is the remote endpoint itself (on-link) vs a gateway.
+  onLink: bool,
+  # Resolved link-layer address; null when unresolved.
+  mac: ?string,
+  # Kernel neighbour state for the next hop (reachable, stale, delay, probe,
+  # incomplete, failed, permanent, ...); null when not looked up.
+  neighbourState: ?string
+)
+
+type Tunnel (
+  # Tunnel name (also the user-facing veth interface name).
+  name: string,
+  # Absolute path of the winning drop-in config file, if known.
+  configPath: ?string,
+  # Configured outer source; null means auto-select.
+  configuredLocal: ?string,
+  remote: string,
+  # Effective outer source currently in use; null while pending.
+  effectiveSource: ?string,
+  state: TunnelState,
+  # Effective tunnel MTU.
+  mtu: int,
+  # Explicit MTU override from config, if any.
+  mtuOverride: ?int,
+  macPolicy: MacPolicy,
+  # User-facing interface MAC currently presented.
+  mac: string,
+  nextHopOnLinkPolicy: NextHopOnLinkPolicy,
+  nextHop: NextHop,
+  # Effective inner MSS clamps; 0 means clamping disabled.
+  mssClampIpv4: int,
+  mssClampIpv6: int,
+  # veth-peer ifindex (decap redirect target).
+  peerIfindex: int
+)
+
+# One per-device daemon's full status. `external.name` is the device label.
+type InterfaceStatus (
+  external: ExternalInterface,
+  # Daemon-global per-CPU debug counters (summed); NOT per-tunnel.
+  counters: []Counter,
+  tunnels: []Tunnel
+)
+
+# Status of one daemon (single element) or, via the manager, of all daemons.
+method List() -> (
+  interfaces: []InterfaceStatus
+)

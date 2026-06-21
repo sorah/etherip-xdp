@@ -1,0 +1,20 @@
+# Host-wide varlink socket for the etherip-xdp manager proxy. Single instance,
+# so it is registered under /run/varlink/registry so `varlinkctl` can address it
+# by interface name (the per-device daemon sockets are not registered — they
+# share this one interface name).
+#
+#   sudo systemctl enable --now etherip-xdp-manager.socket
+[Unit]
+Description=etherip-xdp varlink manager socket
+Documentation=https://github.com/sorah/etherip-xdp
+
+[Socket]
+Service=etherip-xdp-manager.service
+ListenStream=/run/etherip-xdp/co.0w0.etheripxdp.Management
+FileDescriptorName=varlink
+SocketMode=0660
+SocketGroup=etherip-xdp-sock
+Symlinks=/run/varlink/registry/co.0w0.etheripxdp.Management
+
+[Install]
+WantedBy=sockets.target
