@@ -18,6 +18,36 @@ fn next_bounce(current: std::time::Duration) -> std::time::Duration {
     std::cmp::min(current * 2, MONITOR_BOUNCE_MAX)
 }
 
+/// Wrap the raw netlink change monitor in a coalescing task and return a receiver
+/// that gets one signal per bounce window. The task absorbs a change burst behind
+/// the adaptive window (see [`next_bounce`]) off the main loop, so signal and
+/// control handling stay responsive even while a sustained storm holds the window
+/// open for up to 30s. The forwarding channel is single-slot, so a re-resolve
+/// already pending coalesces further windows just like the monitor itself.
+fn spawn_bounce(mut monitor: tokio::sync::mpsc::Receiver<()>) -> tokio::sync::mpsc::Receiver<()> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        let mut bounce = MONITOR_BOUNCE_BASE;
+        while monitor.recv().await.is_some() {
+            tokio::time::sleep(bounce).await;
+            // If more events queued across the whole window, the burst is
+            // ongoing: back off the next window (up to 30s) to shed load under a
+            // netlink storm. A window that ends quiet resets it.
+            let mut still_bursting = false;
+            while monitor.try_recv().is_ok() {
+                still_bursting = true;
+            }
+            bounce = if still_bursting {
+                next_bounce(bounce)
+            } else {
+                MONITOR_BOUNCE_BASE
+            };
+            let _ = tx.try_send(());
+        }
+    });
+    rx
+}
+
 #[derive(clap::Parser)]
 #[command(version, about = "XDP-based EtherIP tunnel (RFC 3378)")]
 struct Opt {
@@ -151,10 +181,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut monitor = crate::control::netlink::spawn_change_monitor()?;
+    let mut reresolve = spawn_bounce(crate::control::netlink::spawn_change_monitor()?);
     let mut ticker = tokio::time::interval(RERESOLVE_INTERVAL);
     ticker.tick().await; // consume the immediate first tick
-    let mut bounce = MONITOR_BOUNCE_BASE;
 
     loop {
         tokio::select! {
@@ -171,23 +200,10 @@ pub async fn run() -> anyhow::Result<()> {
                 // synchronously (reads live state, including BPF counters).
                 manager.handle_control(req);
             }
-            Some(_) = monitor.recv() => {
-                // Coalesce a burst of neighbour/route changes before re-resolving.
-                tokio::time::sleep(bounce).await;
-                // If more events queued across the whole window, the burst is
-                // ongoing: back off the next window (up to 30s) to shed load
-                // under a netlink storm. A window that ends quiet resets it.
-                let mut still_bursting = false;
-                while monitor.try_recv().is_ok() {
-                    still_bursting = true;
-                }
-                bounce = if still_bursting {
-                    next_bounce(bounce)
-                } else {
-                    MONITOR_BOUNCE_BASE
-                };
-                // Reactive: react to the observed change; don't probe (a probe
-                // would just generate more neighbour events).
+            Some(_) = reresolve.recv() => {
+                // A netlink change burst, already coalesced behind the bounce
+                // window by spawn_bounce. Reactive: react to the observed change;
+                // don't probe (a probe would just generate more neighbour events).
                 manager.reresolve_all(false).await;
             }
             _ = ticker.tick() => {
