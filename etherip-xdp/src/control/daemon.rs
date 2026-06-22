@@ -5,7 +5,18 @@
 //! [`Manager`]: crate::control::tunnel::Manager
 
 const RERESOLVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-const MONITOR_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
+/// Base coalescing window for a netlink change burst. A burst that keeps arriving
+/// across the whole window backs the next one off (see [`next_bounce`]).
+const MONITOR_BOUNCE_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Ceiling for the backed-off coalescing window during a sustained event storm.
+const MONITOR_BOUNCE_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Next coalescing window: double the current one, capped at [`MONITOR_BOUNCE_MAX`]
+/// (250ms, 500ms, 1s, 2s, ... 30s). Used to shed load when netlink events keep
+/// arriving faster than we can quiesce. Pure so it can be unit-tested.
+fn next_bounce(current: std::time::Duration) -> std::time::Duration {
+    std::cmp::min(current * 2, MONITOR_BOUNCE_MAX)
+}
 
 #[derive(clap::Parser)]
 #[command(version, about = "XDP-based EtherIP tunnel (RFC 3378)")]
@@ -143,6 +154,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut monitor = crate::control::netlink::spawn_change_monitor()?;
     let mut ticker = tokio::time::interval(RERESOLVE_INTERVAL);
     ticker.tick().await; // consume the immediate first tick
+    let mut bounce = MONITOR_BOUNCE_BASE;
 
     loop {
         tokio::select! {
@@ -161,8 +173,19 @@ pub async fn run() -> anyhow::Result<()> {
             }
             Some(_) = monitor.recv() => {
                 // Coalesce a burst of neighbour/route changes before re-resolving.
-                tokio::time::sleep(MONITOR_DEBOUNCE).await;
-                while monitor.try_recv().is_ok() {}
+                tokio::time::sleep(bounce).await;
+                // If more events queued across the whole window, the burst is
+                // ongoing: back off the next window (up to 30s) to shed load
+                // under a netlink storm. A window that ends quiet resets it.
+                let mut still_bursting = false;
+                while monitor.try_recv().is_ok() {
+                    still_bursting = true;
+                }
+                bounce = if still_bursting {
+                    next_bounce(bounce)
+                } else {
+                    MONITOR_BOUNCE_BASE
+                };
                 // Reactive: react to the observed change; don't probe (a probe
                 // would just generate more neighbour events).
                 manager.reresolve_all(false).await;
@@ -191,6 +214,17 @@ mod tests {
 
     fn pb(s: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(s)
+    }
+
+    #[test]
+    fn bounce_doubles_then_caps_at_max() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(next_bounce(MONITOR_BOUNCE_BASE), ms(500));
+        assert_eq!(next_bounce(ms(500)), ms(1000));
+        assert_eq!(next_bounce(ms(8000)), ms(16000));
+        // 16s would double to 32s; capped at the 30s ceiling, and stays there.
+        assert_eq!(next_bounce(ms(16000)), MONITOR_BOUNCE_MAX);
+        assert_eq!(next_bounce(MONITOR_BOUNCE_MAX), MONITOR_BOUNCE_MAX);
     }
 
     #[test]
