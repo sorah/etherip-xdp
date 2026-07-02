@@ -23,6 +23,17 @@ Restart=on-failure
 RestartSec=2
 Sockets=etherip-xdp-varlink@%i.socket
 
+# Graceful restart: SIGUSR2 = exit leaving the pinned data plane attached; the
+# next instance adopts it, so restarts (and crash respawns) don't stop traffic.
+RestartKillSignal=SIGUSR2
+# The hidden veth-peer netns is parked in the fd store across restarts (also
+# implies NotifyAccess=main). Preserve keeps it through a failed state
+# (systemd >= 254; older versions preserve across restarts only).
+FileDescriptorStoreMax=1
+FileDescriptorStorePreserve=yes
+# Carve the bpffs pin directory out of ProtectSystem/ProtectKernelTunables.
+ReadWritePaths=/sys/fs/bpf/etherip-xdp
+
 # Own dynamic user joining the static etherip-xdp-sock group, which owns the 0660
 # sockets and /run/etherip-xdp so the manager (another dynamic user in the group)
 # can reach them. A shared DynamicUser can't: systemd parks its RuntimeDirectory
@@ -34,9 +45,11 @@ Environment=RUNTIME_DIRECTORY=/run/etherip-xdp
 
 # CAP_SYS_ADMIN: unshare(CLONE_NEWNET) for the hidden veth peer (dropped by
 # --disable-veth-peer-netns). CAP_PERFMON also sets allow_ptr_leaks for the
-# data-path verifier. Pre-5.8: swap CAP_BPF for CAP_SYS_ADMIN.
-AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN
+# data-path verifier. CAP_DAC_READ_SEARCH: traverse the 0700 root-only
+# /sys/fs/bpf mount to reach the group-owned pin directory (graceful restart).
+# Pre-5.8: swap CAP_BPF for CAP_SYS_ADMIN.
+AmbientCapabilities=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
 
 # systemd-analyze security 2.2. AF_INET(6) is needed for the ethtool ioctl socket.
 NoNewPrivileges=yes

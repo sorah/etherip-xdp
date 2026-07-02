@@ -20,6 +20,9 @@ const CAPS: &[caps::Capability] = &[
     caps::Capability::CAP_SYS_RESOURCE,
     caps::Capability::CAP_NET_RAW,
     caps::Capability::CAP_SYS_ADMIN,
+    // Traverse the 0700 /sys/fs/bpf mount to the pin directory, as on a real
+    // systemd host (the VM harness runs the daemon as root and won't notice).
+    caps::Capability::CAP_DAC_READ_SEARCH,
 ];
 
 /// uid/gid the daemon is dropped to; the harness chowns its config to this.
