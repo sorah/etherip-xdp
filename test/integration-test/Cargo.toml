@@ -20,7 +20,8 @@ anyhow = { workspace = true, features = ["std"] }
 caps = "0.5"
 clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context"] }
 futures-util = { workspace = true }
-nix = { workspace = true, features = ["signal", "user", "process", "fs"] }
+# `uio` for recvmsg/SCM_RIGHTS in the mini-systemd fd store (minisystemd.rs).
+nix = { workspace = true, features = ["signal", "user", "process", "fs", "uio"] }
 rtnetlink = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "process"] }

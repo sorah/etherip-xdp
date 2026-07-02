@@ -141,11 +141,22 @@ fn default_config_roots(runtime_directory: Option<&std::ffi::OsStr>) -> Vec<std:
 
 /// Run the daemon: parse arguments, set up the data plane for one external
 /// device, and drive the event loop until SIGINT/SIGTERM.
-pub async fn run() -> anyhow::Result<()> {
+///
+/// `inherited` carries fd-store descriptors recovered by
+/// [`crate::control::systemd::take_inherited_fds`] in `main()`.
+pub async fn run(inherited: crate::control::systemd::InheritedFds) -> anyhow::Result<()> {
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();
+
+    if inherited.netns.is_some() {
+        // Adoption of a preserved namespace is not wired up yet; release the
+        // store slot so it does not pin a dead namespace forever.
+        log::warn!("discarding a stored netns fd (adoption not supported)");
+        drop(inherited.netns);
+        crate::control::systemd::remove_stored_netns()?;
+    }
 
     let opt = <Opt as clap::Parser>::parse();
     let config_dirs = resolve_config_dirs(

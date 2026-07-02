@@ -100,22 +100,35 @@ struct Opt {
     sandbox: bool,
 }
 
+mod minisystemd;
 mod sandbox;
 
 const PAYLOAD: &[u8] = b"etherip-xdp integration payload; the quick brown fox jumps; 0123456789";
 
 fn main() {
-    // Wrapper subcommand: `etherip-xdp-e2e __sandbox <daemon> [args...]` drops
-    // privileges and execs the daemon (see sandbox.rs). Intercept before clap and
-    // before any threads start.
+    // Wrapper subcommands, intercepted before clap and before any threads
+    // start: `__sandbox <daemon> [args...]` drops privileges and execs the
+    // daemon (see sandbox.rs); `__listenfds [--fd N:NAME]... [--sandbox]
+    // <daemon> [args...]` first rebuilds a systemd-style activation block from
+    // inherited fds (see minisystemd.rs).
     let mut raw = std::env::args();
     let _ = raw.next();
-    if raw.next().as_deref() == Some("__sandbox") {
-        if let Err(e) = sandbox::exec(&raw.collect::<Vec<_>>()) {
-            eprintln!("sandbox: {e:#}");
-            std::process::exit(127);
+    match raw.next().as_deref() {
+        Some("__sandbox") => {
+            if let Err(e) = sandbox::exec(&raw.collect::<Vec<_>>()) {
+                eprintln!("sandbox: {e:#}");
+                std::process::exit(127);
+            }
+            unreachable!();
         }
-        unreachable!();
+        Some("__listenfds") => {
+            if let Err(e) = minisystemd::exec_with_listen_fds(&raw.collect::<Vec<_>>()) {
+                eprintln!("listenfds: {e:#}");
+                std::process::exit(127);
+            }
+            unreachable!();
+        }
+        _ => {}
     }
 
     let opt = <Opt as clap::Parser>::parse();
@@ -204,7 +217,17 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
 
     log("writing tunnel config and launching etherip-xdp");
     write_config(opt, uplink_ip, peer_uplink)?;
-    let mut daemon = spawn_daemon(opt)?;
+    let notify = minisystemd::NotifyServer::spawn(&opt.config_dir.join("notify.sock"))?;
+    // Seed a bogus "netns" fd-store entry: the daemon must consume it out of
+    // the activation block (so varlink fd routing stays intact) and release
+    // the store slot, whatever it makes of the descriptor itself.
+    let bogus_netns = nix::unistd::pipe().map_err(|e| anyhow::anyhow!("pipe: {e}"))?;
+    let mut daemon = spawn_daemon(
+        opt,
+        notify.path(),
+        &[(std::os::fd::AsRawFd::as_raw_fd(&bogus_netns.0), "netns")],
+    )?;
+    drop(bogus_netns);
 
     // The daemon creates the user-facing tunnel interface during start-up.
     log("waiting for tunnel interface");
@@ -214,6 +237,12 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
         std::time::Duration::from_secs(30),
     )
     .await?;
+
+    log("waiting for the daemon to release the bogus stored netns fd");
+    let released = notify
+        .wait_removed("netns", std::time::Duration::from_secs(10))
+        .await;
+    anyhow::ensure!(released, "daemon did not FDSTOREREMOVE the bogus netns fd");
     add_address(
         &handle,
         tunnel_idx,
@@ -434,21 +463,27 @@ fn write_config(
     Ok(())
 }
 
-fn spawn_daemon(opt: &Opt) -> anyhow::Result<tokio::process::Child> {
-    let mut cmd = if opt.sandbox {
-        // Re-exec ourselves as the sandbox wrapper, which drops privileges and
-        // execs the daemon (see sandbox.rs).
-        let me = std::env::current_exe().map_err(|e| anyhow::anyhow!("current_exe: {e}"))?;
-        let mut cmd = tokio::process::Command::new(me);
-        cmd.arg("__sandbox").arg(&opt.daemon_path);
-        cmd
-    } else {
-        tokio::process::Command::new(&opt.daemon_path)
-    };
-    cmd.arg(&opt.uplink)
+/// Spawn the daemon through the `__listenfds` wrapper, which rebuilds a
+/// systemd-style activation block from `stored_fds` (fd-store entries handed
+/// back) and then execs — via the sandbox wrapper when requested.
+fn spawn_daemon(
+    opt: &Opt,
+    notify_socket: &std::path::Path,
+    stored_fds: &[(std::os::fd::RawFd, &str)],
+) -> anyhow::Result<tokio::process::Child> {
+    let me = std::env::current_exe().map_err(|e| anyhow::anyhow!("current_exe: {e}"))?;
+    let mut cmd = tokio::process::Command::new(me);
+    cmd.arg("__listenfds");
+    cmd.args(minisystemd::listenfds_args(stored_fds)?);
+    if opt.sandbox {
+        cmd.arg("--sandbox");
+    }
+    cmd.arg(&opt.daemon_path)
+        .arg(&opt.uplink)
         .arg("--config-dir")
         .arg(&opt.config_dir)
         .env("RUST_LOG", "info")
+        .env("NOTIFY_SOCKET", notify_socket)
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn {}: {e}", opt.daemon_path.display()))
