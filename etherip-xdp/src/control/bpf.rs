@@ -74,11 +74,39 @@ impl PinPaths {
         self.maps_dir().join(name)
     }
 
+    fn links_dir(&self) -> std::path::PathBuf {
+        self.base.join("links")
+    }
+
+    fn tunnels_dir(&self) -> std::path::PathBuf {
+        self.links_dir().join("tunnels")
+    }
+
+    /// Pin of the shared decap link on the uplink.
+    pub fn decap_link(&self) -> std::path::PathBuf {
+        self.links_dir().join("decap")
+    }
+
+    /// Directory holding one tunnel's link pins.
+    pub fn tunnel_dir(&self, name: &str) -> std::path::PathBuf {
+        self.tunnels_dir().join(name)
+    }
+
+    /// Pin of one of a tunnel's two links.
+    pub fn tunnel_link(&self, name: &str, kind: LinkKind) -> std::path::PathBuf {
+        self.tunnel_dir(name).join(kind.as_str())
+    }
+
     /// Create the pin directories, group-accessible for the next instance's
     /// (different) DynamicUser uid. chmod only sticks for directories we own —
     /// ones adopted from a previous instance already carry these modes.
     pub fn ensure_dirs(&self) -> anyhow::Result<()> {
-        for dir in [self.base.clone(), self.maps_dir()] {
+        for dir in [
+            self.base.clone(),
+            self.maps_dir(),
+            self.links_dir(),
+            self.tunnels_dir(),
+        ] {
             std::fs::create_dir_all(&dir)
                 .map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
             let _ = std::fs::set_permissions(
@@ -87,6 +115,29 @@ impl PinPaths {
             );
         }
         Ok(())
+    }
+
+    /// Create one tunnel's link-pin directory (same group semantics as
+    /// [`Self::ensure_dirs`]).
+    pub fn ensure_tunnel_dir(&self, name: &str) -> anyhow::Result<()> {
+        let dir = self.tunnel_dir(name);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
+        let _ =
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o2770));
+        Ok(())
+    }
+
+    /// Remove one tunnel's link-pin directory and anything left in it.
+    pub fn remove_tunnel_dir(&self, name: &str) -> anyhow::Result<()> {
+        match std::fs::remove_dir_all(self.tunnel_dir(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::anyhow!(
+                "remove {}: {e}",
+                self.tunnel_dir(name).display()
+            )),
+        }
     }
 
     /// Remove every pinned object and the instance directory (full teardown:
@@ -98,6 +149,40 @@ impl PinPaths {
             Err(e) => Err(anyhow::anyhow!("remove {}: {e}", self.base.display())),
         }
     }
+}
+
+/// Which of a tunnel's two XDP links a pin refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkKind {
+    /// `xdp_encap` on the (possibly hidden) veth peer.
+    Encap,
+    /// `xdp_pass` on the user-facing veth end.
+    Pass,
+}
+
+impl LinkKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            LinkKind::Encap => "encap",
+            LinkKind::Pass => "pass",
+        }
+    }
+}
+
+/// One live XDP attachment, owning the link one way or another. Dropping a
+/// `Registered` value (with its `Ebpf`) detaches; dropping a `Pinned` one
+/// leaves the program attached, held by its bpffs pin — exactly what a
+/// no-teardown exit wants.
+pub struct Attachment {
+    prog: &'static str,
+    inner: AttachmentInner,
+}
+
+enum AttachmentInner {
+    /// Registered on the loaded program (pinning disabled or degraded).
+    Registered(aya::programs::xdp::XdpLinkId),
+    /// Owned bpf_link, pinned on bpffs.
+    Pinned(aya::programs::links::PinnedLink),
 }
 
 /// The kernel-visible shape a pinned map must have to be reused.
@@ -240,6 +325,9 @@ pub struct Bpf {
     ebpf: aya::Ebpf,
     /// Handle on the pinned state map; `None` when pinning is disabled.
     state: Option<aya::maps::Array<aya::maps::MapData, etherip_xdp_common::PinnedState>>,
+    /// Set when the kernel can only do netlink (non-bpf_link) XDP attaches,
+    /// which cannot be pinned.
+    degraded: bool,
 }
 
 impl Bpf {
@@ -270,7 +358,11 @@ impl Bpf {
         if let Some(pins) = pins {
             chmod_pins(pins);
         }
-        Ok(Bpf { ebpf, state })
+        Ok(Bpf {
+            ebpf,
+            state,
+            degraded: false,
+        })
     }
 
     /// The `PinnedState` record currently pinned, if valid.
@@ -293,16 +385,20 @@ impl Bpf {
         Ok(())
     }
 
-    fn attach(
+    fn program(&mut self, prog: &str) -> anyhow::Result<&mut aya::programs::Xdp> {
+        Ok(self
+            .ebpf
+            .program_mut(prog)
+            .ok_or_else(|| anyhow::anyhow!("program {prog} missing"))?
+            .try_into()?)
+    }
+
+    fn attach_id(
         &mut self,
         prog: &str,
         ifname: &str,
     ) -> anyhow::Result<aya::programs::xdp::XdpLinkId> {
-        let xdp: &mut aya::programs::Xdp = self
-            .ebpf
-            .program_mut(prog)
-            .ok_or_else(|| anyhow::anyhow!("program {prog} missing"))?
-            .try_into()?;
+        let xdp = self.program(prog)?;
         // Prefer native (driver) mode, fall back to generic/SKB.
         match xdp.attach(ifname, aya::programs::XdpMode::Driver) {
             Ok(id) => {
@@ -324,41 +420,113 @@ impl Bpf {
         }
     }
 
-    fn detach(&mut self, prog: &str, id: aya::programs::xdp::XdpLinkId) -> anyhow::Result<()> {
-        let xdp: &mut aya::programs::Xdp = self
-            .ebpf
-            .program_mut(prog)
-            .ok_or_else(|| anyhow::anyhow!("program {prog} missing"))?
-            .try_into()?;
-        xdp.detach(id)
-            .map_err(|e| anyhow::anyhow!("detach {prog}: {e}"))
+    fn attach(
+        &mut self,
+        prog: &'static str,
+        ifname: &str,
+        pin: Option<&std::path::Path>,
+    ) -> anyhow::Result<Attachment> {
+        let id = self.attach_id(prog, ifname)?;
+        let Some(pin) = pin else {
+            return Ok(Attachment {
+                prog,
+                inner: AttachmentInner::Registered(id),
+            });
+        };
+        if self.degraded {
+            return Ok(Attachment {
+                prog,
+                inner: AttachmentInner::Registered(id),
+            });
+        }
+        // Pinning needs the owned link, and only an Fd (bpf_link) one can be
+        // pinned. The conversion consumes — and thereby detaches — a
+        // netlink-fallback link (pre-5.9 kernel), so that path re-attaches and
+        // degrades to process-lifetime links for the rest of this run.
+        let link = self.program(prog)?.take_link(id)?;
+        match <aya::programs::links::FdLink as TryFrom<_>>::try_from(link) {
+            Ok(fd_link) => {
+                // Replace any stale pin from a previous unclean exit.
+                let _ = std::fs::remove_file(pin);
+                let pinned = fd_link
+                    .pin(pin)
+                    .map_err(|e| anyhow::anyhow!("pin {prog} link at {}: {e}", pin.display()))?;
+                let _ = std::fs::set_permissions(
+                    pin,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o660),
+                );
+                Ok(Attachment {
+                    prog,
+                    inner: AttachmentInner::Pinned(pinned),
+                })
+            }
+            Err(_) => {
+                log::warn!(
+                    "kernel lacks bpf_link XDP attachments; the data plane will not \
+                     survive a daemon restart"
+                );
+                self.degraded = true;
+                let id = self.attach_id(prog, ifname)?;
+                Ok(Attachment {
+                    prog,
+                    inner: AttachmentInner::Registered(id),
+                })
+            }
+        }
+    }
+
+    /// Whether links could not be pinned (netlink-fallback attach on an old
+    /// kernel): graceful restart is then unavailable.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
     }
 
     /// Attach the encap program to a veth peer.
-    pub fn attach_encap(&mut self, ifname: &str) -> anyhow::Result<aya::programs::xdp::XdpLinkId> {
-        self.attach(ENCAP_PROG, ifname)
+    pub fn attach_encap(
+        &mut self,
+        ifname: &str,
+        pin: Option<&std::path::Path>,
+    ) -> anyhow::Result<Attachment> {
+        self.attach(ENCAP_PROG, ifname, pin)
     }
 
     /// Attach the decap program to the uplink.
-    pub fn attach_decap(&mut self, ifname: &str) -> anyhow::Result<aya::programs::xdp::XdpLinkId> {
-        self.attach(DECAP_PROG, ifname)
+    pub fn attach_decap(
+        &mut self,
+        ifname: &str,
+        pin: Option<&std::path::Path>,
+    ) -> anyhow::Result<Attachment> {
+        self.attach(DECAP_PROG, ifname, pin)
     }
 
     /// Attach the pass-through program to a user-facing veth end.
-    pub fn attach_pass(&mut self, ifname: &str) -> anyhow::Result<aya::programs::xdp::XdpLinkId> {
-        self.attach(PASS_PROG, ifname)
+    pub fn attach_pass(
+        &mut self,
+        ifname: &str,
+        pin: Option<&std::path::Path>,
+    ) -> anyhow::Result<Attachment> {
+        self.attach(PASS_PROG, ifname, pin)
     }
 
-    pub fn detach_encap(&mut self, id: aya::programs::xdp::XdpLinkId) -> anyhow::Result<()> {
-        self.detach(ENCAP_PROG, id)
-    }
-
-    pub fn detach_decap(&mut self, id: aya::programs::xdp::XdpLinkId) -> anyhow::Result<()> {
-        self.detach(DECAP_PROG, id)
-    }
-
-    pub fn detach_pass(&mut self, id: aya::programs::xdp::XdpLinkId) -> anyhow::Result<()> {
-        self.detach(PASS_PROG, id)
+    /// Detach an attachment for good: a registered link detaches through its
+    /// program; a pinned link is unpinned, and closing the returned (last)
+    /// descriptor destroys it.
+    pub fn detach(&mut self, att: Attachment) -> anyhow::Result<()> {
+        let Attachment { prog, inner } = att;
+        match inner {
+            AttachmentInner::Registered(id) => {
+                let xdp = self.program(prog)?;
+                xdp.detach(id)
+                    .map_err(|e| anyhow::anyhow!("detach {prog}: {e}"))
+            }
+            AttachmentInner::Pinned(pinned) => {
+                let fd_link = pinned
+                    .unpin()
+                    .map_err(|e| anyhow::anyhow!("unpin {prog} link: {e}"))?;
+                drop(fd_link);
+                Ok(())
+            }
+        }
     }
 
     fn hash_map(

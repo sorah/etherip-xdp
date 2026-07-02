@@ -42,8 +42,8 @@ pub struct RunningTunnel {
     next_hop_on_link: bool,
     /// Observed kernel neighbour state for the next hop, if looked up.
     neigh_state: Option<crate::control::netlink::NeighState>,
-    encap_link: aya::programs::xdp::XdpLinkId,
-    pass_link: aya::programs::xdp::XdpLinkId,
+    encap_link: crate::control::bpf::Attachment,
+    pass_link: crate::control::bpf::Attachment,
 }
 
 fn peer_name(name: &str) -> String {
@@ -106,7 +106,7 @@ pub struct Manager {
     bpf: crate::control::bpf::Bpf,
     nl: crate::control::netlink::Netlink,
     external: ExternalInterface,
-    external_decap_link: aya::programs::xdp::XdpLinkId,
+    external_decap_link: crate::control::bpf::Attachment,
     /// bpffs pin layout when pinning is active; `None` when the pin root is
     /// unavailable (no bpffs, no packaging dir) and the data plane is
     /// process-lifetime only.
@@ -217,7 +217,8 @@ impl Manager {
 
         // The shared decap program + redirect target for the uplink.
         bpf.add_uplink_redirect(external.index)?;
-        let external_decap_link = bpf.attach_decap(&external.name)?;
+        let decap_pin = pins.as_ref().map(|p| p.decap_link());
+        let external_decap_link = bpf.attach_decap(&external.name, decap_pin.as_deref())?;
 
         let mut manager = Manager {
             bpf,
@@ -343,7 +344,8 @@ impl Manager {
         &mut self,
         peer: &str,
         mtu: u32,
-    ) -> anyhow::Result<(u32, aya::programs::xdp::XdpLinkId)> {
+        encap_pin: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<(u32, crate::control::bpf::Attachment)> {
         let peer_host_index = self
             .nl
             .index_of(peer)
@@ -353,7 +355,7 @@ impl Manager {
         match &self.netns {
             None => {
                 self.nl.set_mtu_up(peer_host_index, mtu).await?;
-                let encap_link = self.bpf.attach_encap(peer)?;
+                let encap_link = self.bpf.attach_encap(peer, encap_pin.as_deref())?;
                 self.bpf.add_peer_redirect(peer_host_index)?;
                 Ok((peer_host_index, encap_link))
             }
@@ -379,7 +381,9 @@ impl Manager {
                         nl.set_mtu_up(idx, mtu).await?;
                         anyhow::Ok(idx)
                     })?;
-                    let encap_link = bpf.attach_encap(peer)?;
+                    // The pin lands on the host-wide bpffs: mount namespaces are
+                    // untouched by the netns switch.
+                    let encap_link = bpf.attach_encap(peer, encap_pin.as_deref())?;
                     bpf.add_peer_redirect(peer_index)?;
                     anyhow::Ok((peer_index, encap_link))
                 })
@@ -424,6 +428,17 @@ impl Manager {
         self.nl.delete_link(&name).await.ok();
         self.nl.create_veth(&name, &peer).await?;
 
+        let (encap_pin, pass_pin) = match &self.pins {
+            Some(pins) => {
+                pins.ensure_tunnel_dir(&name)?;
+                (
+                    Some(pins.tunnel_link(&name, crate::control::bpf::LinkKind::Encap)),
+                    Some(pins.tunnel_link(&name, crate::control::bpf::LinkKind::Pass)),
+                )
+            }
+            None => (None, None),
+        };
+
         let user = self
             .nl
             .link_info(&name)
@@ -456,7 +471,7 @@ impl Manager {
         // private namespace: moving the link reassigns its ifindex there and
         // resets it to down, and both the XDP attach and the devmap insert resolve
         // the ifindex against the calling namespace.
-        let (peer_index, encap_link) = self.setup_peer(&peer, mtu).await?;
+        let (peer_index, encap_link) = self.setup_peer(&peer, mtu, encap_pin).await?;
 
         self.warn_if_src_unassigned(&spec).await;
         let resolved = match crate::control::resolver::resolve_endpoint(
@@ -480,7 +495,7 @@ impl Manager {
 
         // The user-facing end stays in the host namespace; its pass-through attach
         // satisfies the kernel's `veth_xdp_xmit` peer check for redirected frames.
-        let pass_link = self.bpf.attach_pass(&name)?;
+        let pass_link = self.bpf.attach_pass(&name, pass_pin.as_deref())?;
 
         // Without a source address (auto-select found no route yet) the tunnel is
         // pending: withhold the map entries so the data path never encapsulates
@@ -553,15 +568,20 @@ impl Manager {
         let Some(t) = self.tunnels.remove(name) else {
             return Ok(());
         };
-        if let Err(e) = self.bpf.detach_encap(t.encap_link) {
+        if let Err(e) = self.bpf.detach(t.encap_link) {
             log::warn!("tunnel {name}: detach encap: {e:#}");
         }
-        if let Err(e) = self.bpf.detach_pass(t.pass_link) {
+        if let Err(e) = self.bpf.detach(t.pass_link) {
             log::warn!("tunnel {name}: detach pass: {e:#}");
         }
         self.bpf.remove_encap(t.peer_index).ok();
         self.bpf.remove_decap(&t.decap_key).ok();
         self.bpf.remove_peer_redirect(t.peer_index).ok();
+        if let Some(pins) = &self.pins
+            && let Err(e) = pins.remove_tunnel_dir(name)
+        {
+            log::warn!("tunnel {name}: remove link pins: {e:#}");
+        }
         // Deleting the user-facing end removes the whole veth pair, including the
         // peer in the private namespace; the namespace itself outlives it for the
         // next tunnel and is torn down only when the daemon exits.
@@ -938,19 +958,28 @@ impl Manager {
                 log::error!("cleanup: remove {name}: {e:#}");
             }
         }
-        if let Err(e) = self.bpf.detach_decap(self.external_decap_link) {
+        let Manager {
+            mut bpf,
+            external,
+            external_decap_link,
+            pins,
+            netns,
+            ..
+        } = self;
+        if let Err(e) = bpf.detach(external_decap_link) {
             log::warn!("cleanup: detach uplink program: {e:#}");
         }
-        self.bpf.remove_uplink_redirect(self.external.index).ok();
+        bpf.remove_uplink_redirect(external.index).ok();
         // Unpin everything: with the daemon's own references dropping below,
         // this releases the kernel's last hold on the maps.
-        if let Some(pins) = &self.pins
+        if let Some(pins) = &pins
             && let Err(e) = pins.remove_all()
         {
             log::warn!("cleanup: remove pins: {e:#}");
         }
-        // Dropping `self` closes the namespace descriptor, destroying the private
-        // namespace and any peers that survived individual teardown.
+        // Dropping the namespace descriptor destroys the private namespace and
+        // any peers that survived individual teardown.
+        drop(netns);
     }
 }
 

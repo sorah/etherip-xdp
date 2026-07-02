@@ -245,14 +245,30 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
         .await;
     anyhow::ensure!(released, "daemon did not FDSTOREREMOVE the bogus netns fd");
 
-    // The data-plane maps must be pinned while the daemon runs (the bpffs root
-    // above stands in for the packaged tmpfiles.d entry).
+    // The data-plane maps and links must be pinned while the daemon runs (the
+    // bpffs root above stands in for the packaged tmpfiles.d entry). The pass
+    // link is attached only after endpoint resolution, which may probe for a
+    // while — wait rather than sample.
     let pin_dir = bpffs_instance_dir(opt);
-    for map in ["ENCAP_CONFIG", "DECAP_CONFIG", "ETHERIP_STATE"] {
-        let pin = pin_dir.join("maps").join(map);
-        anyhow::ensure!(pin.exists(), "map pin {} missing", pin.display());
+    let mut pins: Vec<std::path::PathBuf> = ["ENCAP_CONFIG", "DECAP_CONFIG", "ETHERIP_STATE"]
+        .iter()
+        .map(|m| pin_dir.join("maps").join(m))
+        .collect();
+    pins.push(pin_dir.join("links/decap"));
+    pins.push(pin_dir.join(format!("links/tunnels/{}/encap", opt.tunnel_name)));
+    pins.push(pin_dir.join(format!("links/tunnels/{}/pass", opt.tunnel_name)));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    for pin in &pins {
+        while !pin.exists() {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "pin {} did not appear",
+                pin.display()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
-    log("map pins present");
+    log("map and link pins present");
     add_address(
         &handle,
         tunnel_idx,
