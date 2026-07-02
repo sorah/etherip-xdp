@@ -158,6 +158,12 @@ fn move_fd(src: std::os::fd::RawFd, dst: std::os::fd::RawFd) -> anyhow::Result<(
     Ok(())
 }
 
+/// Whether a service manager is listening for `sd_notify` datagrams — without
+/// it, e.g. fd-store entries silently go nowhere.
+pub fn notify_socket_available() -> bool {
+    std::env::var_os("NOTIFY_SOCKET").is_some()
+}
+
 /// Send an `sd_notify(3)` state datagram. A no-op without `$NOTIFY_SOCKET`
 /// (running outside systemd).
 pub fn notify(state: &str) -> anyhow::Result<()> {

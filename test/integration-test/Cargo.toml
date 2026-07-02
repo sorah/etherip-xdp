@@ -17,6 +17,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+# Opening the pinned state map to tamper with the recorded object digest
+# (drives the daemon's atomic-swap path with an identical binary).
+aya = { workspace = true }
 caps = "0.5"
 clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context"] }
 futures-util = { workspace = true }

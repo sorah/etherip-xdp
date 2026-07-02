@@ -128,6 +128,20 @@ impl PinPaths {
         Ok(())
     }
 
+    /// Tunnel names with pinned links, i.e. what the previous instance was
+    /// running. Names ordered for deterministic processing.
+    pub fn list_pinned_tunnels(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.tunnels_dir()) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Remove one tunnel's link-pin directory and anything left in it.
     pub fn remove_tunnel_dir(&self, name: &str) -> anyhow::Result<()> {
         match std::fs::remove_dir_all(self.tunnel_dir(name)) {
@@ -170,9 +184,9 @@ impl LinkKind {
 }
 
 /// One live XDP attachment, owning the link one way or another. Dropping a
-/// `Registered` value (with its `Ebpf`) detaches; dropping a `Pinned` one
-/// leaves the program attached, held by its bpffs pin — exactly what a
-/// no-teardown exit wants.
+/// `Registered` value (with its `Ebpf`) detaches; dropping a `Pinned` or
+/// `AdoptedFd` one leaves the program attached, held by its bpffs pin —
+/// exactly what a no-teardown exit wants.
 pub struct Attachment {
     prog: &'static str,
     inner: AttachmentInner,
@@ -183,6 +197,23 @@ enum AttachmentInner {
     Registered(aya::programs::xdp::XdpLinkId),
     /// Owned bpf_link, pinned on bpffs.
     Pinned(aya::programs::links::PinnedLink),
+    /// Adopted from an existing pin (kept there); same drop semantics as
+    /// `Pinned`, but teardown removes the pin file by path.
+    AdoptedFd {
+        link: aya::programs::links::FdLink,
+        pin: std::path::PathBuf,
+    },
+}
+
+/// What to do with the pinned links adopted on a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptMode {
+    /// The embedded object differs from the pinned record: atomically replace
+    /// each adopted link's program (`BPF_LINK_UPDATE`, no packet gap).
+    UpdateLinks,
+    /// The embedded object is byte-identical: leave the running programs
+    /// attached untouched.
+    SkipIdentical,
 }
 
 /// The kernel-visible shape a pinned map must have to be reused.
@@ -226,14 +257,16 @@ pub fn expected_map_specs() -> [MapSpec; 6] {
             name: REDIRECT_UPLINK,
             map_type: aya::maps::MapType::DevMapHash,
             key_size: 4,
-            value_size: 4,
+            // Devmap values are `bpf_devmap_val` (ifindex + prog union), not a
+            // bare ifindex.
+            value_size: std::mem::size_of::<aya_obj::generated::bpf_devmap_val>() as u32,
             max_entries: etherip_xdp_common::REDIRECT_UPLINK_MAX_ENTRIES,
         },
         MapSpec {
             name: REDIRECT_PEER,
             map_type: aya::maps::MapType::DevMapHash,
             key_size: 4,
-            value_size: 4,
+            value_size: std::mem::size_of::<aya_obj::generated::bpf_devmap_val>() as u32,
             max_entries: etherip_xdp_common::REDIRECT_PEER_MAX_ENTRIES,
         },
         MapSpec {
@@ -289,20 +322,44 @@ pub fn classify_pins(pins: &PinPaths) -> PinState {
     let observations: Vec<Option<bool>> = specs
         .iter()
         .map(|spec| {
-            let info = aya::maps::MapInfo::from_pin(pins.map(spec.name)).ok()?;
+            let info = match aya::maps::MapInfo::from_pin(pins.map(spec.name)) {
+                Ok(info) => info,
+                Err(e) => {
+                    log::debug!("pin {}: not readable: {e}", spec.name);
+                    return None;
+                }
+            };
             let map_type = info.map_type().ok()?;
-            Some(spec.matches(
+            let ok = spec.matches(
                 map_type,
                 info.key_size(),
                 info.value_size(),
                 info.max_entries(),
-            ))
+            );
+            if !ok {
+                log::warn!(
+                    "pin {}: kernel reports {:?} key={} value={} max={}, expected {:?} key={} value={} max={}",
+                    spec.name,
+                    map_type,
+                    info.key_size(),
+                    info.value_size(),
+                    info.max_entries(),
+                    spec.map_type,
+                    spec.key_size,
+                    spec.value_size,
+                    spec.max_entries,
+                );
+            }
+            Some(ok)
         })
         .collect();
     // The state record itself gates compatibility: a record from a different
     // layout revision means the (shape-identical or not) maps follow rules we
     // no longer understand.
     let state_ok = read_pinned_state(pins).is_some_and(|s| s.is_compatible());
+    if !state_ok && observations.iter().any(Option::is_some) {
+        log::warn!("pinned state record is missing, unreadable, or from another layout revision");
+    }
     classify(&observations, state_ok)
 }
 
@@ -526,7 +583,67 @@ impl Bpf {
                 drop(fd_link);
                 Ok(())
             }
+            AttachmentInner::AdoptedFd { link, pin } => {
+                std::fs::remove_file(&pin)
+                    .map_err(|e| anyhow::anyhow!("unpin {prog} link at {}: {e}", pin.display()))?;
+                drop(link);
+                Ok(())
+            }
         }
+    }
+
+    /// Adopt the pinned link at `pin`. `expect_prog_id` is the program id the
+    /// device actually runs (`IFLA_XDP`): a pinned link that no longer matches
+    /// it is defunct (its device was deleted or replaced) and is rejected —
+    /// the caller falls back to a fresh attach. In `UpdateLinks` mode the
+    /// adopted link's program is atomically replaced with this build's.
+    ///
+    /// Namespace-free: the pin path and `BPF_LINK_UPDATE` work on descriptors,
+    /// so this never needs to enter the hidden netns.
+    pub fn adopt_link(
+        &mut self,
+        prog: &'static str,
+        pin: &std::path::Path,
+        expect_prog_id: Option<u32>,
+        mode: AdoptMode,
+    ) -> anyhow::Result<Attachment> {
+        let pinned = aya::programs::links::PinnedLink::from_pin(pin)
+            .map_err(|e| anyhow::anyhow!("open pinned link {}: {e}", pin.display()))?;
+        let link = aya::programs::links::FdLink::from(pinned);
+        let link_prog = link
+            .info()
+            .map_err(|e| anyhow::anyhow!("pinned link {}: info: {e}", pin.display()))?
+            .program_id();
+        anyhow::ensure!(
+            expect_prog_id == Some(link_prog),
+            "pinned link {} is defunct: it holds program {link_prog} but the device runs {:?}",
+            pin.display(),
+            expect_prog_id
+        );
+        let link = match mode {
+            AdoptMode::SkipIdentical => link,
+            AdoptMode::UpdateLinks => {
+                let xdp_link: aya::programs::xdp::XdpLink = link.try_into().map_err(|e| {
+                    anyhow::anyhow!("pinned link {} is not XDP: {e}", pin.display())
+                })?;
+                let xdp = self.program(prog)?;
+                let id = xdp
+                    .attach_to_link(xdp_link)
+                    .map_err(|e| anyhow::anyhow!("update {prog} link: {e}"))?;
+                // Re-own the (updated, still pinned) link so drop semantics
+                // stay pin-governed rather than program-registry-governed.
+                let link = xdp.take_link(id)?;
+                <aya::programs::links::FdLink as TryFrom<_>>::try_from(link)
+                    .map_err(|e| anyhow::anyhow!("updated {prog} link is not fd-backed: {e}"))?
+            }
+        };
+        Ok(Attachment {
+            prog,
+            inner: AttachmentInner::AdoptedFd {
+                link,
+                pin: pin.to_path_buf(),
+            },
+        })
     }
 
     fn hash_map(
@@ -632,6 +749,78 @@ impl Bpf {
         self.devmap_remove(REDIRECT_PEER, ifindex)
     }
 
+    /// Adopt the pinned uplink decap link (see [`Self::adopt_link`]).
+    pub fn adopt_decap(
+        &mut self,
+        pin: &std::path::Path,
+        expect_prog_id: Option<u32>,
+        mode: AdoptMode,
+    ) -> anyhow::Result<Attachment> {
+        self.adopt_link(DECAP_PROG, pin, expect_prog_id, mode)
+    }
+
+    /// Adopt a pinned per-tunnel encap link (see [`Self::adopt_link`]).
+    pub fn adopt_encap(
+        &mut self,
+        pin: &std::path::Path,
+        expect_prog_id: Option<u32>,
+        mode: AdoptMode,
+    ) -> anyhow::Result<Attachment> {
+        self.adopt_link(ENCAP_PROG, pin, expect_prog_id, mode)
+    }
+
+    /// Adopt a pinned per-tunnel pass link (see [`Self::adopt_link`]).
+    pub fn adopt_pass(
+        &mut self,
+        pin: &std::path::Path,
+        expect_prog_id: Option<u32>,
+        mode: AdoptMode,
+    ) -> anyhow::Result<Attachment> {
+        self.adopt_link(PASS_PROG, pin, expect_prog_id, mode)
+    }
+
+    /// Keys currently present in `ENCAP_CONFIG`, for the post-adoption sweep
+    /// of entries owned by no running tunnel.
+    pub fn encap_keys(&mut self) -> anyhow::Result<Vec<u32>> {
+        let map = self
+            .ebpf
+            .map_mut(ENCAP_CONFIG)
+            .ok_or_else(|| anyhow::anyhow!("map {ENCAP_CONFIG} missing"))?;
+        let map: aya::maps::HashMap<_, u32, etherip_xdp_common::TunnelConfig> =
+            aya::maps::HashMap::try_from(map)?;
+        map.keys()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Keys currently present in `DECAP_CONFIG` (see [`Self::encap_keys`]).
+    pub fn decap_keys(&mut self) -> anyhow::Result<Vec<etherip_xdp_common::DecapKey>> {
+        let map = self.hash_map(DECAP_CONFIG)?;
+        map.keys()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// The persisted `ENCAP_CONFIG` entry for a veth-peer ifindex, if any —
+    /// the prior instance's record of the tunnel, used to reconstruct its
+    /// state on adoption.
+    pub fn get_encap(
+        &mut self,
+        ifindex: u32,
+    ) -> anyhow::Result<Option<etherip_xdp_common::TunnelConfig>> {
+        let map = self
+            .ebpf
+            .map_mut(ENCAP_CONFIG)
+            .ok_or_else(|| anyhow::anyhow!("map {ENCAP_CONFIG} missing"))?;
+        let map: aya::maps::HashMap<_, u32, etherip_xdp_common::TunnelConfig> =
+            aya::maps::HashMap::try_from(map)?;
+        match map.get(&ifindex, 0) {
+            Ok(cfg) => Ok(Some(cfg)),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Read and sum the per-CPU debug counters.
     pub fn read_counters(&mut self) -> anyhow::Result<[u64; etherip_xdp_common::DBG_MAX as usize]> {
         let map = self
@@ -734,6 +923,12 @@ mod tests {
             state.value_size as usize,
             std::mem::size_of::<etherip_xdp_common::PinnedState>()
         );
+        // Devmap values are 8-byte `bpf_devmap_val`s, not bare ifindexes; the
+        // kernel reports 8 for maps created from the object's declarations.
+        for name in ["REDIRECT_UPLINK", "REDIRECT_PEER"] {
+            let spec = specs.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(spec.value_size, 8, "{name}");
+        }
     }
 
     #[test]

@@ -41,6 +41,27 @@ impl NetNs {
         Ok(NetNs { fd })
     }
 
+    /// Adopt a namespace descriptor handed back by the systemd fd store on a
+    /// graceful restart. Validates that the descriptor really names a network
+    /// namespace (`NS_GET_NSTYPE`), since the fd store is just a bag of fds.
+    pub fn from_fd(fd: std::os::fd::OwnedFd) -> anyhow::Result<Self> {
+        nix::ioctl_none!(ns_get_nstype, 0xb7, 0x3);
+        // SAFETY: NS_GET_NSTYPE takes no argument and only reads kernel state;
+        // it fails cleanly (ENOTTY/EINVAL) on a non-namespace descriptor.
+        let nstype = unsafe { ns_get_nstype(std::os::fd::AsRawFd::as_raw_fd(&fd)) }
+            .map_err(|e| anyhow::anyhow!("NS_GET_NSTYPE: {e}"))?;
+        anyhow::ensure!(
+            nstype == nix::sched::CloneFlags::CLONE_NEWNET.bits(),
+            "stored descriptor is not a network namespace (type {nstype:#x})"
+        );
+        Ok(NetNs { fd })
+    }
+
+    /// Borrow the descriptor, e.g. to park it in the systemd fd store.
+    pub fn borrow_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.fd)
+    }
+
     /// The raw descriptor of the namespace, for `setns_by_fd` when moving a link
     /// into it (see [`crate::control::netlink::Netlink::move_link_to_netns`]).
     pub fn as_raw_fd(&self) -> std::os::fd::RawFd {

@@ -76,6 +76,33 @@ struct Opt {
     /// redirect).
     #[arg(long)]
     disable_veth_peer_netns: bool,
+
+    /// Disable graceful restart: no bpffs pinning, no adoption of a previous
+    /// instance's data plane, and SIGUSR2 tears down like SIGTERM. By default
+    /// the data plane is pinned so `systemctl restart` (and a crash restart)
+    /// does not interrupt traffic.
+    #[arg(long)]
+    disable_graceful_restart: bool,
+}
+
+/// How the daemon should exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shutdown {
+    /// Detach and delete everything (stop / disable).
+    Full,
+    /// Leave the pinned data plane attached for the next instance (restart).
+    Handoff,
+}
+
+/// SIGUSR2 (`RestartKillSignal=`) asks for a no-teardown exit, honored only
+/// when the data plane can actually survive this process; SIGTERM/SIGINT
+/// always tear down. Pure so the gate is unit-tested.
+fn shutdown_mode(handoff_requested: bool, graceful: bool) -> Shutdown {
+    if handoff_requested && graceful {
+        Shutdown::Handoff
+    } else {
+        Shutdown::Full
+    }
 }
 
 fn bump_memlock_rlimit() {
@@ -150,14 +177,6 @@ pub async fn run(inherited: crate::control::systemd::InheritedFds) -> anyhow::Re
         .parse_default_env()
         .init();
 
-    if inherited.netns.is_some() {
-        // Adoption of a preserved namespace is not wired up yet; release the
-        // store slot so it does not pin a dead namespace forever.
-        log::warn!("discarding a stored netns fd (adoption not supported)");
-        drop(inherited.netns);
-        crate::control::systemd::remove_stored_netns()?;
-    }
-
     let opt = <Opt as clap::Parser>::parse();
     let config_dirs = resolve_config_dirs(
         &opt.device,
@@ -173,9 +192,15 @@ pub async fn run(inherited: crate::control::systemd::InheritedFds) -> anyhow::Re
         opt.device,
         config_dirs,
         !opt.disable_veth_peer_netns,
+        crate::control::tunnel::RestartContext {
+            netns_fd: inherited.netns,
+            graceful: !opt.disable_graceful_restart,
+        },
     )
     .await?;
-    log::info!("etherip-xdp ready; SIGHUP to reload, SIGINT/SIGTERM to stop");
+    log::info!(
+        "etherip-xdp ready; SIGHUP to reload, SIGINT/SIGTERM to stop, SIGUSR2 to restart-handoff"
+    );
 
     // Embedded varlink management server. It runs as a separate task and reaches
     // the manager only via this channel, serviced in the select! loop below, so
@@ -192,11 +217,13 @@ pub async fn run(inherited: crate::control::systemd::InheritedFds) -> anyhow::Re
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigusr2 =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?;
     let mut reresolve = spawn_bounce(crate::control::netlink::spawn_change_monitor()?);
     let mut ticker = tokio::time::interval(RERESOLVE_INTERVAL);
     ticker.tick().await; // consume the immediate first tick
 
-    loop {
+    let shutdown = loop {
         tokio::select! {
             _ = sighup.recv() => {
                 log::info!("SIGHUP: reloading config");
@@ -204,8 +231,22 @@ pub async fn run(inherited: crate::control::systemd::InheritedFds) -> anyhow::Re
                     log::error!("reload failed: {e:#}");
                 }
             }
-            _ = sigterm.recv() => { log::info!("SIGTERM: shutting down"); break; }
-            _ = sigint.recv() => { log::info!("SIGINT: shutting down"); break; }
+            _ = sigterm.recv() => { log::info!("SIGTERM: shutting down"); break Shutdown::Full; }
+            _ = sigint.recv() => { log::info!("SIGINT: shutting down"); break Shutdown::Full; }
+            _ = sigusr2.recv() => {
+                // RestartKillSignal=SIGUSR2: the service manager is restarting
+                // us, not stopping us.
+                match shutdown_mode(true, manager.is_graceful()) {
+                    Shutdown::Handoff => {
+                        log::info!("SIGUSR2: exiting without teardown (graceful restart)");
+                        break Shutdown::Handoff;
+                    }
+                    Shutdown::Full => {
+                        log::warn!("SIGUSR2 but graceful restart is unavailable; tearing down");
+                        break Shutdown::Full;
+                    }
+                }
+            }
             Some(req) = control_rx.recv() => {
                 // Management query from the embedded varlink server; serviced
                 // synchronously (reads live state, including BPF counters).
@@ -223,7 +264,7 @@ pub async fn run(inherited: crate::control::systemd::InheritedFds) -> anyhow::Re
                 manager.reresolve_all(true).await;
             }
         }
-    }
+    };
 
     // Stop the management server (it polls `stop` on its accept idle-timeout);
     // abort as a backstop since the process is exiting anyway.
@@ -231,7 +272,16 @@ pub async fn run(inherited: crate::control::systemd::InheritedFds) -> anyhow::Re
     control_server.abort();
 
     manager.dump_counters();
-    manager.cleanup().await;
+    match shutdown {
+        Shutdown::Full => {
+            manager.cleanup().await;
+            // The stored netns fd must die with the data plane, not revive it.
+            if let Err(e) = crate::control::systemd::remove_stored_netns() {
+                log::debug!("remove stored netns fd: {e:#}");
+            }
+        }
+        Shutdown::Handoff => manager.abandon(),
+    }
     Ok(())
 }
 
@@ -241,6 +291,16 @@ mod tests {
 
     fn pb(s: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(s)
+    }
+
+    #[test]
+    fn sigusr2_hands_off_only_when_graceful() {
+        assert_eq!(shutdown_mode(true, true), Shutdown::Handoff);
+        // Degraded data plane (no pins / netlink attach / unstored netns):
+        // honoring the no-teardown request would leave a dead data plane.
+        assert_eq!(shutdown_mode(true, false), Shutdown::Full);
+        assert_eq!(shutdown_mode(false, true), Shutdown::Full);
+        assert_eq!(shutdown_mode(false, false), Shutdown::Full);
     }
 
     #[test]

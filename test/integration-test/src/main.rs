@@ -98,6 +98,13 @@ struct Opt {
     /// no-new-privs) mirroring packaging/etherip-xdp@.service.
     #[arg(long, default_value_t = false)]
     sandbox: bool,
+
+    /// Exercise graceful-restart: SIGUSR2 handoff, crash + respawn, the
+    /// skip-identical and atomic-swap paths, and a config edit applied across
+    /// a restart — all under a continuity pinger asserting the data plane
+    /// never stops.
+    #[arg(long, default_value_t = false)]
+    restart_scenarios: bool,
 }
 
 mod minisystemd;
@@ -216,7 +223,7 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
     set_up(&handle, uplink_idx).await?;
 
     log("writing tunnel config and launching etherip-xdp");
-    write_config(opt, uplink_ip, peer_uplink)?;
+    write_config(opt, uplink_ip, peer_uplink, None)?;
     prepare_bpffs_root(opt)?;
     let notify = minisystemd::NotifyServer::spawn(&opt.config_dir.join("notify.sock"))?;
     // Seed a bogus "netns" fd-store entry: the daemon must consume it out of
@@ -227,6 +234,7 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
         opt,
         notify.path(),
         &[(std::os::fd::AsRawFd::as_raw_fd(&bogus_netns.0), "netns")],
+        0,
     )?;
     drop(bogus_netns);
 
@@ -278,18 +286,54 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
     .await?;
     set_up(&handle, tunnel_idx).await?;
 
-    let result = drive_traffic(opt, inner_ip, inner_peer).await;
+    let result = async {
+        // ICMP first: proves the tunnel end to end and seeds ARP for the
+        // restart phases' continuity pinger.
+        log("pinging peer inner address through the tunnel");
+        tokio::task::spawn_blocking(move || ping(inner_peer, std::time::Duration::from_secs(45)))
+            .await
+            .map_err(|e| anyhow::anyhow!("ping task join: {e}"))??;
+        log("ping OK");
+
+        if opt.restart_scenarios {
+            restart_phases(
+                opt,
+                &notify,
+                &mut daemon,
+                &handle,
+                uplink_ip,
+                peer_uplink,
+                inner_peer,
+            )
+            .await?;
+        }
+
+        drive_tcp(opt, inner_ip, inner_peer).await
+    }
+    .await;
+    if result.is_err() {
+        dump_daemon_logs(opt);
+    }
 
     // Stop the daemon (graceful: it tears down veths and dumps counters).
     terminate(&mut daemon).await;
 
-    // A SIGTERM stop is a full teardown: the pins must be gone with it.
+    // A SIGTERM stop is a full teardown: the pins must be gone, and the netns
+    // fd released from the store, with it.
     let pin_dir = bpffs_instance_dir(opt);
     anyhow::ensure!(
         !pin_dir.exists(),
         "pin dir {} survived SIGTERM teardown",
         pin_dir.display()
     );
+    if opt.restart_scenarios {
+        anyhow::ensure!(
+            notify
+                .wait_unstored("netns", std::time::Duration::from_secs(5))
+                .await,
+            "netns fd still in the store after SIGTERM teardown"
+        );
+    }
     log("pins removed on teardown");
     result
 }
@@ -317,23 +361,14 @@ fn prepare_bpffs_root(opt: &Opt) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// ICMP reachability plus a TCP echo exchange through the tunnel.
-async fn drive_traffic(
+/// TCP through the tunnel. Echo mode (Linux↔Linux) verifies a full
+/// round-trip; connect mode (interop) only proves the handshake traverses the
+/// tunnel — enough to exercise the inner-TCP path against a plain listener.
+async fn drive_tcp(
     opt: &Opt,
     inner_ip: std::net::Ipv4Addr,
     inner_peer: std::net::Ipv4Addr,
 ) -> anyhow::Result<()> {
-    // ICMP echo to the peer's inner address. The first packet triggers ARP over
-    // the tunnel, so retry generously while both ends finish coming up.
-    log("pinging peer inner address through the tunnel");
-    tokio::task::spawn_blocking(move || ping(inner_peer, std::time::Duration::from_secs(45)))
-        .await
-        .map_err(|e| anyhow::anyhow!("ping task join: {e}"))??;
-    log("ping OK");
-
-    // TCP through the tunnel. Echo mode (Linux↔Linux) verifies a full
-    // round-trip; connect mode (interop) only proves the handshake traverses the
-    // tunnel — enough to exercise the inner-TCP path against a plain listener.
     let addr = std::net::SocketAddrV4::new(inner_ip, opt.port);
     let peer_addr = std::net::SocketAddrV4::new(inner_peer, opt.port);
     match (opt.tcp, opt.role) {
@@ -343,6 +378,236 @@ async fn drive_traffic(
         (TcpMode::Connect, Role::Server) => tcp_accept_once(addr).await,
         (TcpMode::Connect, Role::Client) => tcp_connect_once(peer_addr).await,
     }
+}
+
+// ---- graceful-restart phases ----
+
+/// Drive the daemon through every restart flavor while a continuity pinger
+/// asserts the data plane never pauses: SIGUSR2 handoff with the identical
+/// object (skip-swap), a tampered object digest (atomic BPF_LINK_UPDATE swap),
+/// a SIGKILL crash, and a config edit applied across a restart.
+#[allow(clippy::too_many_arguments)]
+async fn restart_phases(
+    opt: &Opt,
+    notify: &minisystemd::NotifyServer,
+    daemon: &mut tokio::process::Child,
+    handle: &rtnetlink::Handle,
+    uplink_ip: std::net::Ipv6Addr,
+    peer_uplink: std::net::Ipv6Addr,
+    inner_peer: std::net::Ipv4Addr,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        notify
+            .wait_stored("netns", std::time::Duration::from_secs(10))
+            .await,
+        "daemon did not park its netns fd in the store"
+    );
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pinger = {
+        let stop = stop.clone();
+        tokio::task::spawn_blocking(move || {
+            ping_continuity(inner_peer, &stop, std::time::Duration::from_millis(1500))
+        })
+    };
+
+    let phases = async {
+        let adopted = format!("tunnel {}: adopted running data plane", opt.tunnel_name);
+
+        log("restart phase 1: SIGUSR2 handoff, identical object (skip swap)");
+        stop_daemon(daemon, nix::sys::signal::Signal::SIGUSR2).await?;
+        *daemon = respawn_daemon(opt, notify, 1)?;
+        wait_daemon_log(opt, 1, "eBPF object unchanged", 20).await?;
+        wait_daemon_log(opt, 1, "adopted the uplink decap link", 20).await?;
+        wait_daemon_log(opt, 1, &adopted, 20).await?;
+
+        log("restart phase 2: SIGUSR2 handoff, changed object digest (atomic swap)");
+        stop_daemon(daemon, nix::sys::signal::Signal::SIGUSR2).await?;
+        tamper_pinned_digest(opt)?;
+        *daemon = respawn_daemon(opt, notify, 2)?;
+        wait_daemon_log(opt, 2, "updating attached programs atomically", 20).await?;
+        wait_daemon_log(opt, 2, &adopted, 20).await?;
+
+        log("restart phase 3: crash (SIGKILL) and respawn");
+        stop_daemon(daemon, nix::sys::signal::Signal::SIGKILL).await?;
+        *daemon = respawn_daemon(opt, notify, 3)?;
+        wait_daemon_log(opt, 3, &adopted, 20).await?;
+
+        log("restart phase 4: config edited while down (mtu applied on adopt)");
+        stop_daemon(daemon, nix::sys::signal::Signal::SIGUSR2).await?;
+        write_config(opt, uplink_ip, peer_uplink, Some(RESTART_MTU))?;
+        *daemon = respawn_daemon(opt, notify, 4)?;
+        wait_daemon_log(opt, 4, &adopted, 20).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if link_mtu(handle, &opt.tunnel_name).await? == Some(RESTART_MTU) {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "tunnel MTU was not updated to {RESTART_MTU} after the restart"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let continuity = pinger
+        .await
+        .map_err(|e| anyhow::anyhow!("pinger task join: {e}"))?;
+    phases?;
+    continuity?;
+    log("restart phases OK (no data-plane gap observed)");
+    Ok(())
+}
+
+/// Inner MTU applied through a config edit in restart phase 4.
+const RESTART_MTU: u32 = 1300;
+
+async fn stop_daemon(
+    daemon: &mut tokio::process::Child,
+    signal: nix::sys::signal::Signal,
+) -> anyhow::Result<()> {
+    let pid = daemon
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("daemon already exited"))?;
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal)
+        .map_err(|e| anyhow::anyhow!("kill({signal}): {e}"))?;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), daemon.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon did not exit on {signal}"))?
+        .map_err(|e| anyhow::anyhow!("wait: {e}"))?;
+    if signal != nix::sys::signal::Signal::SIGKILL {
+        anyhow::ensure!(status.success(), "daemon exited with {status} on {signal}");
+    }
+    Ok(())
+}
+
+/// Respawn the daemon with the fd-store contents passed back, as systemd
+/// would on `Restart=`.
+fn respawn_daemon(
+    opt: &Opt,
+    notify: &minisystemd::NotifyServer,
+    generation: usize,
+) -> anyhow::Result<tokio::process::Child> {
+    let mut fds: Vec<(std::os::fd::RawFd, &str)> = Vec::new();
+    if let Some(fd) = notify.stored_fd("netns") {
+        fds.push((fd, "netns"));
+    }
+    spawn_daemon(opt, notify.path(), &fds, generation)
+}
+
+fn daemon_log_path(opt: &Opt, generation: usize) -> std::path::PathBuf {
+    opt.config_dir.join(format!("daemon-{generation}.log"))
+}
+
+/// Wait until the daemon's (stderr) log contains `needle`.
+async fn wait_daemon_log(
+    opt: &Opt,
+    generation: usize,
+    needle: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let path = daemon_log_path(opt, generation);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "daemon log {} did not contain {needle:?}",
+            path.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Print every captured daemon log (called on scenario failure).
+fn dump_daemon_logs(opt: &Opt) {
+    for generation in 0..=8 {
+        let path = daemon_log_path(opt, generation);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            println!("[daemon-{generation}] {line}");
+        }
+    }
+}
+
+/// Flip one byte of the pinned state record's object digest so the next
+/// daemon start takes the changed-object path (atomic program swap) even
+/// though the binary is identical.
+fn tamper_pinned_digest(opt: &Opt) -> anyhow::Result<()> {
+    let path = bpffs_instance_dir(opt).join("maps/ETHERIP_STATE");
+    let data = aya::maps::MapData::from_pin(&path)
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    // The record is opaque bytes here; the digest lives past the two header
+    // words and the 32-byte version field (see etherip-xdp-common PinnedState).
+    let mut array: aya::maps::Array<_, [u8; 72]> =
+        aya::maps::Array::try_from(aya::maps::Map::Array(data))
+            .map_err(|e| anyhow::anyhow!("state map shape: {e}"))?;
+    let mut record = array.get(&0, 0).map_err(|e| anyhow::anyhow!("read: {e}"))?;
+    record[40] ^= 0xff;
+    array
+        .set(0, record, 0)
+        .map_err(|e| anyhow::anyhow!("write: {e}"))?;
+    Ok(())
+}
+
+async fn link_mtu(handle: &rtnetlink::Handle, name: &str) -> anyhow::Result<Option<u32>> {
+    use futures_util::stream::TryStreamExt as _;
+    let mut links = handle.link().get().match_name(name.to_string()).execute();
+    match links.try_next().await {
+        Ok(Some(msg)) => Ok(msg.attributes.iter().find_map(|attr| match attr {
+            rtnetlink::packet_route::link::LinkAttribute::Mtu(m) => Some(*m),
+            _ => None,
+        })),
+        _ => Ok(None),
+    }
+}
+
+/// Blocking continuity pinger: one echo every ~100 ms; errors if replies stop
+/// for longer than `max_gap` (the data plane must keep flowing through every
+/// restart flavor).
+fn ping_continuity(
+    target: std::net::Ipv4Addr,
+    stop: &std::sync::atomic::AtomicBool,
+    max_gap: std::time::Duration,
+) -> anyhow::Result<()> {
+    let sock = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::RAW,
+        Some(socket2::Protocol::ICMPV4),
+    )
+    .map_err(|e| anyhow::anyhow!("open ICMP socket: {e}"))?;
+    sock.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .map_err(|e| anyhow::anyhow!("set timeout: {e}"))?;
+    let dest = socket2::SockAddr::from(std::net::SocketAddrV4::new(target, 0));
+    // Distinct id so replies can't be confused with the setup ping's.
+    let id: u16 = ((std::process::id() & 0xffff) as u16) ^ 0x5aa5;
+    let mut last_reply = std::time::Instant::now();
+    let mut seq: u16 = 0;
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        let packet = icmp_echo_request(id, seq);
+        sock.send_to(&packet, &dest)
+            .map_err(|e| anyhow::anyhow!("send ICMP: {e}"))?;
+        if recv_echo_reply(&sock, id) {
+            last_reply = std::time::Instant::now();
+        }
+        let gap = last_reply.elapsed();
+        if gap > max_gap {
+            anyhow::bail!("data-plane gap: no echo reply for {gap:?} (seq {seq})");
+        }
+        seq = seq.wrapping_add(1);
+    }
+    Ok(())
 }
 
 /// Connect to the peer and immediately close — success proves the TCP handshake
@@ -502,12 +767,14 @@ fn write_config(
     opt: &Opt,
     uplink_ip: std::net::Ipv6Addr,
     peer_uplink: std::net::Ipv6Addr,
+    mtu: Option<u32>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&opt.config_dir)
         .map_err(|e| anyhow::anyhow!("create {}: {e}", opt.config_dir.display()))?;
     let path = opt.config_dir.join(format!("{}.json", opt.tunnel_name));
+    let mtu_field = mtu.map(|m| format!(",\"mtu\":{m}")).unwrap_or_default();
     let json = format!(
-        "{{\"name\":\"{}\",\"local\":\"{}\",\"remote\":\"{}\",\"mss\":\"auto\"}}\n",
+        "{{\"name\":\"{}\",\"local\":\"{}\",\"remote\":\"{}\",\"mss\":\"auto\"{mtu_field}}}\n",
         opt.tunnel_name, uplink_ip, peer_uplink
     );
     std::fs::write(&path, json).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
@@ -523,13 +790,19 @@ fn write_config(
 
 /// Spawn the daemon through the `__listenfds` wrapper, which rebuilds a
 /// systemd-style activation block from `stored_fds` (fd-store entries handed
-/// back) and then execs — via the sandbox wrapper when requested.
+/// back) and then execs — via the sandbox wrapper when requested. The
+/// daemon's stderr (its log) is captured per `generation` so the restart
+/// phases can assert on adoption markers.
 fn spawn_daemon(
     opt: &Opt,
     notify_socket: &std::path::Path,
     stored_fds: &[(std::os::fd::RawFd, &str)],
+    generation: usize,
 ) -> anyhow::Result<tokio::process::Child> {
     let me = std::env::current_exe().map_err(|e| anyhow::anyhow!("current_exe: {e}"))?;
+    let log_path = daemon_log_path(opt, generation);
+    let log = std::fs::File::create(&log_path)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", log_path.display()))?;
     let mut cmd = tokio::process::Command::new(me);
     cmd.arg("__listenfds");
     cmd.args(minisystemd::listenfds_args(stored_fds)?);
@@ -540,8 +813,11 @@ fn spawn_daemon(
         .arg(&opt.uplink)
         .arg("--config-dir")
         .arg(&opt.config_dir)
-        .env("RUST_LOG", "info")
+        // bpf=debug so pin-classification decisions are visible in the
+        // captured log when a phase assertion fails.
+        .env("RUST_LOG", "info,etherip_xdp::control::bpf=debug")
         .env("NOTIFY_SOCKET", notify_socket)
+        .stderr(std::process::Stdio::from(log))
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawn {}: {e}", opt.daemon_path.display()))

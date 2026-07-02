@@ -62,6 +62,32 @@ impl NotifyServer {
         &self.path
     }
 
+    /// Whether an `FDSTORE=1` entry for `name` is currently held.
+    pub fn stored(&self, name: &str) -> bool {
+        self.store.fds.lock().unwrap().contains_key(name)
+    }
+
+    /// The raw fd of a stored entry, for passing back on a respawn. The store
+    /// keeps holding it (as systemd would).
+    pub fn stored_fd(&self, name: &str) -> Option<std::os::fd::RawFd> {
+        self.store
+            .fds
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(std::os::fd::AsRawFd::as_raw_fd)
+    }
+
+    /// Wait until an `FDSTORE=1` for `name` arrives.
+    pub async fn wait_stored(&self, name: &str, timeout: std::time::Duration) -> bool {
+        self.wait(timeout, || self.stored(name)).await
+    }
+
+    /// Wait until no entry for `name` is held (`FDSTOREREMOVE=1` observed).
+    pub async fn wait_unstored(&self, name: &str, timeout: std::time::Duration) -> bool {
+        self.wait(timeout, || !self.stored(name)).await
+    }
+
     /// Wait until the daemon sends `FDSTOREREMOVE=1` for `name`.
     pub async fn wait_removed(&self, name: &str, timeout: std::time::Duration) -> bool {
         self.wait(timeout, || {
