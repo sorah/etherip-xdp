@@ -217,6 +217,7 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
 
     log("writing tunnel config and launching etherip-xdp");
     write_config(opt, uplink_ip, peer_uplink)?;
+    prepare_bpffs_root(opt)?;
     let notify = minisystemd::NotifyServer::spawn(&opt.config_dir.join("notify.sock"))?;
     // Seed a bogus "netns" fd-store entry: the daemon must consume it out of
     // the activation block (so varlink fd routing stays intact) and release
@@ -243,6 +244,15 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
         .wait_removed("netns", std::time::Duration::from_secs(10))
         .await;
     anyhow::ensure!(released, "daemon did not FDSTOREREMOVE the bogus netns fd");
+
+    // The data-plane maps must be pinned while the daemon runs (the bpffs root
+    // above stands in for the packaged tmpfiles.d entry).
+    let pin_dir = bpffs_instance_dir(opt);
+    for map in ["ENCAP_CONFIG", "DECAP_CONFIG", "ETHERIP_STATE"] {
+        let pin = pin_dir.join("maps").join(map);
+        anyhow::ensure!(pin.exists(), "map pin {} missing", pin.display());
+    }
+    log("map pins present");
     add_address(
         &handle,
         tunnel_idx,
@@ -256,7 +266,39 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
 
     // Stop the daemon (graceful: it tears down veths and dumps counters).
     terminate(&mut daemon).await;
+
+    // A SIGTERM stop is a full teardown: the pins must be gone with it.
+    let pin_dir = bpffs_instance_dir(opt);
+    anyhow::ensure!(
+        !pin_dir.exists(),
+        "pin dir {} survived SIGTERM teardown",
+        pin_dir.display()
+    );
+    log("pins removed on teardown");
     result
+}
+
+/// The daemon's per-uplink pin directory (`control/bpf.rs::PinPaths`).
+fn bpffs_instance_dir(opt: &Opt) -> std::path::PathBuf {
+    std::path::PathBuf::from("/sys/fs/bpf/etherip-xdp").join(&opt.uplink)
+}
+
+/// Stand-in for the packaged tmpfiles.d entry: the pin root, group-writable
+/// for the sandboxed daemon (setgid so its subdirectories inherit the group).
+fn prepare_bpffs_root(opt: &Opt) -> anyhow::Result<()> {
+    let root = std::path::Path::new("/sys/fs/bpf/etherip-xdp");
+    std::fs::create_dir_all(root).map_err(|e| anyhow::anyhow!("create {}: {e}", root.display()))?;
+    if opt.sandbox {
+        nix::unistd::chown(
+            root,
+            None,
+            Some(nix::unistd::Gid::from_raw(sandbox::DAEMON_GID)),
+        )
+        .map_err(|e| anyhow::anyhow!("chown {}: {e}", root.display()))?;
+        std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o2770))
+            .map_err(|e| anyhow::anyhow!("chmod {}: {e}", root.display()))?;
+    }
+    Ok(())
 }
 
 /// ICMP reachability plus a TCP echo exchange through the tunnel.

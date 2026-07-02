@@ -107,6 +107,10 @@ pub struct Manager {
     nl: crate::control::netlink::Netlink,
     external: ExternalInterface,
     external_decap_link: aya::programs::xdp::XdpLinkId,
+    /// bpffs pin layout when pinning is active; `None` when the pin root is
+    /// unavailable (no bpffs, no packaging dir) and the data plane is
+    /// process-lifetime only.
+    pins: Option<crate::control::bpf::PinPaths>,
     config_dirs: Vec<std::path::PathBuf>,
     /// When `Some`, each tunnel's `<name>-xdp` peer is moved into this private
     /// anonymous namespace to hide it from userland; when `None`, peers stay in
@@ -157,7 +161,33 @@ impl Manager {
         hide_peer: bool,
     ) -> anyhow::Result<Self> {
         let nl = crate::control::netlink::Netlink::connect()?;
-        let mut bpf = crate::control::bpf::Bpf::load()?;
+
+        // Pin the data-plane maps when the packaged bpffs directory is
+        // available; anything less (no bpffs, missing tmpfiles dir, no group
+        // access) degrades to a process-lifetime data plane.
+        let pins = {
+            let pins = crate::control::bpf::PinPaths::new(&external_name);
+            match pins.ensure_dirs() {
+                Ok(()) => Some(pins),
+                Err(e) => {
+                    log::warn!("bpffs pinning unavailable: {e:#}");
+                    None
+                }
+            }
+        };
+        if let Some(pins) = &pins
+            && crate::control::bpf::classify_pins(pins) == crate::control::bpf::PinState::Mismatch
+        {
+            // Partial pins (mid-setup crash) or another build's layout: not
+            // reusable, so release the kernel objects and start clean.
+            log::warn!(
+                "discarding incomplete or incompatible pins under {}",
+                pins.base().display()
+            );
+            pins.remove_all()?;
+            pins.ensure_dirs()?;
+        }
+        let mut bpf = crate::control::bpf::Bpf::load(pins.as_ref())?;
 
         let netns = if hide_peer {
             let ns = crate::control::netns::NetNs::create()?;
@@ -194,6 +224,7 @@ impl Manager {
             nl,
             external,
             external_decap_link,
+            pins,
             config_dirs,
             netns,
             tunnels: std::collections::HashMap::new(),
@@ -210,6 +241,11 @@ impl Manager {
             if let Err(e) = manager.add_tunnel(Some(path), spec).await {
                 log::error!("failed to create tunnel: {e:#}");
             }
+        }
+        // Stamp the pins as belonging to this build only now, with the data
+        // plane fully set up under it.
+        if let Err(e) = manager.bpf.write_state() {
+            log::warn!("record pinned state: {e:#}");
         }
         Ok(manager)
     }
@@ -906,6 +942,13 @@ impl Manager {
             log::warn!("cleanup: detach uplink program: {e:#}");
         }
         self.bpf.remove_uplink_redirect(self.external.index).ok();
+        // Unpin everything: with the daemon's own references dropping below,
+        // this releases the kernel's last hold on the maps.
+        if let Some(pins) = &self.pins
+            && let Err(e) = pins.remove_all()
+        {
+            log::warn!("cleanup: remove pins: {e:#}");
+        }
         // Dropping `self` closes the namespace descriptor, destroying the private
         // namespace and any peers that survived individual teardown.
     }

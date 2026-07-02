@@ -63,6 +63,8 @@ etherip-xdp-common = { path = "../etherip-xdp-common", features = ["user"] }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
+aya-obj = { workspace = true }
+sha2 = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true, features = [

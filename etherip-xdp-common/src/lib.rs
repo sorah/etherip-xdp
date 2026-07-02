@@ -29,6 +29,18 @@ pub const ETHERIP_VERSION: u8 = 0x30;
 /// Outer encapsulation overhead: Ethernet (14) + IPv6 (40) + EtherIP (2).
 pub const OUTER_OVERHEAD: usize = 14 + 40 + 2;
 
+// Map capacities, shared by the eBPF map declarations and the userspace
+// validator that decides whether an existing set of bpffs pins is still
+// compatible with this build (see `control/bpf.rs` in the daemon).
+/// `ENCAP_CONFIG` capacity (tunnels per uplink).
+pub const ENCAP_CONFIG_MAX_ENTRIES: u32 = 256;
+/// `DECAP_CONFIG` capacity (tunnels per uplink).
+pub const DECAP_CONFIG_MAX_ENTRIES: u32 = 256;
+/// `REDIRECT_UPLINK` capacity (single uplink per process).
+pub const REDIRECT_UPLINK_MAX_ENTRIES: u32 = 1;
+/// `REDIRECT_PEER` capacity (veth peers).
+pub const REDIRECT_PEER_MAX_ENTRIES: u32 = 512;
+
 /// Maximum IPv6 extension headers walked on the decap path.
 pub const MAX_EXT_HEADERS: usize = 6;
 /// Maximum TCP option entries scanned while MSS clamping.
@@ -93,6 +105,68 @@ pub struct DecapKey {
     pub remote: [u8; 16],
     /// Expected outer IPv6 destination (our local endpoint).
     pub local: [u8; 16],
+}
+
+/// Expected [`PinnedState::magic`] value ("eXdP", little-endian).
+pub const PINNED_STATE_MAGIC: u32 = u32::from_le_bytes(*b"eXdP");
+/// Revision of the pinned-state layout: the map schemas ([`TunnelConfig`],
+/// [`DecapKey`], capacities) and the bpffs pin paths, as one compatibility
+/// number. Bump on any change to those; a daemon (or external tool) finding a
+/// different revision must not touch the pinned objects beyond tearing them
+/// down.
+pub const PINNED_LAYOUT_REVISION: u32 = 1;
+
+/// Identity record stored in the pinned `ETHERIP_STATE` map (a 1-entry array
+/// on bpffs, next to the data-plane maps). This is the cross-process contract
+/// for the pinned data plane: it names who created the pins
+/// ([`Self::pkg_version`]), which schema they follow
+/// ([`Self::layout_revision`]), and the exact eBPF object behind the attached
+/// programs ([`Self::obj_digest`], used to skip the program swap when a
+/// restarted daemon embeds the identical object).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinnedState {
+    /// [`PINNED_STATE_MAGIC`].
+    pub magic: u32,
+    /// [`PINNED_LAYOUT_REVISION`] at the time the pins were created.
+    pub layout_revision: u32,
+    /// NUL-padded `CARGO_PKG_VERSION` of the daemon that wrote the record.
+    /// Informational (logging, external tooling); compatibility is governed by
+    /// `layout_revision` alone.
+    pub pkg_version: [u8; 32],
+    /// SHA-256 of the embedded eBPF object bytes.
+    pub obj_digest: [u8; 32],
+}
+
+impl PinnedState {
+    /// Build the record for the running daemon.
+    pub fn new(pkg_version: &str, obj_digest: [u8; 32]) -> Self {
+        let mut version = [0u8; 32];
+        let src = pkg_version.as_bytes();
+        let n = src.len().min(version.len());
+        version[..n].copy_from_slice(&src[..n]);
+        PinnedState {
+            magic: PINNED_STATE_MAGIC,
+            layout_revision: PINNED_LAYOUT_REVISION,
+            pkg_version: version,
+            obj_digest,
+        }
+    }
+
+    /// Whether the record was written by a build speaking this layout.
+    pub fn is_compatible(&self) -> bool {
+        self.magic == PINNED_STATE_MAGIC && self.layout_revision == PINNED_LAYOUT_REVISION
+    }
+
+    /// The recorded package version, for logging.
+    pub fn pkg_version_str(&self) -> &str {
+        let end = self
+            .pkg_version
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.pkg_version.len());
+        core::str::from_utf8(&self.pkg_version[..end]).unwrap_or("")
+    }
 }
 
 // Per-path debug counters (indices into the PERCPU_ARRAY). Mirrors the Go
@@ -221,6 +295,11 @@ unsafe impl aya::Pod for TunnelConfig {}
 // with no padding, so any byte pattern is a valid value (aya `Pod` contract).
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for DecapKey {}
+// SAFETY: `PinnedState` is `#[repr(C)]`, `Copy`, two naturally-aligned `u32`s
+// followed by byte arrays — no padding, no invalid bit patterns (aya `Pod`
+// contract).
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for PinnedState {}
 
 #[cfg(test)]
 mod tests {
@@ -283,6 +362,40 @@ mod tests {
     #[test]
     fn counter_names_cover_all() {
         assert_eq!(COUNTER_NAMES.len(), DBG_MAX as usize);
+    }
+
+    #[test]
+    fn pinned_state_round_trip() {
+        let digest = [0xabu8; 32];
+        let s = PinnedState::new("0.1.0", digest);
+        assert!(s.is_compatible());
+        assert_eq!(s.pkg_version_str(), "0.1.0");
+        assert_eq!(s.obj_digest, digest);
+    }
+
+    #[test]
+    fn pinned_state_truncates_long_version() {
+        let long = "1.2.3-a-very-long-prerelease-identifier-string";
+        let s = PinnedState::new(long, [0u8; 32]);
+        assert_eq!(s.pkg_version_str().len(), 32);
+        assert!(long.starts_with(s.pkg_version_str()));
+    }
+
+    #[test]
+    fn pinned_state_incompatible_on_magic_or_revision() {
+        let mut s = PinnedState::new("0.1.0", [0u8; 32]);
+        s.magic ^= 1;
+        assert!(!s.is_compatible());
+        let mut s = PinnedState::new("0.1.0", [0u8; 32]);
+        s.layout_revision += 1;
+        assert!(!s.is_compatible());
+    }
+
+    #[test]
+    fn pinned_state_has_no_padding() {
+        // The struct is a bpffs map value read by external tooling; its size
+        // must be exactly the sum of its fields on every target.
+        assert_eq!(core::mem::size_of::<PinnedState>(), 4 + 4 + 32 + 32);
     }
 
     #[test]
