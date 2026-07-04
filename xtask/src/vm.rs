@@ -341,6 +341,7 @@ fn linux_scenario_args(role: &str, timeout_secs: u64) -> Vec<String> {
         "--load-veth".into(),
         "--timeout-secs".into(),
         timeout_secs.to_string(),
+        "--restart-scenarios".into(),
     ]
 }
 

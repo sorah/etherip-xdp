@@ -44,8 +44,9 @@ Ethernet 14) and can be overridden per tunnel.
 The `<name>-xdp` peer is purely an internal artefact of driving encap through
 XDP, so by default it is moved into a daemon-private, anonymous network
 namespace; it never shows up in `ip link` (or `ip netns list`) and is destroyed
-when the daemon exits. Only the user-facing `<name>` end stays in the host
-namespace.
+when the daemon stops for good (across restarts it survives in the systemd fd
+store; see [Graceful restart](#graceful-restart)). Only the user-facing
+`<name>` end stays in the host namespace.
 
 Decap and encap therefore redirect across the namespace boundary, which
 native-mode XDP supports (the same path container networking uses). Pass
@@ -168,6 +169,56 @@ or extend the on-disk `/etc` config without touching it; the directory is kept
 across daemon restarts (`RuntimeDirectoryPreserve=yes`) and cleared only at
 reboot.
 
+## Graceful restart
+
+Restarting the daemon (`systemctl restart`, a package upgrade, or a crash with
+`Restart=`) does not interrupt the data plane: the kernel side keeps forwarding
+while userspace is down, and the next instance adopts it instead of rebuilding.
+`systemctl stop` remains a full teardown. Three mechanisms make this work:
+
+- **bpffs pins.** The maps and every XDP bpf_link are pinned under
+  `/sys/fs/bpf/etherip-xdp/<uplink>/` (`maps/<NAME>`, `links/decap`,
+  `links/tunnels/<name>/{encap,pass}`), so the kernel objects — and the live
+  tunnel state in the maps — outlive the process. The directory is created by
+  tmpfiles.d as setgid `etherip-xdp-sock`, and the daemon opens its pins to the
+  group, because each `DynamicUser` instance may run as a different uid.
+- **The systemd fd store.** The hidden peer namespace is anonymous (an open
+  descriptor, no bind mount — which could not survive the unit's private mount
+  namespace anyway), so the daemon parks the descriptor in the service
+  manager's fd store (`FDSTORE=1`, `FDNAME=netns`) and receives it back through
+  the socket-activation protocol on the next start. It is validated with
+  `NS_GET_NSTYPE` before reuse and removed from the store on full teardown.
+- **`RestartKillSignal=SIGUSR2`.** A restart delivers SIGUSR2 instead of
+  SIGTERM, telling the daemon to exit *without* teardown: it drops its handles
+  and leaves the pins, veths, and stored netns in place. A crash trivially does
+  the same. SIGUSR2 falls back to a full teardown when the data plane cannot
+  actually survive (no bpffs, a pre-5.9 netlink-mode attach that bpf_link
+  cannot express, or a netns that could not be stored);
+  `--disable-graceful-restart` forces that behavior throughout.
+
+On start, existing pins are validated before reuse: a pinned `ETHERIP_STATE`
+map records the pin-layout revision, the writing package version, and the
+SHA-256 of the embedded eBPF object, and each map's kernel-reported shape is
+checked against this build's expectations. Anything incompatible or partial (a
+mid-setup crash) is discarded for a clean start — a brief interruption instead
+of undefined behavior. The record also makes the pinned state safely
+identifiable by tooling other than the daemon.
+
+With compatible pins, adoption then either leaves the attached programs
+untouched (the recorded digest matches, i.e. the eBPF object is byte-identical
+— the common restart) or atomically replaces the program behind every adopted
+link with `BPF_LINK_UPDATE`, which swaps without dropping a packet. Each link
+is adopted only if it is still what its device runs (the pinned link's program
+id must match the device's `IFLA_XDP` id); a tunnel whose device was deleted or
+replaced while the daemon was down is recreated instead. Finally the current
+config is reconciled: adopted tunnels get a normal in-place update (applying
+anything edited while down), tunnels removed from the config are torn down, and
+map entries owned by no tunnel are swept. The state record is written last, so
+a crash mid-adoption can never masquerade as an already-updated data plane.
+
+One visible side effect: the debug counters live in a pinned map, so their
+totals accumulate across restarts rather than starting from zero.
+
 ## Management plane
 
 Status is exposed over a [varlink](https://varlink.org/) interface,
@@ -209,10 +260,12 @@ root. (A shared `DynamicUser` could not do this: systemd parks a shared
 `RuntimeDirectory` under `/run/private` at `0700`.)
 
 The daemon itself needs a focused capability set,
-`CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN`
-(the last for `unshare(CLONE_NEWNET)`, dropped by `--disable-veth-peer-netns`),
-under full `systemd-analyze security` sandboxing. The manager needs no
-capabilities at all.
+`CAP_NET_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_NET_RAW CAP_SYS_ADMIN
+CAP_DAC_READ_SEARCH` (`CAP_SYS_ADMIN` for `unshare(CLONE_NEWNET)`, dropped by
+`--disable-veth-peer-netns`; `CAP_DAC_READ_SEARCH` to traverse the `0700`
+root-only `/sys/fs/bpf` mount to the graceful-restart pin directory), under
+full `systemd-analyze security` sandboxing. The manager needs no capabilities
+at all.
 
 ## Debug counters
 

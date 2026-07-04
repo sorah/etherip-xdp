@@ -42,8 +42,8 @@ pub struct RunningTunnel {
     next_hop_on_link: bool,
     /// Observed kernel neighbour state for the next hop, if looked up.
     neigh_state: Option<crate::control::netlink::NeighState>,
-    encap_link: aya::programs::xdp::XdpLinkId,
-    pass_link: aya::programs::xdp::XdpLinkId,
+    encap_link: crate::control::bpf::Attachment,
+    pass_link: crate::control::bpf::Attachment,
 }
 
 fn peer_name(name: &str) -> String {
@@ -106,12 +106,19 @@ pub struct Manager {
     bpf: crate::control::bpf::Bpf,
     nl: crate::control::netlink::Netlink,
     external: ExternalInterface,
-    external_decap_link: aya::programs::xdp::XdpLinkId,
+    external_decap_link: crate::control::bpf::Attachment,
+    /// bpffs pin layout when pinning is active; `None` when the pin root is
+    /// unavailable (no bpffs, no packaging dir) and the data plane is
+    /// process-lifetime only.
+    pins: Option<crate::control::bpf::PinPaths>,
     config_dirs: Vec<std::path::PathBuf>,
     /// When `Some`, each tunnel's `<name>-xdp` peer is moved into this private
     /// anonymous namespace to hide it from userland; when `None`, peers stay in
     /// the host namespace alongside the user-facing ends.
     netns: Option<crate::control::netns::NetNs>,
+    /// Whether the hidden netns descriptor is parked in the systemd fd store,
+    /// i.e. survives this process.
+    netns_stored: bool,
     tunnels: std::collections::HashMap<String, RunningTunnel>,
 }
 
@@ -148,22 +155,142 @@ async fn wait_for_external(
     }
 }
 
+/// State recovered by `main()` for a possible graceful restart.
+pub struct RestartContext {
+    /// The hidden-netns descriptor handed back by the systemd fd store.
+    pub netns_fd: Option<std::os::fd::OwnedFd>,
+    /// `false` disables pinning and adoption entirely
+    /// (`--disable-graceful-restart`): every start attaches fresh, every exit
+    /// tears down.
+    pub graceful: bool,
+}
+
 impl Manager {
     /// Load the eBPF object, attach the main program to the uplink, and create
-    /// all tunnels from the config directory.
+    /// all tunnels from the config directory — adopting whatever a previous
+    /// instance left pinned instead of recreating it, so a daemon restart
+    /// does not interrupt the data plane.
     pub async fn start(
         external_name: String,
         config_dirs: Vec<std::path::PathBuf>,
         hide_peer: bool,
+        ctx: RestartContext,
     ) -> anyhow::Result<Self> {
         let nl = crate::control::netlink::Netlink::connect()?;
-        let mut bpf = crate::control::bpf::Bpf::load()?;
+        let RestartContext { netns_fd, graceful } = ctx;
 
-        let netns = if hide_peer {
-            let ns = crate::control::netns::NetNs::create()?;
-            log::info!("hiding veth peers in a private anonymous network namespace");
-            Some(ns)
+        // Pin the data-plane maps when the packaged bpffs directory is
+        // available; anything less (no bpffs, missing tmpfiles dir, no group
+        // access) degrades to a process-lifetime data plane.
+        let pins = if graceful {
+            let pins = crate::control::bpf::PinPaths::new(&external_name);
+            match pins.ensure_dirs() {
+                Ok(()) => Some(pins),
+                Err(e) => {
+                    log::warn!("bpffs pinning unavailable: {e:#}");
+                    None
+                }
+            }
         } else {
+            // Pinning disabled: also drop whatever an earlier (graceful) run
+            // left behind, so nothing keeps running unowned.
+            let stale = crate::control::bpf::PinPaths::new(&external_name);
+            if let Err(e) = stale.remove_all() {
+                log::warn!("remove pins left by a previous run: {e:#}");
+            }
+            None
+        };
+
+        let mut adoptable = false;
+        if let Some(pins) = &pins {
+            match crate::control::bpf::classify_pins(pins) {
+                crate::control::bpf::PinState::Absent => {}
+                crate::control::bpf::PinState::Compatible => adoptable = true,
+                crate::control::bpf::PinState::Mismatch => {
+                    // Partial pins (mid-setup crash) or another build's layout:
+                    // not reusable, so release the kernel objects, start clean.
+                    log::warn!(
+                        "discarding incomplete or incompatible pins under {}",
+                        pins.base().display()
+                    );
+                    pins.remove_all()?;
+                    pins.ensure_dirs()?;
+                }
+            }
+        }
+        let mut bpf = crate::control::bpf::Bpf::load(pins.as_ref())?;
+
+        // With compatible pins in hand, decide what to do about the attached
+        // programs: identical object -> leave them running, otherwise swap
+        // each adopted link's program atomically (BPF_LINK_UPDATE).
+        let adopt_mode = if adoptable {
+            match bpf.read_state() {
+                Some(prev) if prev.obj_digest == crate::control::bpf::object_digest() => {
+                    log::info!("eBPF object unchanged; leaving attached programs in place");
+                    Some(crate::control::bpf::AdoptMode::SkipIdentical)
+                }
+                Some(prev) => {
+                    log::info!(
+                        "eBPF object changed ({} -> {}); updating attached programs atomically",
+                        prev.pkg_version_str(),
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    Some(crate::control::bpf::AdoptMode::UpdateLinks)
+                }
+                None => Some(crate::control::bpf::AdoptMode::UpdateLinks),
+            }
+        } else {
+            None
+        };
+
+        // The hidden netns: prefer the descriptor preserved in the fd store
+        // (its veth peers are what the adopted links are attached to); anything
+        // else gets a fresh namespace, parked in the store for the next
+        // instance when the rest of the data plane is also restart-safe.
+        let mut netns_stored = false;
+        let netns = if hide_peer {
+            let adopted = match netns_fd {
+                Some(fd) if adopt_mode.is_some() => {
+                    match crate::control::netns::NetNs::from_fd(fd) {
+                        Ok(ns) => Some(ns),
+                        Err(e) => {
+                            log::warn!("stored netns fd unusable: {e:#}");
+                            None
+                        }
+                    }
+                }
+                Some(_) => None, // pins gone: the old namespace's peers are useless
+                None => None,
+            };
+            match adopted {
+                Some(ns) => {
+                    log::info!("adopted the hidden netns from the fd store");
+                    netns_stored = true;
+                    Some(ns)
+                }
+                None => {
+                    // Drop a discarded stored fd before storing a fresh one
+                    // (FileDescriptorStoreMax=1).
+                    if let Err(e) = crate::control::systemd::remove_stored_netns() {
+                        log::debug!("remove stored netns fd: {e:#}");
+                    }
+                    let ns = crate::control::netns::NetNs::create()?;
+                    log::info!("hiding veth peers in a private anonymous network namespace");
+                    if pins.is_some() && crate::control::systemd::notify_socket_available() {
+                        match crate::control::systemd::store_netns_fd(ns.borrow_fd()) {
+                            Ok(()) => netns_stored = true,
+                            Err(e) => log::warn!("store netns fd: {e:#}"),
+                        }
+                    }
+                    Some(ns)
+                }
+            }
+        } else {
+            if netns_fd.is_some()
+                && let Err(e) = crate::control::systemd::remove_stored_netns()
+            {
+                log::debug!("remove stored netns fd: {e:#}");
+            }
             log::info!("keeping veth peers in the host namespace (--disable-veth-peer-netns)");
             None
         };
@@ -185,17 +312,41 @@ impl Manager {
             external.mtu
         );
 
-        // The shared decap program + redirect target for the uplink.
+        // The shared decap program + redirect target for the uplink. The
+        // devmap re-insert is idempotent; the kernel already dropped the entry
+        // if the device bounced while we were down.
         bpf.add_uplink_redirect(external.index)?;
-        let external_decap_link = bpf.attach_decap(&external.name)?;
+        let decap_pin = pins.as_ref().map(|p| p.decap_link());
+        let external_decap_link = match (adopt_mode, &decap_pin) {
+            (Some(mode), Some(pin)) if pin.exists() => {
+                match bpf.adopt_decap(pin, info.xdp_prog_id, mode) {
+                    Ok(att) => {
+                        log::info!("adopted the uplink decap link");
+                        att
+                    }
+                    Err(e) => {
+                        // Defunct (uplink recreated while down) or update
+                        // failure: destroy the old link so a fresh attach
+                        // doesn't hit EBUSY. Decap was already dead here, so
+                        // this adds no interruption.
+                        log::warn!("adopt uplink decap link: {e:#}; reattaching");
+                        let _ = std::fs::remove_file(pin);
+                        bpf.attach_decap(&external.name, decap_pin.as_deref())?
+                    }
+                }
+            }
+            _ => bpf.attach_decap(&external.name, decap_pin.as_deref())?,
+        };
 
         let mut manager = Manager {
             bpf,
             nl,
             external,
             external_decap_link,
+            pins,
             config_dirs,
             netns,
+            netns_stored,
             tunnels: std::collections::HashMap::new(),
         };
 
@@ -206,12 +357,55 @@ impl Manager {
                 manager.config_dirs_display()
             );
         }
+        if adopt_mode.is_some() {
+            // Config may have changed while down: pinned tunnels no longer
+            // configured are torn down before their names can collide.
+            let configured: std::collections::HashSet<String> =
+                specs.iter().map(|(_, s)| s.name.clone()).collect();
+            manager.remove_orphan_tunnels(&configured).await;
+        }
         for (path, spec) in specs {
-            if let Err(e) = manager.add_tunnel(Some(path), spec).await {
+            let adopted = match adopt_mode {
+                Some(mode) => manager
+                    .adopt_tunnel(mode, Some(path.clone()), &spec)
+                    .await
+                    .unwrap_or_else(|e| {
+                        log::warn!("tunnel {}: adoption failed: {e:#}", spec.name);
+                        false
+                    }),
+                None => false,
+            };
+            if !adopted && let Err(e) = manager.add_tunnel(Some(path), spec).await {
                 log::error!("failed to create tunnel: {e:#}");
             }
         }
+        if adopt_mode.is_some() {
+            manager.sweep_stale_map_entries();
+        }
+        // Stamp the pins as belonging to this build only now, with the data
+        // plane fully set up under it — a crash mid-adoption must re-run the
+        // program swap, never masquerade as "identical".
+        if let Err(e) = manager.bpf.write_state() {
+            log::warn!("record pinned state: {e:#}");
+        }
         Ok(manager)
+    }
+
+    /// Whether the data plane can outlive this process: pinned maps and
+    /// bpf_link attachments, plus the hidden netns parked in the fd store
+    /// (or no hidden netns at all).
+    pub fn is_graceful(&self) -> bool {
+        self.pins.is_some()
+            && !self.bpf.is_degraded()
+            && (self.netns.is_none() || self.netns_stored)
+    }
+
+    /// Exit without teardown (SIGUSR2, i.e. `systemctl restart`): drop every
+    /// in-process handle while the pinned links and maps — and the netns fd
+    /// parked in the service manager — keep packets flowing until the next
+    /// instance adopts them. Callers gate on [`Self::is_graceful`].
+    pub fn abandon(self) {
+        log::info!("leaving the data plane attached for the next daemon instance");
     }
 
     /// Render the searched config directories for log messages.
@@ -307,7 +501,8 @@ impl Manager {
         &mut self,
         peer: &str,
         mtu: u32,
-    ) -> anyhow::Result<(u32, aya::programs::xdp::XdpLinkId)> {
+        encap_pin: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<(u32, crate::control::bpf::Attachment)> {
         let peer_host_index = self
             .nl
             .index_of(peer)
@@ -317,7 +512,7 @@ impl Manager {
         match &self.netns {
             None => {
                 self.nl.set_mtu_up(peer_host_index, mtu).await?;
-                let encap_link = self.bpf.attach_encap(peer)?;
+                let encap_link = self.bpf.attach_encap(peer, encap_pin.as_deref())?;
                 self.bpf.add_peer_redirect(peer_host_index)?;
                 Ok((peer_host_index, encap_link))
             }
@@ -343,7 +538,9 @@ impl Manager {
                         nl.set_mtu_up(idx, mtu).await?;
                         anyhow::Ok(idx)
                     })?;
-                    let encap_link = bpf.attach_encap(peer)?;
+                    // The pin lands on the host-wide bpffs: mount namespaces are
+                    // untouched by the netns switch.
+                    let encap_link = bpf.attach_encap(peer, encap_pin.as_deref())?;
                     bpf.add_peer_redirect(peer_index)?;
                     anyhow::Ok((peer_index, encap_link))
                 })
@@ -370,6 +567,187 @@ impl Manager {
         }
     }
 
+    /// Look up a veth peer where it lives: the hidden namespace when peers are
+    /// hidden, the host namespace otherwise.
+    async fn peer_link_info(
+        &self,
+        peer: &str,
+    ) -> anyhow::Result<Option<crate::control::netlink::LinkInfo>> {
+        match &self.netns {
+            None => self.nl.link_info(peer).await,
+            Some(ns) => ns.run_in(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("build hidden-netns runtime: {e}"))?;
+                rt.block_on(async {
+                    crate::control::netlink::Netlink::connect()?
+                        .link_info(peer)
+                        .await
+                })
+            }),
+        }
+    }
+
+    /// Adopt one tunnel left running by the previous instance: both veth ends
+    /// alive, both link pins live on their devices. Returns `Ok(false)` when
+    /// any precondition fails and the tunnel should be recreated instead
+    /// (interrupting only that tunnel). On success the recorded `ENCAP_CONFIG`
+    /// entry reconstructs the runtime state, and a normal in-place update then
+    /// applies whatever changed in the config while the daemon was down.
+    async fn adopt_tunnel(
+        &mut self,
+        mode: crate::control::bpf::AdoptMode,
+        config_path: Option<std::path::PathBuf>,
+        spec: &crate::control::config::TunnelSpec,
+    ) -> anyhow::Result<bool> {
+        validate_name(&spec.name)?;
+        let name = spec.name.clone();
+        let peer = peer_name(&name);
+        let Some(pins) = self.pins.clone() else {
+            return Ok(false);
+        };
+        let encap_pin = pins.tunnel_link(&name, crate::control::bpf::LinkKind::Encap);
+        let pass_pin = pins.tunnel_link(&name, crate::control::bpf::LinkKind::Pass);
+        if !encap_pin.exists() || !pass_pin.exists() {
+            return Ok(false);
+        }
+        let Some(user) = self.nl.link_info(&name).await? else {
+            return Ok(false);
+        };
+        let Some(peer_info) = self.peer_link_info(&peer).await? else {
+            return Ok(false);
+        };
+
+        let encap_link = match self
+            .bpf
+            .adopt_encap(&encap_pin, peer_info.xdp_prog_id, mode)
+        {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("tunnel {name}: adopt encap link: {e:#}; recreating");
+                return Ok(false);
+            }
+        };
+        let pass_link = match self.bpf.adopt_pass(&pass_pin, user.xdp_prog_id, mode) {
+            Ok(l) => l,
+            Err(e) => {
+                log::warn!("tunnel {name}: adopt pass link: {e:#}; recreating");
+                self.bpf.detach(encap_link).ok();
+                return Ok(false);
+            }
+        };
+        // Re-register the peer redirect from inside its namespace (devmap
+        // entries resolve the ifindex against the caller's netns); the kernel
+        // kept the existing entry alive with the device, so this is a no-op
+        // re-insert in the common case.
+        match &self.netns {
+            None => self.bpf.add_peer_redirect(peer_info.index)?,
+            Some(ns) => {
+                let bpf = &mut self.bpf;
+                ns.run_in(|| bpf.add_peer_redirect(peer_info.index))?;
+            }
+        }
+
+        // The persisted encap entry is the previous instance's record of the
+        // tunnel; no entry means it was still pending (entries withheld).
+        let (config, decap_key, effective_src) = match self.bpf.get_encap(peer_info.index)? {
+            Some(mut cfg) => {
+                // The veth's actual MAC is the ground truth the update below
+                // diffs against.
+                cfg.tunnel_mac = user.mac;
+                let (decap_key, effective_src) = reconstruct_adopted_state(&cfg);
+                (cfg, decap_key, effective_src)
+            }
+            None => {
+                let unspecified = std::net::Ipv6Addr::UNSPECIFIED;
+                let config = self.build_config(
+                    spec,
+                    peer_info.index,
+                    unspecified,
+                    user.mac,
+                    [0u8; 6],
+                    user.mtu as i32,
+                );
+                (config, Self::decap_key(unspecified, spec.remote), None)
+            }
+        };
+        self.tunnels.insert(
+            name.clone(),
+            RunningTunnel {
+                spec: spec.clone(),
+                config_path: config_path.clone(),
+                peer_index: peer_info.index,
+                // The veth's live MTU, so an offline config change is seen as
+                // a change by the update below.
+                tunnel_mtu: user.mtu as i32,
+                config,
+                decap_key,
+                effective_src,
+                next_hop: None,
+                next_hop_on_link: false,
+                neigh_state: None,
+                encap_link,
+                pass_link,
+            },
+        );
+        log::info!("tunnel {name}: adopted running data plane");
+        self.update_tunnel(config_path, spec.clone()).await?;
+        Ok(true)
+    }
+
+    /// Tear down pinned tunnels whose names vanished from the config while the
+    /// daemon was down. Unlinking the pins drops the links' last references;
+    /// deleting the user-facing end removes the veth pair.
+    async fn remove_orphan_tunnels(&mut self, configured: &std::collections::HashSet<String>) {
+        let Some(pins) = self.pins.clone() else {
+            return;
+        };
+        for name in pins.list_pinned_tunnels() {
+            if configured.contains(&name) {
+                continue;
+            }
+            log::info!("tunnel {name}: removed from config while down; tearing down leftovers");
+            if let Err(e) = pins.remove_tunnel_dir(&name) {
+                log::warn!("tunnel {name}: remove link pins: {e:#}");
+            }
+            self.nl.delete_link(&name).await.ok();
+        }
+    }
+
+    /// Drop `ENCAP_CONFIG`/`DECAP_CONFIG` entries owned by no running tunnel —
+    /// leftovers of tunnels that changed or disappeared while the daemon was
+    /// down. The devmaps need no sweep: the kernel clears their entries when a
+    /// device goes away.
+    fn sweep_stale_map_entries(&mut self) {
+        let owned_peers: std::collections::HashSet<u32> =
+            self.tunnels.values().map(|t| t.peer_index).collect();
+        let owned_keys: std::collections::HashSet<etherip_xdp_common::DecapKey> = self
+            .tunnels
+            .values()
+            .filter(|t| t.effective_src.is_some())
+            .map(|t| t.decap_key)
+            .collect();
+        match self.bpf.encap_keys() {
+            Ok(keys) => {
+                for key in stale_entries(keys, &owned_peers) {
+                    log::info!("sweeping stale encap entry for ifindex {key}");
+                    self.bpf.remove_encap(key).ok();
+                }
+            }
+            Err(e) => log::warn!("sweep encap entries: {e:#}"),
+        }
+        match self.bpf.decap_keys() {
+            Ok(keys) => {
+                for key in stale_entries(keys, &owned_keys) {
+                    log::info!("sweeping a stale decap entry");
+                    self.bpf.remove_decap(&key).ok();
+                }
+            }
+            Err(e) => log::warn!("sweep decap entries: {e:#}"),
+        }
+    }
+
     /// Create a new tunnel: veth pair, MTU/offload, map population, attach.
     async fn add_tunnel(
         &mut self,
@@ -387,6 +765,17 @@ impl Manager {
         // Recover from a previous unclean exit (mirrors the Go behaviour).
         self.nl.delete_link(&name).await.ok();
         self.nl.create_veth(&name, &peer).await?;
+
+        let (encap_pin, pass_pin) = match &self.pins {
+            Some(pins) => {
+                pins.ensure_tunnel_dir(&name)?;
+                (
+                    Some(pins.tunnel_link(&name, crate::control::bpf::LinkKind::Encap)),
+                    Some(pins.tunnel_link(&name, crate::control::bpf::LinkKind::Pass)),
+                )
+            }
+            None => (None, None),
+        };
 
         let user = self
             .nl
@@ -420,7 +809,7 @@ impl Manager {
         // private namespace: moving the link reassigns its ifindex there and
         // resets it to down, and both the XDP attach and the devmap insert resolve
         // the ifindex against the calling namespace.
-        let (peer_index, encap_link) = self.setup_peer(&peer, mtu).await?;
+        let (peer_index, encap_link) = self.setup_peer(&peer, mtu, encap_pin).await?;
 
         self.warn_if_src_unassigned(&spec).await;
         let resolved = match crate::control::resolver::resolve_endpoint(
@@ -444,7 +833,7 @@ impl Manager {
 
         // The user-facing end stays in the host namespace; its pass-through attach
         // satisfies the kernel's `veth_xdp_xmit` peer check for redirected frames.
-        let pass_link = self.bpf.attach_pass(&name)?;
+        let pass_link = self.bpf.attach_pass(&name, pass_pin.as_deref())?;
 
         // Without a source address (auto-select found no route yet) the tunnel is
         // pending: withhold the map entries so the data path never encapsulates
@@ -517,15 +906,20 @@ impl Manager {
         let Some(t) = self.tunnels.remove(name) else {
             return Ok(());
         };
-        if let Err(e) = self.bpf.detach_encap(t.encap_link) {
+        if let Err(e) = self.bpf.detach(t.encap_link) {
             log::warn!("tunnel {name}: detach encap: {e:#}");
         }
-        if let Err(e) = self.bpf.detach_pass(t.pass_link) {
+        if let Err(e) = self.bpf.detach(t.pass_link) {
             log::warn!("tunnel {name}: detach pass: {e:#}");
         }
         self.bpf.remove_encap(t.peer_index).ok();
         self.bpf.remove_decap(&t.decap_key).ok();
         self.bpf.remove_peer_redirect(t.peer_index).ok();
+        if let Some(pins) = &self.pins
+            && let Err(e) = pins.remove_tunnel_dir(name)
+        {
+            log::warn!("tunnel {name}: remove link pins: {e:#}");
+        }
         // Deleting the user-facing end removes the whole veth pair, including the
         // peer in the private namespace; the namespace itself outlives it for the
         // next tunnel and is torn down only when the daemon exits.
@@ -902,13 +1296,56 @@ impl Manager {
                 log::error!("cleanup: remove {name}: {e:#}");
             }
         }
-        if let Err(e) = self.bpf.detach_decap(self.external_decap_link) {
+        let Manager {
+            mut bpf,
+            external,
+            external_decap_link,
+            pins,
+            netns,
+            ..
+        } = self;
+        if let Err(e) = bpf.detach(external_decap_link) {
             log::warn!("cleanup: detach uplink program: {e:#}");
         }
-        self.bpf.remove_uplink_redirect(self.external.index).ok();
-        // Dropping `self` closes the namespace descriptor, destroying the private
-        // namespace and any peers that survived individual teardown.
+        bpf.remove_uplink_redirect(external.index).ok();
+        // Unpin everything: with the daemon's own references dropping below,
+        // this releases the kernel's last hold on the maps.
+        if let Some(pins) = &pins
+            && let Err(e) = pins.remove_all()
+        {
+            log::warn!("cleanup: remove pins: {e:#}");
+        }
+        // Dropping the namespace descriptor destroys the private namespace and
+        // any peers that survived individual teardown.
+        drop(netns);
     }
+}
+
+/// Rebuild a tunnel's runtime identity from the `ENCAP_CONFIG` entry the
+/// previous instance persisted: the decap demux key and the effective outer
+/// source. An unspecified source cannot occur in an installed entry (pending
+/// tunnels withhold their entries), but map to "pending" anyway. Pure, so the
+/// round trip against `build_config`/`decap_key` is unit-tested.
+fn reconstruct_adopted_state(
+    cfg: &etherip_xdp_common::TunnelConfig,
+) -> (etherip_xdp_common::DecapKey, Option<std::net::Ipv6Addr>) {
+    let src = std::net::Ipv6Addr::from(cfg.src_addr);
+    let decap_key = etherip_xdp_common::DecapKey {
+        remote: cfg.dst_addr,
+        local: cfg.src_addr,
+    };
+    (decap_key, (!src.is_unspecified()).then_some(src))
+}
+
+/// Observed map keys not owned by any running tunnel. Pure sweep core.
+fn stale_entries<K: Eq + std::hash::Hash>(
+    observed: Vec<K>,
+    owned: &std::collections::HashSet<K>,
+) -> Vec<K> {
+    observed
+        .into_iter()
+        .filter(|k| !owned.contains(k))
+        .collect()
 }
 
 /// A real neighbour MAC is never all-zero, so a zero `dst_mac` after resolution
@@ -1022,6 +1459,34 @@ mod tests {
         let old = running(&[a1]);
         let diff = diff_specs(&old, std::slice::from_ref(&a2));
         assert_eq!(diff.updated, vec![a2]);
+    }
+
+    #[test]
+    fn reconstruct_round_trips_installed_state() {
+        // An installed entry records src/dst as add_tunnel wrote them; the
+        // reconstruction must yield the same decap key and source.
+        let src: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let remote: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let mut cfg = etherip_xdp_common::TunnelConfig::zeroed();
+        cfg.src_addr = src.octets();
+        cfg.dst_addr = remote.octets();
+        let (key, eff) = reconstruct_adopted_state(&cfg);
+        assert_eq!(key, Manager::decap_key(src, remote));
+        assert_eq!(eff, Some(src));
+    }
+
+    #[test]
+    fn reconstruct_maps_unspecified_src_to_pending() {
+        let cfg = etherip_xdp_common::TunnelConfig::zeroed();
+        let (_, eff) = reconstruct_adopted_state(&cfg);
+        assert_eq!(eff, None);
+    }
+
+    #[test]
+    fn stale_entries_filter_owned() {
+        let owned: std::collections::HashSet<u32> = [3u32, 7].into_iter().collect();
+        assert_eq!(stale_entries(vec![1, 3, 5, 7], &owned), vec![1, 5]);
+        assert_eq!(stale_entries(Vec::<u32>::new(), &owned), Vec::<u32>::new());
     }
 
     #[test]

@@ -9,6 +9,11 @@ pub struct LinkInfo {
     pub index: u32,
     pub mac: [u8; 6],
     pub mtu: u32,
+    /// BPF program id of the device's active XDP attachment (`IFLA_XDP`).
+    /// Adoption of a pinned link requires this to match the link's recorded
+    /// program — a pinned link whose device was deleted or replaced is defunct
+    /// while the device reports no (or another) program.
+    pub xdp_prog_id: Option<u32>,
 }
 
 /// Result of a route lookup.
@@ -144,6 +149,7 @@ impl Netlink {
         let index = msg.header.index;
         let mut mac = [0u8; 6];
         let mut mtu = 0u32;
+        let mut xdp_prog_id = None;
         for attr in msg.attributes {
             match attr {
                 rtnetlink::packet_route::link::LinkAttribute::Address(bytes) => {
@@ -152,10 +158,22 @@ impl Netlink {
                     }
                 }
                 rtnetlink::packet_route::link::LinkAttribute::Mtu(m) => mtu = m,
+                rtnetlink::packet_route::link::LinkAttribute::Xdp(xdp) => {
+                    for nla in xdp {
+                        if let rtnetlink::packet_route::link::LinkXdp::ProgId(id) = nla {
+                            xdp_prog_id = Some(id);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
-        Ok(Some(LinkInfo { index, mac, mtu }))
+        Ok(Some(LinkInfo {
+            index,
+            mac,
+            mtu,
+            xdp_prog_id,
+        }))
     }
 
     /// Return a link's index by name, or `None` if it doesn't exist.

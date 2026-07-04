@@ -14,5 +14,6 @@ pub mod netns;
 pub mod offload;
 pub mod resolver;
 pub mod server;
+pub mod systemd;
 pub mod tunnel;
 pub mod types;

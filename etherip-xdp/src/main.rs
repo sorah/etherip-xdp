@@ -8,7 +8,13 @@
 //! This binary is a thin entry point; the control plane lives in
 //! [`etherip_xdp::control`].
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    etherip_xdp::control::daemon::run().await
+fn main() -> anyhow::Result<()> {
+    // SAFETY: no threads exist yet; must run before the runtime so nothing (the
+    // varlink activation listener in particular) sees fd-store entries in
+    // LISTEN_FDS.
+    let inherited = unsafe { etherip_xdp::control::systemd::take_inherited_fds()? };
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(etherip_xdp::control::daemon::run(inherited))
 }

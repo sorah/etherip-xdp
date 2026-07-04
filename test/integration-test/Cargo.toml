@@ -17,10 +17,15 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
+# Opening the pinned state map to tamper with the recorded object digest
+# (drives the daemon's atomic-swap path with an identical binary).
+aya = { workspace = true }
 caps = "0.5"
 clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context"] }
 futures-util = { workspace = true }
-nix = { workspace = true, features = ["signal", "user", "process", "fs"] }
+# `uio` for recvmsg/SCM_RIGHTS in the mini-systemd fd store (minisystemd.rs);
+# `mount` to supply a bpffs inside `ip netns exec`'s fresh mount namespace.
+nix = { workspace = true, features = ["signal", "user", "process", "fs", "uio", "mount"] }
 rtnetlink = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "process"] }

@@ -8,8 +8,9 @@ pub(crate) struct Options {
     #[clap(long, default_value = "tmp/integration/local")]
     work_dir: std::path::PathBuf,
 
-    /// Per-role scenario deadline, in seconds.
-    #[clap(long, default_value_t = 60)]
+    /// Per-role scenario deadline, in seconds. Covers the restart phases on
+    /// top of the base traffic checks.
+    #[clap(long, default_value_t = 120)]
     timeout_secs: u64,
 
     /// Run the daemon unsandboxed; by default it runs under the hardened
@@ -107,7 +108,8 @@ fn spawn_scenario(
         .arg("--config-dir")
         .arg(&config_dir)
         .arg("--timeout-secs")
-        .arg(opts.timeout_secs.to_string());
+        .arg(opts.timeout_secs.to_string())
+        .arg("--restart-scenarios");
     if !opts.no_sandbox {
         cmd.arg("--sandbox");
     }

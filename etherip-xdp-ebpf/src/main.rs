@@ -43,14 +43,20 @@ const NO_PREALLOC: u32 = aya_ebpf::bindings::BPF_F_NO_PREALLOC as u32;
 /// Per-tunnel encap parameters, keyed by the ingress (veth-peer) ifindex.
 #[aya_ebpf::macros::map]
 static ENCAP_CONFIG: aya_ebpf::maps::HashMap<u32, etherip_xdp_common::TunnelConfig> =
-    aya_ebpf::maps::HashMap::with_max_entries(256, NO_PREALLOC);
+    aya_ebpf::maps::HashMap::with_max_entries(
+        etherip_xdp_common::ENCAP_CONFIG_MAX_ENTRIES,
+        NO_PREALLOC,
+    );
 
 /// Per-tunnel decap parameters, keyed by the outer IPv6 (remote, local) pair.
 #[aya_ebpf::macros::map]
 static DECAP_CONFIG: aya_ebpf::maps::HashMap<
     etherip_xdp_common::DecapKey,
     etherip_xdp_common::TunnelConfig,
-> = aya_ebpf::maps::HashMap::with_max_entries(256, NO_PREALLOC);
+> = aya_ebpf::maps::HashMap::with_max_entries(
+    etherip_xdp_common::DECAP_CONFIG_MAX_ENTRIES,
+    NO_PREALLOC,
+);
 
 /// Encap redirect target: the shared uplink, keyed by its ifindex. Held separate
 /// from [`REDIRECT_PEER`] so a veth-peer ifindex — which, when the peer lives in a
@@ -58,13 +64,15 @@ static DECAP_CONFIG: aya_ebpf::maps::HashMap<
 /// routinely takes the same small value — can never collide with the uplink key
 /// and steer encap and decap to the wrong device.
 #[aya_ebpf::macros::map]
-static REDIRECT_UPLINK: aya_ebpf::maps::DevMapHash =
-    aya_ebpf::maps::DevMapHash::with_max_entries(1, 0);
+static REDIRECT_UPLINK: aya_ebpf::maps::DevMapHash = aya_ebpf::maps::DevMapHash::with_max_entries(
+    etherip_xdp_common::REDIRECT_UPLINK_MAX_ENTRIES,
+    0,
+);
 
 /// Decap redirect targets: the veth peers, keyed by ifindex.
 #[aya_ebpf::macros::map]
 static REDIRECT_PEER: aya_ebpf::maps::DevMapHash =
-    aya_ebpf::maps::DevMapHash::with_max_entries(512, 0);
+    aya_ebpf::maps::DevMapHash::with_max_entries(etherip_xdp_common::REDIRECT_PEER_MAX_ENTRIES, 0);
 
 /// Per-CPU per-path debug counters (see `etherip_xdp_common::DBG_*`).
 #[aya_ebpf::macros::map]

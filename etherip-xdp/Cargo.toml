@@ -63,6 +63,8 @@ etherip-xdp-common = { path = "../etherip-xdp-common", features = ["user"] }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
+aya-obj = { workspace = true }
+sha2 = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 tokio = { workspace = true, features = [
@@ -85,7 +87,8 @@ serde_json = { workspace = true }
 serde_derive = "1"
 rtnetlink = { workspace = true }
 futures-util = { workspace = true }
-nix = { workspace = true }
+# `fs` for fcntl(F_DUPFD_CLOEXEC), `uio` for sendmsg/SCM_RIGHTS (control/systemd).
+nix = { workspace = true, features = ["fs", "uio"] }
 varlink = { workspace = true }
 async-trait = { workspace = true }
 

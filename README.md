@@ -35,6 +35,10 @@ who has to run it. Everything below exists to make day-2 operations
 - **Graceful, safe reload.** `systemctl reload` applies config changes in place.
   Unchanged tunnels keep forwarding and never flap; only the tunnels that
   actually changed are touched.
+- **Restarts don't stop traffic.** `systemctl restart` (a package upgrade, or a
+  crash respawn) leaves the XDP data plane attached and running; the new daemon
+  adopts it, swapping in a changed program atomically. See
+  [DESIGN.md](DESIGN.md#graceful-restart).
 - **Automatic next-hop resolution.** The daemon resolves the peer's next-hop MAC
   from the kernel routing/neighbour tables, honouring policy routing and source
   selection, and keeps it fresh as the network changes. No "ping the peer
@@ -202,7 +206,12 @@ sudo etherip-xdp eth1          # foreground, owns eth1 and its tunnels
 ```
 
 On SIGHUP it reloads config; on SIGINT/SIGTERM it prints debug counters and
-tears down all interfaces and XDP attachments.
+tears down all interfaces and XDP attachments. SIGUSR2 exits *without* teardown
+(what `systemctl restart` sends via `RestartKillSignal=`) so the next start can
+adopt the still-running data plane — but outside systemd there is no fd store
+to keep the hidden peer namespace alive, so SIGUSR2 falls back to a full
+teardown unless `--disable-veth-peer-netns` is in use. Pass
+`--disable-graceful-restart` to opt out of pinning entirely.
 
 ## How it works
 
