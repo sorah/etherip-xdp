@@ -51,8 +51,11 @@ type Tunnel (
   name: string,
   # Absolute path of the winning drop-in config file, if known.
   configPath: ?string,
-  # Configured outer source; null means auto-select.
+  # Configured outer source; null means auto-select. May carry a "/N" prefix
+  # length (64..=128) when the endpoint is a routed prefix whose host bits are
+  # filled per flow.
   configuredLocal: ?string,
+  # Remote outer endpoint; may carry a "/N" prefix length like configuredLocal.
   remote: string,
   # Effective outer source currently in use; null while pending.
   effectiveSource: ?string,

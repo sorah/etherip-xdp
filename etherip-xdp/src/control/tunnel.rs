@@ -439,14 +439,14 @@ impl Manager {
         let (mss4, mss6) = spec.mss.resolve(tunnel_mtu);
         etherip_xdp_common::TunnelConfig {
             src_addr: src.octets(),
-            dst_addr: spec.remote.octets(),
+            dst_addr: spec.remote.addr.octets(),
             internal_ifindex: peer_index,
             external_ifindex: self.external.index,
             tunnel_mac,
             external_mac: self.external.mac,
             dst_mac,
-            src_plen: 128,
-            dst_plen: 128,
+            src_plen: spec.local_plen(),
+            dst_plen: spec.remote.plen,
             mss_clamp_ipv4: mss4,
             mss_clamp_ipv6: mss6,
         }
@@ -467,10 +467,18 @@ impl Manager {
         }
     }
 
-    fn decap_key(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> etherip_xdp_common::DecapKey {
+    /// Build the (masked-base) decap demux key. `src` is the effective outer
+    /// source — for a prefixed local, its base address — and `src_plen` its
+    /// prefix length; the masking keeps the invariant explicit even though
+    /// both inputs already arrive masked.
+    fn decap_key(
+        src: std::net::Ipv6Addr,
+        src_plen: u8,
+        remote: crate::control::config::EndpointPrefix,
+    ) -> etherip_xdp_common::DecapKey {
         etherip_xdp_common::DecapKey {
-            remote: dst.octets(),
-            local: src.octets(),
+            remote: etherip_xdp_common::mask_addr(remote.addr.octets(), remote.plen),
+            local: etherip_xdp_common::mask_addr(src.octets(), src_plen),
         }
     }
 
@@ -480,7 +488,16 @@ impl Manager {
     /// reverse-path filtering. Auto-selected sources are always local, so skip.
     async fn warn_if_src_unassigned(&self, spec: &crate::control::config::TunnelSpec) {
         let Some(src) = spec.local else { return };
-        match self.nl.is_local_address(src).await {
+        if src.plen < 128 {
+            // A routed prefix is intentionally not assigned to any interface;
+            // XDP matches it before the stack ever sees the addresses.
+            log::debug!(
+                "tunnel {}: source {src} is a routed prefix; skipping the local-address check",
+                spec.name
+            );
+            return;
+        }
+        match self.nl.is_local_address(src.addr).await {
             Ok(true) => {}
             Ok(false) => log::warn!(
                 "tunnel {}: configured source {src} is not assigned to any local \
@@ -673,7 +690,7 @@ impl Manager {
                     [0u8; 6],
                     user.mtu as i32,
                 );
-                (config, Self::decap_key(unspecified, spec.remote), None)
+                (config, Self::decap_key(unspecified, 128, spec.remote), None)
             }
         };
         self.tunnels.insert(
@@ -835,8 +852,8 @@ impl Manager {
             &self.nl,
             self.external.index,
             &self.external.name,
-            spec.local,
-            spec.remote,
+            spec.local.map(|e| e.addr),
+            spec.remote.addr,
             spec.next_hop_on_link,
             crate::control::resolver::Probe::Bringup,
         )
@@ -862,7 +879,7 @@ impl Manager {
             Some(src) => {
                 let config =
                     self.build_config(&spec, peer_index, src, tunnel_mac, dst_mac, tunnel_mtu);
-                let decap_key = Self::decap_key(src, spec.remote);
+                let decap_key = Self::decap_key(src, spec.local_plen(), spec.remote);
                 self.bpf.set_encap(peer_index, &config)?;
                 self.bpf.set_decap(&decap_key, &config)?;
                 if dst_mac == [0u8; 6] {
@@ -890,7 +907,7 @@ impl Manager {
                     dst_mac,
                     tunnel_mtu,
                 );
-                let decap_key = Self::decap_key(unspecified, spec.remote);
+                let decap_key = Self::decap_key(unspecified, 128, spec.remote);
                 log::warn!(
                     "tunnel {name}: no source address resolved yet (src auto-select); \
                      pending until a route to {} appears",
@@ -1007,8 +1024,8 @@ impl Manager {
             &self.nl,
             self.external.index,
             &self.external.name,
-            spec.local,
-            spec.remote,
+            spec.local.map(|e| e.addr),
+            spec.remote.addr,
             spec.next_hop_on_link,
             crate::control::resolver::Probe::Bringup,
         )
@@ -1041,7 +1058,7 @@ impl Manager {
                 t.config_path = config_path;
                 t.tunnel_mtu = tunnel_mtu;
                 t.config = config;
-                t.decap_key = Self::decap_key(unspecified, t.spec.remote);
+                t.decap_key = Self::decap_key(unspecified, 128, t.spec.remote);
                 t.effective_src = None;
                 t.next_hop = resolved.next_hop;
                 t.next_hop_on_link = resolved.on_link;
@@ -1052,7 +1069,7 @@ impl Manager {
         };
 
         let config = self.build_config(&spec, peer_index, src, tunnel_mac, dst_mac, tunnel_mtu);
-        let new_key = Self::decap_key(src, spec.remote);
+        let new_key = Self::decap_key(src, spec.local_plen(), spec.remote);
 
         self.bpf.set_encap(peer_index, &config)?;
         if was_installed && new_key != old_key {
@@ -1177,8 +1194,8 @@ impl Manager {
                 &self.nl,
                 self.external.index,
                 &self.external.name,
-                spec.local,
-                spec.remote,
+                spec.local.map(|e| e.addr),
+                spec.remote.addr,
                 spec.next_hop_on_link,
                 probe,
             )
@@ -1215,7 +1232,7 @@ impl Manager {
                 dst_mac,
                 tunnel_mtu,
             );
-            let new_key = Self::decap_key(src, spec.remote);
+            let new_key = Self::decap_key(src, spec.local_plen(), spec.remote);
             let was_installed = eff_src.is_some();
 
             if was_installed && new_config == cur_config && new_key == cur_key {
@@ -1353,9 +1370,11 @@ fn reconstruct_adopted_state(
     cfg: &etherip_xdp_common::TunnelConfig,
 ) -> (etherip_xdp_common::DecapKey, Option<std::net::Ipv6Addr>) {
     let src = std::net::Ipv6Addr::from(cfg.src_addr);
+    // Installed addresses are already masked bases; masking here keeps the
+    // key derivation aligned with `decap_key` by construction.
     let decap_key = etherip_xdp_common::DecapKey {
-        remote: cfg.dst_addr,
-        local: cfg.src_addr,
+        remote: etherip_xdp_common::mask_addr(cfg.dst_addr, cfg.dst_plen),
+        local: etherip_xdp_common::mask_addr(cfg.src_addr, cfg.src_plen),
     };
     (decap_key, (!src.is_unspecified()).then_some(src))
 }
@@ -1409,7 +1428,11 @@ fn stale_entries<K: Eq + std::hash::Hash>(
 /// means the next hop has not resolved yet: the encap/decap entries are installed
 /// but the data path drops every frame (addressed to the null MAC) until a
 /// neighbour appears. That is a failure the operator must see, hence `warn`.
-fn warn_next_hop_unresolved(name: &str, src: std::net::Ipv6Addr, remote: std::net::Ipv6Addr) {
+fn warn_next_hop_unresolved(
+    name: &str,
+    src: std::net::Ipv6Addr,
+    remote: crate::control::config::EndpointPrefix,
+) {
     log::warn!(
         "tunnel {name}: {src} -> {remote} installed but next-hop MAC unresolved; \
          frames are dropped until a neighbour resolves"
@@ -1528,7 +1551,14 @@ mod tests {
         cfg.src_addr = src.octets();
         cfg.dst_addr = remote.octets();
         let (key, eff) = reconstruct_adopted_state(&cfg);
-        assert_eq!(key, Manager::decap_key(src, remote));
+        assert_eq!(
+            key,
+            Manager::decap_key(
+                src,
+                128,
+                crate::control::config::EndpointPrefix::host(remote)
+            )
+        );
         assert_eq!(eff, Some(src));
     }
 

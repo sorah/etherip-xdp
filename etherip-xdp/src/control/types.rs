@@ -45,8 +45,8 @@ pub enum TunnelState {
 pub struct TunnelSnapshot {
     pub name: String,
     pub config_path: Option<std::path::PathBuf>,
-    pub configured_local: Option<std::net::Ipv6Addr>,
-    pub remote: std::net::Ipv6Addr,
+    pub configured_local: Option<crate::control::config::EndpointPrefix>,
+    pub remote: crate::control::config::EndpointPrefix,
     pub effective_src: Option<std::net::Ipv6Addr>,
     pub state: TunnelState,
     pub tunnel_mtu: i32,

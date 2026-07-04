@@ -16,7 +16,12 @@
 //! instance `%i`), so it is not repeated per file. `name` defaults to the file
 //! stem. `local` may be omitted to auto-select the outer source address from the
 //! route to `remote` (the kernel's preferred source), which then tracks underlay
-//! address changes. `mss` is `"auto"` (default), `"off"`, an integer (both
+//! address changes. Both endpoints accept an optional `/N` prefix length
+//! (64..=128, e.g. `"local": "2001:db8:1::/64"`) when the underlay *routes*
+//! that prefix to the node: the bits below `/N` then carry a per-flow hash of
+//! the inner headers so transit ECMP/LAG sees flow entropy, and decap accepts
+//! any host bits within the peer's prefix. A prefixed `local` must be explicit
+//! (auto-select only ever yields a single address). `mss` is `"auto"` (default), `"off"`, an integer (both
 //! families), or `{ "ipv4": N, "ipv6": N }` (a missing family falls back to auto).
 //! `mac` sets the user-facing interface's MAC on the connected L2 domain: omit to
 //! keep the kernel-assigned address (default), `"inherit"` to copy the external
@@ -68,16 +73,61 @@ pub enum MacConfig {
     Explicit([u8; 6]),
 }
 
+/// A tunnel endpoint: base address plus prefix length. `plen == 128` is a
+/// single fixed address; 64..=127 is a routed prefix whose host bits carry the
+/// inner flow hash on encap and match any value on decap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointPrefix {
+    /// Masked base address (bits below `plen` are zero, enforced at parse).
+    pub addr: std::net::Ipv6Addr,
+    /// Prefix length, 64..=128.
+    pub plen: u8,
+}
+
+impl EndpointPrefix {
+    /// A single fixed address (`/128`).
+    pub fn host(addr: std::net::Ipv6Addr) -> Self {
+        EndpointPrefix { addr, plen: 128 }
+    }
+
+    /// Whether the two prefixes share any address (the shorter one contains
+    /// the other's base).
+    pub fn overlaps(&self, other: &EndpointPrefix) -> bool {
+        let p = self.plen.min(other.plen);
+        etherip_xdp_common::mask_addr(self.addr.octets(), p)
+            == etherip_xdp_common::mask_addr(other.addr.octets(), p)
+    }
+}
+
+impl std::fmt::Display for EndpointPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.plen == 128 {
+            write!(f, "{}", self.addr)
+        } else {
+            write!(f, "{}/{}", self.addr, self.plen)
+        }
+    }
+}
+
+impl std::str::FromStr for EndpointPrefix {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        parse_endpoint(s, "endpoint")
+    }
+}
+
 /// A fully-validated tunnel definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelSpec {
     /// Tunnel name (also the user-facing veth interface name).
     pub name: String,
     /// Local outer IPv6 endpoint. `None` means auto-select from the route to
-    /// `remote` (the kernel's preferred source), tracking underlay changes.
-    pub local: Option<std::net::Ipv6Addr>,
+    /// `remote` (the kernel's preferred source), tracking underlay changes;
+    /// auto-selected sources are always single addresses (`/128`).
+    pub local: Option<EndpointPrefix>,
     /// Remote outer IPv6 endpoint.
-    pub remote: std::net::Ipv6Addr,
+    pub remote: EndpointPrefix,
     /// MSS clamping policy.
     pub mss: MssConfig,
     /// Optional tunnel MTU override (default: external MTU minus overhead).
@@ -92,8 +142,8 @@ pub struct TunnelSpec {
 #[serde(deny_unknown_fields)]
 struct RawTunnel {
     name: Option<String>,
-    local: Option<std::net::Ipv6Addr>,
-    remote: std::net::Ipv6Addr,
+    local: Option<String>,
+    remote: String,
     mss: Option<RawMss>,
     mtu: Option<u32>,
     mac: Option<String>,
@@ -176,29 +226,116 @@ fn parse_mac(s: &str) -> anyhow::Result<[u8; 6]> {
     Ok(octets)
 }
 
-fn validate_endpoint(addr: std::net::Ipv6Addr, role: &str) -> anyhow::Result<std::net::Ipv6Addr> {
+/// Parse an endpoint as `addr` or `addr/plen` (64..=128), rejecting non-zero
+/// host bits so the stored base is always the masked prefix.
+fn parse_endpoint(s: &str, role: &str) -> anyhow::Result<EndpointPrefix> {
+    let (addr_str, plen) = match s.split_once('/') {
+        None => (s, 128u8),
+        Some((addr, plen)) => {
+            let plen: u8 = plen
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid {role} {s:?}: bad prefix length"))?;
+            if !(64..=128).contains(&plen) {
+                anyhow::bail!(
+                    "invalid {role} {s:?}: prefix length must be between 64 and 128 \
+                     (the host bits carry a 64-bit flow hash)"
+                );
+            }
+            (addr, plen)
+        }
+    };
+    let addr: std::net::Ipv6Addr = addr_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid {role} {s:?}: not an IPv6 address"))?;
     if addr.to_ipv4_mapped().is_some() {
         anyhow::bail!(
             "{role} address {addr} is an IPv4-mapped address, not a genuine IPv6 endpoint"
         );
     }
-    Ok(addr)
+    let masked = std::net::Ipv6Addr::from(etherip_xdp_common::mask_addr(addr.octets(), plen));
+    if masked != addr {
+        anyhow::bail!(
+            "{role} {s} has non-zero bits below /{plen}; the host bits are filled \
+             per flow — use {masked}/{plen}"
+        );
+    }
+    if plen < 128 && addr.is_unspecified() {
+        // The daemon uses an unspecified source as its "pending" sentinel, so a
+        // legitimately-zero base must be impossible.
+        anyhow::bail!("invalid {role} {s:?}: the all-zero prefix cannot be an endpoint");
+    }
+    Ok(EndpointPrefix { addr, plen })
+}
+
+/// Reject tunnel combinations the decap demux cannot disambiguate (or fit).
+/// Auto-selected locals are unknown until runtime, so they conservatively
+/// overlap any prefixed local and nothing else.
+pub fn validate_tunnel_set(specs: &[TunnelSpec]) -> anyhow::Result<()> {
+    let locals_overlap = |a: &TunnelSpec, b: &TunnelSpec| match (&a.local, &b.local) {
+        (Some(a), Some(b)) => a.overlaps(b),
+        (None, Some(one)) | (Some(one), None) => one.plen < 128,
+        (None, None) => false,
+    };
+    for (i, a) in specs.iter().enumerate() {
+        if let Some(local) = &a.local
+            && local.overlaps(&a.remote)
+            && (local.plen < 128 || a.remote.plen < 128)
+        {
+            anyhow::bail!(
+                "tunnel {:?}: local {} overlaps remote {} — the node would decap \
+                 its own encapsulated frames",
+                a.name,
+                local,
+                a.remote
+            );
+        }
+        for b in &specs[i + 1..] {
+            if a.remote.overlaps(&b.remote) && locals_overlap(a, b) {
+                anyhow::bail!(
+                    "tunnels {:?} (remote {}) and {:?} (remote {}) are ambiguous: \
+                     a packet could demux to either",
+                    a.name,
+                    a.remote,
+                    b.name,
+                    b.remote
+                );
+            }
+        }
+    }
+    let mut pairs: Vec<(u8, u8)> = specs
+        .iter()
+        .map(|s| (s.remote.plen, s.local_plen()))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    if pairs.len() > etherip_xdp_common::DECAP_PLEN_PAIRS_MAX {
+        anyhow::bail!(
+            "{} distinct (remote, local) prefix-length combinations exceed the \
+             decap table capacity of {}",
+            pairs.len(),
+            etherip_xdp_common::DECAP_PLEN_PAIRS_MAX
+        );
+    }
+    Ok(())
 }
 
 impl TunnelSpec {
     fn from_raw(raw: RawTunnel, default_name: &str) -> anyhow::Result<Self> {
         Ok(TunnelSpec {
             name: raw.name.unwrap_or_else(|| default_name.to_string()),
-            local: raw
-                .local
-                .map(|s| validate_endpoint(s, "local"))
-                .transpose()?,
-            remote: validate_endpoint(raw.remote, "remote")?,
+            local: raw.local.map(|s| parse_endpoint(&s, "local")).transpose()?,
+            remote: parse_endpoint(&raw.remote, "remote")?,
             mss: convert_mss(raw.mss)?,
             mtu: raw.mtu,
             mac: convert_mac(raw.mac)?,
             next_hop_on_link: convert_on_link(raw.next_hop_on_link)?,
         })
+    }
+
+    /// Prefix length of the local endpoint; an auto-selected source is always
+    /// a single address.
+    pub fn local_plen(&self) -> u8 {
+        self.local.map_or(128, |e| e.plen)
     }
 
     /// Parse a single tunnel definition from JSON text, defaulting the name to
@@ -266,6 +403,8 @@ pub async fn load_dirs(
         }
         specs.push((path, spec));
     }
+    let bare: Vec<TunnelSpec> = specs.iter().map(|(_, s)| s.clone()).collect();
+    validate_tunnel_set(&bare)?;
     Ok(specs)
 }
 
@@ -298,6 +437,128 @@ mod tests {
         // Explicit local is parsed.
         let s = spec(r#"{"local":"2001:db8::1","remote":"2001:db8::2"}"#);
         assert_eq!(s.local, Some("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn endpoint_prefix_parse_and_display() {
+        let e: EndpointPrefix = "2001:db8::1".parse().unwrap();
+        assert_eq!((e.addr.to_string().as_str(), e.plen), ("2001:db8::1", 128));
+        assert_eq!(e.to_string(), "2001:db8::1");
+
+        let e: EndpointPrefix = "2001:db8:1::/64".parse().unwrap();
+        assert_eq!((e.addr.to_string().as_str(), e.plen), ("2001:db8:1::", 64));
+        assert_eq!(e.to_string(), "2001:db8:1::/64");
+
+        let s = spec(r#"{"local":"fd00:a::/112","remote":"fd00:b::/64"}"#);
+        assert_eq!(s.local.unwrap().plen, 112);
+        assert_eq!(s.remote.plen, 64);
+        assert_eq!(s.local_plen(), 112);
+    }
+
+    #[test]
+    fn endpoint_prefix_rejects_invalid() {
+        let parse = |s: &str| TunnelSpec::from_json(&format!(r#"{{"remote":"{s}"}}"#), "t");
+        for bad in [
+            "2001:db8::/63",    // below the 64-bit hash width
+            "2001:db8::/129",   // out of range
+            "2001:db8::/x",     // not a number
+            "2001:db8::/64/64", // double suffix
+            "nonsense/64",      // not an address
+            "::ffff:1.2.3.4",   // IPv4-mapped (pre-existing rule)
+            "::/64",            // all-zero base is the pending sentinel
+        ] {
+            assert!(parse(bad).is_err(), "{bad} must be rejected");
+        }
+        // Non-zero host bits: the error suggests the masked base.
+        let err = parse("2001:db8::1/64").unwrap_err().to_string();
+        assert!(err.contains("2001:db8::/64"), "unhelpful error: {err}");
+    }
+
+    fn named(name: &str, local: Option<&str>, remote: &str) -> TunnelSpec {
+        TunnelSpec {
+            name: name.to_string(),
+            local: local.map(|l| l.parse().unwrap()),
+            remote: remote.parse().unwrap(),
+            mss: MssConfig::Auto,
+            mtu: None,
+            mac: MacConfig::Auto,
+            next_hop_on_link: crate::control::resolver::NextHopOnLink::default(),
+        }
+    }
+
+    #[test]
+    fn validate_tunnel_set_overlap_matrix() {
+        let ok = |specs: &[TunnelSpec]| validate_tunnel_set(specs).is_ok();
+
+        // Today's shapes stay legal: distinct /128s, same remote with two
+        // auto locals, same remote with an auto and an explicit /128 local.
+        assert!(ok(&[
+            named("a", Some("fd00::1"), "fd00::2"),
+            named("b", Some("fd00::1"), "fd00::3"),
+        ]));
+        assert!(ok(&[
+            named("a", None, "fd00::2"),
+            named("b", None, "fd00::2"),
+        ]));
+        assert!(ok(&[
+            named("a", None, "fd00::2"),
+            named("b", Some("fd00::9"), "fd00::2"),
+        ]));
+
+        // Distinct prefixes demux fine.
+        assert!(ok(&[
+            named("a", Some("fd00:a::/112"), "fd00:b::/112"),
+            named("b", Some("fd00:a::1:0/112"), "fd00:b::1:0/112"),
+        ]));
+
+        // Identical (remote, local) pair: one decap key, ambiguous.
+        assert!(!ok(&[
+            named("a", Some("fd00::1"), "fd00::2"),
+            named("b", Some("fd00::1"), "fd00::2"),
+        ]));
+        // Overlapping remote prefixes with overlapping locals.
+        assert!(!ok(&[
+            named("a", Some("fd00:a::/64"), "fd00:b::/64"),
+            named("b", Some("fd00:a::/64"), "fd00:b::beef:0:0:0/112"),
+        ]));
+        // An auto local cannot be proven outside a prefixed local.
+        assert!(!ok(&[
+            named("a", None, "fd00::2"),
+            named("b", Some("fd00:a::/64"), "fd00::2"),
+        ]));
+
+        // Per-tunnel: local overlapping remote decapsulates our own frames.
+        assert!(!ok(&[named("a", Some("fd00:a::/64"), "fd00:a::/112")]));
+        // ... but two equal /128s (loopback-guard territory) stay accepted.
+        assert!(ok(&[named("a", Some("fd00::1"), "fd00::1")]));
+    }
+
+    #[test]
+    fn validate_tunnel_set_caps_plen_pairs() {
+        // 9 distinct (remote, local) plen combinations exceed the table.
+        let specs: Vec<TunnelSpec> = (0..9u32)
+            .map(|i| {
+                named(
+                    &format!("t{i}"),
+                    Some(&format!("fd00:a:{i}::/{}", 96 + i)),
+                    &format!("fd00:b:{i}::/112"),
+                )
+            })
+            .collect();
+        let err = validate_tunnel_set(&specs).unwrap_err().to_string();
+        assert!(err.contains("capacity"), "unexpected error: {err}");
+
+        // The same combination repeated does not count against the cap.
+        let specs: Vec<TunnelSpec> = (0..9u32)
+            .map(|i| {
+                named(
+                    &format!("t{i}"),
+                    Some(&format!("fd00:a:{i}::/112")),
+                    &format!("fd00:b:{i}::/112"),
+                )
+            })
+            .collect();
+        assert!(validate_tunnel_set(&specs).is_ok());
     }
 
     #[test]
@@ -491,7 +752,7 @@ mod tests {
             .unwrap();
         assert_eq!(names(&specs), vec!["office", "peer"]);
         let peer = specs.iter().find(|(_, s)| s.name == "peer").unwrap();
-        let expected: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let expected: EndpointPrefix = "2001:db8::1".parse().unwrap();
         assert_eq!(peer.1.remote, expected);
     }
 
