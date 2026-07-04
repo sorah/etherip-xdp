@@ -258,12 +258,14 @@ pub fn inner_flow_hash64<P: Packet>(pkt: &P) -> u64 {
 }
 
 /// Write the outer IPv6 and EtherIP headers over the freshly grown headroom (the
-/// outer Ethernet header is written by the caller).
+/// outer Ethernet header is written by the caller). `entropy` fills the host
+/// bits of prefixed endpoint addresses (a no-op for /128 endpoints).
 #[inline(always)]
 pub fn build_outer_headers<P: Packet>(
     pkt: &mut P,
     cfg: &crate::TunnelConfig,
     flow_hash: u32,
+    entropy: u64,
 ) -> Result<(), ()> {
     let eip_off = ETH_HDR_LEN + IPV6_HDR_LEN;
     // Outer IPv6 payload length = EtherIP + inner frame = total length minus the
@@ -280,8 +282,8 @@ pub fn build_outer_headers<P: Packet>(
         payload_len: payload_len.to_be_bytes(),
         nexthdr: crate::ETHERIP_PROTO,
         hop_limit: crate::HOP_LIMIT_DEFAULT,
-        saddr: cfg.src_addr,
-        daddr: cfg.dst_addr,
+        saddr: crate::fill_host_bits(cfg.src_addr, cfg.src_plen, entropy),
+        daddr: crate::fill_host_bits(cfg.dst_addr, cfg.dst_plen, crate::mix_entropy(entropy)),
     };
     pkt.store(ETH_HDR_LEN, ip6)?;
 
@@ -352,12 +354,15 @@ pub fn encap<P: Packet>(pkt: &mut P, cfg: &crate::TunnelConfig) -> EncapOutcome 
         return EncapOutcome::Abort;
     }
     let flow_hash = inner_flow_hash(pkt);
+    // Computed before adjust_head like flow_hash: both read the inner frame at
+    // offset 0.
+    let entropy = inner_flow_hash64(pkt);
 
     let outer_len = crate::OUTER_OVERHEAD;
     if pkt.adjust_head(-(outer_len as i32)).is_err() {
         return EncapOutcome::AdjustFail;
     }
-    if build_outer_headers(pkt, cfg, flow_hash).is_err() {
+    if build_outer_headers(pkt, cfg, flow_hash, entropy).is_err() {
         return EncapOutcome::BuildFail;
     }
     if clamp_inner_tcp_mss(pkt, outer_len, cfg).is_err() {

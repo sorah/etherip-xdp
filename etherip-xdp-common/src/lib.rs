@@ -71,7 +71,12 @@ pub struct TunnelConfig {
     pub external_mac: [u8; 6],
     /// Next-hop MAC — written as outer dst MAC on encap.
     pub dst_mac: [u8; 6],
-    pub _pad: [u8; 2],
+    /// Prefix length of `src_addr` (64..=128). Encap fills the bits below it
+    /// with the inner flow hash; 128 keeps the fixed-address behavior.
+    pub src_plen: u8,
+    /// Prefix length of `dst_addr` (64..=128), likewise (hash mixed via
+    /// [`mix_entropy`]).
+    pub dst_plen: u8,
     /// IPv4 inner MSS clamp; 0 disables clamping.
     pub mss_clamp_ipv4: u16,
     /// IPv6 inner MSS clamp; 0 disables clamping.
@@ -89,7 +94,10 @@ impl TunnelConfig {
             tunnel_mac: [0; 6],
             external_mac: [0; 6],
             dst_mac: [0; 6],
-            _pad: [0; 2],
+            // 128 = no entropy fill: a zeroed config must never spray hash
+            // bits over the whole address if it ever leaks into the maps.
+            src_plen: 128,
+            dst_plen: 128,
             mss_clamp_ipv4: 0,
             mss_clamp_ipv6: 0,
         }
@@ -114,7 +122,11 @@ pub const PINNED_STATE_MAGIC: u32 = u32::from_le_bytes(*b"eXdP");
 /// number. Bump on any change to those; a daemon (or external tool) finding a
 /// different revision must not touch the pinned objects beyond tearing them
 /// down.
-pub const PINNED_LAYOUT_REVISION: u32 = 1;
+///
+/// Revision 2: `TunnelConfig` gained `src_plen`/`dst_plen` (repurposing the
+/// former `_pad` bytes, which a revision-1 daemon wrote as zero — an invalid
+/// prefix length under the new semantics).
+pub const PINNED_LAYOUT_REVISION: u32 = 2;
 
 /// Identity record stored in the pinned `ETHERIP_STATE` map (a 1-entry array
 /// on bpffs, next to the data-plane maps). This is the cross-process contract
@@ -400,8 +412,8 @@ pub fn checksum_update(csum: u16, old: u16, new: u16) -> u16 {
 }
 
 // SAFETY: `TunnelConfig` is `#[repr(C)]`, `Copy`, and contains only `u8`/`u16`/
-// `u32` and byte arrays with an explicit `_pad` field — no padding-dependent or
-// otherwise-invalid bit patterns and no pointers. Every byte sequence of its
+// `u32` and byte arrays laid out without implicit padding — no padding-dependent
+// or otherwise-invalid bit patterns and no pointers. Every byte sequence of its
 // size is therefore a valid value, satisfying aya's `Pod` contract.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TunnelConfig {}

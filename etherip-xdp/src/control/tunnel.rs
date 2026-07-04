@@ -442,7 +442,8 @@ impl Manager {
             tunnel_mac,
             external_mac: self.external.mac,
             dst_mac,
-            _pad: [0; 2],
+            src_plen: 128,
+            dst_plen: 128,
             mss_clamp_ipv4: mss4,
             mss_clamp_ipv6: mss6,
         }

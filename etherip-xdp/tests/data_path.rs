@@ -61,9 +61,22 @@ fn test_config() -> etherip_xdp_common::TunnelConfig {
         tunnel_mac: TUNNEL_MAC,
         external_mac: EXTERNAL_MAC,
         dst_mac: DST_MAC,
-        _pad: [0; 2],
+        src_plen: 128,
+        dst_plen: 128,
         mss_clamp_ipv4: MSS_V4,
         mss_clamp_ipv6: MSS_V6,
+    }
+}
+
+/// A prefixed-endpoint variant: local fd00:a::/112, remote fd00:b::/64, so
+/// encap must fill 16 and 64 host bits from the inner flow hash.
+fn prefixed_config() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        src_addr: "fd00:a::".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+        dst_addr: "fd00:b::".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+        src_plen: 112,
+        dst_plen: 64,
+        ..test_config()
     }
 }
 
@@ -156,8 +169,15 @@ fn run(
 /// coverage-guided fuzzing of this same core (see `test/fuzzing/`) carries over to the
 /// kernel program.
 fn host_encap(input: &[u8]) -> (etherip_xdp_common::data_path::EncapOutcome, Vec<u8>) {
+    host_encap_with(input, &test_config())
+}
+
+fn host_encap_with(
+    input: &[u8],
+    cfg: &etherip_xdp_common::TunnelConfig,
+) -> (etherip_xdp_common::data_path::EncapOutcome, Vec<u8>) {
     let mut pkt = etherip_xdp_common::data_path::HostPacket::new(input.to_vec());
-    let outcome = etherip_xdp_common::data_path::encap(&mut pkt, &test_config());
+    let outcome = etherip_xdp_common::data_path::encap(&mut pkt, cfg);
     (outcome, pkt.into_inner())
 }
 
@@ -192,7 +212,12 @@ fn ipv4_tcp_syn(mss: u16) -> Vec<u8> {
     buf
 }
 
-fn expected_outer_headers(inner_len: usize, flow_hash: u32) -> Vec<u8> {
+fn expected_outer_headers(
+    inner_len: usize,
+    flow_hash: u32,
+    src: [u8; 16],
+    dst: [u8; 16],
+) -> Vec<u8> {
     let mut h = Vec::with_capacity(etherip_xdp_common::OUTER_OVERHEAD);
     h.extend_from_slice(&DST_MAC); // outer eth dst = next hop
     h.extend_from_slice(&EXTERNAL_MAC); // outer eth src = uplink
@@ -207,8 +232,8 @@ fn expected_outer_headers(inner_len: usize, flow_hash: u32) -> Vec<u8> {
     h.extend_from_slice(&payload_len.to_be_bytes());
     h.push(etherip_xdp_common::ETHERIP_PROTO);
     h.push(etherip_xdp_common::HOP_LIMIT_DEFAULT);
-    h.extend_from_slice(&local().octets()); // src
-    h.extend_from_slice(&remote().octets()); // dst
+    h.extend_from_slice(&src);
+    h.extend_from_slice(&dst);
     h.push(etherip_xdp_common::ETHERIP_VERSION);
     h.push(0x00);
     h
@@ -268,8 +293,12 @@ fn encap_ipv4_tcp_syn_is_clamped_and_redirected() {
     let (action, out) = run(&mut ebpf, "xdp_encap", &input, PEER_IFINDEX);
     assert_eq!(action, 4, "expected XDP_REDIRECT");
 
-    let mut expected =
-        expected_outer_headers(input.len(), etherip_xdp_common::inner_flow_hash(&input));
+    let mut expected = expected_outer_headers(
+        input.len(),
+        etherip_xdp_common::inner_flow_hash(&input),
+        local().octets(),
+        remote().octets(),
+    );
     expected.extend_from_slice(&expected_inner);
     assert_eq!(out.len(), expected.len(), "output length");
     assert_eq!(out, expected, "byte-exact encap output");
@@ -294,6 +323,55 @@ fn encap_mss_not_raised_when_below_clamp() {
     assert_eq!(&out[etherip_xdp_common::OUTER_OVERHEAD..], &input[..]);
 
     let (outcome, host_out) = host_encap(&input);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::EncapOutcome::Redirect
+    );
+    assert_eq!(host_out, out, "host core matches eBPF byte-exact (encap)");
+}
+
+#[test]
+#[ignore = "requires root and kernel >= 5.15"]
+fn encap_prefixed_fills_host_bits_from_flow_hash() {
+    let mut ebpf = load_and_setup();
+    let cfg = prefixed_config();
+    {
+        let mut m: aya::maps::HashMap<_, u32, etherip_xdp_common::TunnelConfig> =
+            aya::maps::HashMap::try_from(ebpf.map_mut("ENCAP_CONFIG").unwrap()).unwrap();
+        m.insert(PEER_IFINDEX, cfg, 0).unwrap();
+    }
+
+    let input = ipv4_tcp_syn(1460);
+    let (action, out) = run(&mut ebpf, "xdp_encap", &input, PEER_IFINDEX);
+    assert_eq!(action, 4, "expected XDP_REDIRECT");
+
+    // Outer src/dst host bits are predicted with the independent host
+    // reference: base | (inner_flow_hash64 & host mask), dst side mixed.
+    let entropy = etherip_xdp_common::inner_flow_hash64(&input);
+    let src = etherip_xdp_common::fill_host_bits(cfg.src_addr, cfg.src_plen, entropy);
+    let dst = etherip_xdp_common::fill_host_bits(
+        cfg.dst_addr,
+        cfg.dst_plen,
+        etherip_xdp_common::mix_entropy(entropy),
+    );
+    assert_ne!(src, cfg.src_addr, "/112 must fill some host bits");
+    assert_ne!(dst, cfg.dst_addr, "/64 must fill some host bits");
+    assert_eq!(
+        etherip_xdp_common::mask_addr(src, cfg.src_plen),
+        cfg.src_addr,
+        "fill must stay below the prefix"
+    );
+
+    let mut expected = expected_outer_headers(
+        input.len(),
+        etherip_xdp_common::inner_flow_hash(&input),
+        src,
+        dst,
+    );
+    expected.extend_from_slice(&ipv4_tcp_syn(MSS_V4));
+    assert_eq!(out, expected, "byte-exact prefixed encap output");
+
+    let (outcome, host_out) = host_encap_with(&input, &cfg);
     assert_eq!(
         outcome,
         etherip_xdp_common::data_path::EncapOutcome::Redirect

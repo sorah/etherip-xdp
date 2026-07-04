@@ -30,9 +30,31 @@ pub fn encap_cfg() -> etherip_xdp_common::TunnelConfig {
         tunnel_mac: TUNNEL_MAC,
         external_mac: EXTERNAL_MAC,
         dst_mac: DST_MAC,
-        _pad: [0; 2],
+        src_plen: 128,
+        dst_plen: 128,
         mss_clamp_ipv4: 1404,
         mss_clamp_ipv6: 1384,
+    }
+}
+
+/// Prefixed A-end local base (`fd00:a::/112`).
+pub const PREFIX_A: [u8; 16] = [0xfd, 0x00, 0, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+/// Prefixed B-end local base (`fd00:b::/64`), the remote as seen from A.
+pub const PREFIX_B: [u8; 16] = [0xfd, 0x00, 0, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+/// Prefix length of [`PREFIX_A`].
+pub const PLEN_A: u8 = 112;
+/// Prefix length of [`PREFIX_B`].
+pub const PLEN_B: u8 = 64;
+
+/// As [`encap_cfg`] but with prefixed endpoints, so encap fills the host bits
+/// of both outer addresses from the inner flow hash.
+pub fn encap_cfg_prefixed() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        src_addr: PREFIX_A,
+        dst_addr: PREFIX_B,
+        src_plen: PLEN_A,
+        dst_plen: PLEN_B,
+        ..encap_cfg()
     }
 }
 
@@ -57,7 +79,8 @@ pub fn decap_cfg() -> etherip_xdp_common::TunnelConfig {
         tunnel_mac: TUNNEL_MAC,
         external_mac: EXTERNAL_MAC,
         dst_mac: DST_MAC,
-        _pad: [0; 2],
+        src_plen: 128,
+        dst_plen: 128,
         mss_clamp_ipv4: 0,
         mss_clamp_ipv6: 0,
     }
