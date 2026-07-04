@@ -215,6 +215,50 @@ fn expected_outer_headers(inner_len: usize, flow_hash: u32) -> Vec<u8> {
 }
 
 #[test]
+fn flow_hash64_host_matches_slice_reference() {
+    // The slice reference (`inner_flow_hash64`) and the `Packet`-generic twin
+    // must agree byte for byte; the fuzz targets extend this to arbitrary
+    // frames and the BPF tests to the kernel build.
+    let mut frames: Vec<Vec<u8>> = vec![
+        ipv4_tcp_syn(1460),
+        vec![0u8; 13],    // too short
+        vec![0xFFu8; 14], // unknown ethertype
+    ];
+    // IPv4 fragment (MF set) and non-TCP proto variants.
+    let mut frag = ipv4_tcp_syn(1460);
+    frag[20] = 0x20;
+    frames.push(frag);
+    let mut gre = ipv4_tcp_syn(1460);
+    gre[23] = 47;
+    frames.push(gre);
+    // IPv6 TCP and IPv6-with-extension-header variants.
+    let v6 = {
+        let builder = etherparse::PacketBuilder::ethernet2(
+            [0x00, 0x00, 0x5e, 0x00, 0x11, 0x02],
+            [0x00, 0x00, 0x5e, 0x00, 0x11, 0x01],
+        )
+        .ipv6([0xfd; 16], [0xfc; 16], 64)
+        .tcp(4321, 443, 0, 0);
+        let mut buf = Vec::new();
+        builder.write(&mut buf, &[]).unwrap();
+        buf
+    };
+    let mut v6_ext = v6.clone();
+    v6_ext[20] = 60; // dest-options in place of TCP
+    frames.push(v6);
+    frames.push(v6_ext);
+
+    for frame in frames {
+        let pkt = etherip_xdp_common::data_path::HostPacket::new(frame.clone());
+        assert_eq!(
+            etherip_xdp_common::data_path::inner_flow_hash64(&pkt),
+            etherip_xdp_common::inner_flow_hash64(&frame),
+            "frame {frame:02x?}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires root and kernel >= 5.15"]
 fn encap_ipv4_tcp_syn_is_clamped_and_redirected() {
     let mut ebpf = load_and_setup();

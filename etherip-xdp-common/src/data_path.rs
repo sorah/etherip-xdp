@@ -17,6 +17,7 @@
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
 
 const ETH_HDR_LEN: usize = 14;
 const IPV6_HDR_LEN: usize = 40;
@@ -211,6 +212,49 @@ pub fn inner_flow_hash<P: Packet>(pkt: &P) -> u32 {
     }
 
     h & 0xFFFFF
+}
+
+/// 64-bit entropy hash of the inner frame at offset 0, filling the host bits of
+/// prefixed outer endpoints. Mirrors [`crate::inner_flow_hash64`] (the
+/// slice-based host reference) byte for byte, including the port-inclusion
+/// rules (TCP/UDP only, unfragmented IPv4, no IPv6 extension-header walking).
+#[inline(always)]
+pub fn inner_flow_hash64<P: Packet>(pkt: &P) -> u64 {
+    let Ok(eth) = pkt.load::<[u8; ETH_HDR_LEN]>(0) else {
+        return 0;
+    };
+    let ethertype = u16::from_be_bytes([eth[12], eth[13]]);
+    if ethertype == ETH_P_IP
+        && let Ok(ip) = pkt.load::<[u8; 20]>(ETH_HDR_LEN)
+    {
+        let mut h = crate::fnv64(crate::FNV64_OFFSET, &ip[12..20]); // saddr + daddr
+        let proto = ip[9];
+        h = crate::fnv64(h, &[proto]);
+        let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x3FFF; // MF | offset
+        let ihl = (ip[0] & 0x0F) as usize;
+        if (proto == IPPROTO_TCP || proto == IPPROTO_UDP)
+            && frag == 0
+            && ihl >= 5
+            && let Ok(ports) = pkt.load_var::<[u8; 4]>(ETH_HDR_LEN + ihl * 4)
+        {
+            h = crate::fnv64(h, &ports);
+        }
+        return h;
+    }
+    if ethertype == ETH_P_IPV6
+        && let Ok(ip6) = pkt.load::<[u8; IPV6_HDR_LEN]>(ETH_HDR_LEN)
+    {
+        let mut h = crate::fnv64(crate::FNV64_OFFSET, &ip6[8..40]); // saddr + daddr
+        let nexthdr = ip6[6];
+        h = crate::fnv64(h, &[nexthdr]);
+        if (nexthdr == IPPROTO_TCP || nexthdr == IPPROTO_UDP)
+            && let Ok(ports) = pkt.load::<[u8; 4]>(ETH_HDR_LEN + IPV6_HDR_LEN)
+        {
+            h = crate::fnv64(h, &ports);
+        }
+        return h;
+    }
+    crate::fnv64(crate::FNV64_OFFSET, &eth)
 }
 
 /// Write the outer IPv6 and EtherIP headers over the freshly grown headroom (the

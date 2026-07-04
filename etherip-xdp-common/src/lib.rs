@@ -266,6 +266,120 @@ pub fn inner_flow_hash(frame: &[u8]) -> u32 {
     h & 0xFFFFF
 }
 
+const FNV64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a 64 over `bytes`, continuing from `h`.
+const fn fnv64(mut h: u64, bytes: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < bytes.len() {
+        h = (h ^ bytes[i] as u64).wrapping_mul(FNV64_PRIME);
+        i += 1;
+    }
+    h
+}
+
+/// 64-bit entropy hash of an inner Ethernet frame's L3/L4 flow identity, used
+/// to fill the host bits of prefixed outer endpoints ([`fill_host_bits`]).
+///
+/// FNV-1a 64 over, per inner EtherType:
+/// - IPv4: saddr, daddr, protocol; plus the 4 L4 port bytes when the protocol
+///   is TCP/UDP and the packet is unfragmented (`frag_off & 0x3FFF == 0`, so
+///   every fragment of a fragmented datagram hashes identically).
+/// - IPv6: saddr, daddr, nexthdr; plus the port bytes when `nexthdr` is
+///   directly TCP/UDP. Extension headers are not walked (keeps the eBPF twin
+///   loop-free; a fragment header therefore also falls back to L3-only).
+/// - Other (or truncated IP headers): dst MAC, src MAC, EtherType.
+///
+/// MACs are deliberately excluded for IP frames — unlike [`inner_flow_hash`]
+/// (the flow-label hash, which stays as is) — so a neighbour MAC change does
+/// not re-path in-flight flows. The eBPF program mirrors this byte for byte
+/// via `data_path::inner_flow_hash64`; this slice version is the host-testable
+/// reference.
+pub fn inner_flow_hash64(frame: &[u8]) -> u64 {
+    if frame.len() < 14 {
+        return 0;
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype == 0x0800 && frame.len() >= 14 + 20 {
+        let ip = &frame[14..34];
+        let mut h = fnv64(FNV64_OFFSET, &ip[12..20]); // saddr + daddr
+        let proto = ip[9];
+        h = fnv64(h, &[proto]);
+        let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x3FFF; // MF | offset
+        let ihl = (ip[0] & 0x0F) as usize;
+        let ports_off = 14 + ihl * 4;
+        if (proto == 6 || proto == 17) && frag == 0 && ihl >= 5 && frame.len() >= ports_off + 4 {
+            h = fnv64(h, &frame[ports_off..ports_off + 4]);
+        }
+        return h;
+    }
+    if ethertype == 0x86DD && frame.len() >= 14 + 40 {
+        let ip6 = &frame[14..54];
+        let mut h = fnv64(FNV64_OFFSET, &ip6[8..40]); // saddr + daddr
+        let nexthdr = ip6[6];
+        h = fnv64(h, &[nexthdr]);
+        if (nexthdr == 6 || nexthdr == 17) && frame.len() >= 54 + 4 {
+            h = fnv64(h, &frame[54..58]);
+        }
+        return h;
+    }
+    fnv64(FNV64_OFFSET, &frame[0..14])
+}
+
+/// Zero the host bits of `addr` below a `plen`-bit prefix (`plen >= 128` is a
+/// no-op).
+pub const fn mask_addr(addr: [u8; 16], plen: u8) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        let bit = 8 * i as u32;
+        let keep: u8 = if plen as u32 >= bit + 8 {
+            0xFF
+        } else if plen as u32 <= bit {
+            0x00
+        } else {
+            0xFFu8 << (8 - (plen as u32 - bit))
+        };
+        out[i] = addr[i] & keep;
+        i += 1;
+    }
+    out
+}
+
+/// OR the low `128 - plen` bits of `entropy` into `base` (whose host bits are
+/// zero — enforced by config validation). `plen == 128` returns `base`
+/// unchanged. Callers validate `plen >= 64`: the entropy is 64 bits, so bits
+/// 64..plen of a shorter prefix would stay zero.
+pub const fn fill_host_bits(base: [u8; 16], plen: u8, entropy: u64) -> [u8; 16] {
+    let e = entropy.to_be_bytes();
+    let mut out = base;
+    let mut i = 8;
+    while i < 16 {
+        let bit = 8 * i as u32;
+        let host: u8 = if plen as u32 <= bit {
+            0xFF
+        } else if plen as u32 >= bit + 8 {
+            0x00
+        } else {
+            0xFFu8 >> (plen as u32 - bit)
+        };
+        out[i] |= e[i - 8] & host;
+        i += 1;
+    }
+    out
+}
+
+/// splitmix64 finalizer. Encap fills the outer destination's host bits with
+/// `mix_entropy(h)` while the source uses `h` directly, so ECMP hashes that
+/// fold src ⊕ dst don't see the two suffixes cancel to a constant.
+pub const fn mix_entropy(h: u64) -> u64 {
+    let mut z = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// RFC 1624 incremental 16-bit one's-complement checksum update for a single
 /// changed 16-bit word (`old` -> `new`). All inputs are host-order `u16`.
 ///
@@ -396,6 +510,170 @@ mod tests {
         // The struct is a bpffs map value read by external tooling; its size
         // must be exactly the sum of its fields on every target.
         assert_eq!(core::mem::size_of::<PinnedState>(), 4 + 4 + 32 + 32);
+    }
+
+    #[test]
+    fn mask_addr_vectors() {
+        let all = [0xFFu8; 16];
+        assert_eq!(mask_addr(all, 128), all);
+        assert_eq!(mask_addr(all, 0), [0u8; 16]);
+
+        let mut expect = [0u8; 16];
+        expect[..8].copy_from_slice(&[0xFF; 8]);
+        assert_eq!(mask_addr(all, 64), expect);
+
+        expect[8] = 0x80;
+        assert_eq!(mask_addr(all, 65), expect);
+
+        let mut expect = [0xFFu8; 16];
+        expect[14] = 0;
+        expect[15] = 0;
+        assert_eq!(mask_addr(all, 112), expect);
+        expect[14] = 0xFF;
+        expect[15] = 0xFE;
+        assert_eq!(mask_addr(all, 127), expect);
+
+        // Idempotent.
+        assert_eq!(mask_addr(mask_addr(all, 80), 80), mask_addr(all, 80));
+    }
+
+    #[test]
+    fn fill_host_bits_vectors() {
+        let mut base = [0u8; 16];
+        base[0] = 0xfd;
+        base[1] = 0x00;
+        base[7] = 0x01;
+
+        // /128 carries no entropy.
+        assert_eq!(fill_host_bits(base, 128, u64::MAX), base);
+
+        // /64 fills the whole low half.
+        let e = 0x0123_4567_89AB_CDEFu64;
+        let filled = fill_host_bits(base, 64, e);
+        assert_eq!(filled[..8], base[..8]);
+        assert_eq!(filled[8..], e.to_be_bytes());
+
+        // /112 keeps only the low 16 bits of entropy.
+        let filled = fill_host_bits(base, 112, u64::MAX);
+        let mut expect = base;
+        expect[14] = 0xFF;
+        expect[15] = 0xFF;
+        assert_eq!(filled, expect);
+
+        // /65 masks the top host byte to 7 bits.
+        let filled = fill_host_bits(base, 65, u64::MAX);
+        assert_eq!(filled[8], 0x7F);
+        assert_eq!(filled[9..], [0xFF; 7]);
+
+        // The fill never leaks above the prefix.
+        for plen in [64u8, 65, 80, 112, 127, 128] {
+            assert_eq!(
+                mask_addr(fill_host_bits(base, plen, u64::MAX), plen),
+                mask_addr(base, plen),
+                "plen {plen}"
+            );
+        }
+    }
+
+    #[test]
+    fn mix_entropy_decorrelates() {
+        for h in [0u64, 1, 0xdead_beef, u64::MAX] {
+            assert_ne!(mix_entropy(h), h);
+            assert_eq!(mix_entropy(h), mix_entropy(h));
+        }
+        assert_ne!(mix_entropy(0), mix_entropy(1));
+    }
+
+    fn ipv4_tcp_frame() -> Vec<u8> {
+        let mut f = vec![0u8; 14 + 20 + 20];
+        f[0..6].copy_from_slice(&[0x00, 0x00, 0x5e, 0x00, 0x11, 0x01]); // dst MAC
+        f[6..12].copy_from_slice(&[0x00, 0x00, 0x5e, 0x00, 0x11, 0x02]); // src MAC
+        f[12..14].copy_from_slice(&[0x08, 0x00]);
+        f[14] = 0x45; // v4, ihl 5
+        f[23] = 6; // TCP
+        f[26..30].copy_from_slice(&[192, 168, 100, 200]);
+        f[30..34].copy_from_slice(&[192, 168, 30, 1]);
+        f[34..36].copy_from_slice(&1234u16.to_be_bytes()); // sport
+        f[36..38].copy_from_slice(&80u16.to_be_bytes()); // dport
+        f
+    }
+
+    fn ipv6_tcp_frame() -> Vec<u8> {
+        let mut f = vec![0u8; 14 + 40 + 20];
+        f[0..6].copy_from_slice(&[0x00, 0x00, 0x5e, 0x00, 0x11, 0x01]);
+        f[6..12].copy_from_slice(&[0x00, 0x00, 0x5e, 0x00, 0x11, 0x02]);
+        f[12..14].copy_from_slice(&[0x86, 0xDD]);
+        f[14] = 0x60;
+        f[20] = 6; // nexthdr TCP
+        f[22] = 0xfd; // saddr fd00::…
+        f[37] = 0x01;
+        f[38] = 0xfd; // daddr
+        f[53] = 0x02;
+        f[54..56].copy_from_slice(&1234u16.to_be_bytes());
+        f[56..58].copy_from_slice(&80u16.to_be_bytes());
+        f
+    }
+
+    #[test]
+    fn flow_hash64_ports_and_macs() {
+        for frame in [ipv4_tcp_frame(), ipv6_tcp_frame()] {
+            let h = inner_flow_hash64(&frame);
+            assert_eq!(inner_flow_hash64(&frame), h, "deterministic");
+
+            // L4 ports contribute for plain TCP.
+            let mut other_port = frame.clone();
+            let sport_off = if frame[12] == 0x08 { 34 } else { 54 };
+            other_port[sport_off] ^= 0xFF;
+            assert_ne!(inner_flow_hash64(&other_port), h, "port-sensitive");
+
+            // MACs must not contribute for IP frames.
+            let mut other_mac = frame.clone();
+            other_mac[6] ^= 0xFF;
+            assert_eq!(inner_flow_hash64(&other_mac), h, "MAC-insensitive");
+        }
+    }
+
+    #[test]
+    fn flow_hash64_skips_ports_when_unsafe() {
+        // IPv4 fragments: offset != 0, and MF on a first fragment.
+        for frag in [[0x00u8, 0x10], [0x20, 0x00]] {
+            let mut a = ipv4_tcp_frame();
+            a[20..22].copy_from_slice(&frag);
+            let mut b = a.clone();
+            b[34] ^= 0xFF;
+            assert_eq!(
+                inner_flow_hash64(&a),
+                inner_flow_hash64(&b),
+                "fragment must hash L3-only (frag {frag:02x?})"
+            );
+        }
+
+        // Non-TCP/UDP protocol.
+        let mut a = ipv4_tcp_frame();
+        a[23] = 47; // GRE
+        let mut b = a.clone();
+        b[34] ^= 0xFF;
+        assert_eq!(inner_flow_hash64(&a), inner_flow_hash64(&b));
+
+        // IPv6 extension header: ports are not walked to.
+        let mut a = ipv6_tcp_frame();
+        a[20] = 44; // fragment header instead of TCP
+        let mut b = a.clone();
+        b[54] ^= 0xFF;
+        assert_eq!(inner_flow_hash64(&a), inner_flow_hash64(&b));
+    }
+
+    #[test]
+    fn flow_hash64_non_ip_and_short() {
+        assert_eq!(inner_flow_hash64(&[0u8; 13]), 0);
+
+        // Non-IP frames fall back to MAC + EtherType.
+        let mut arp = vec![0u8; 42];
+        arp[12..14].copy_from_slice(&[0x08, 0x06]);
+        let h = inner_flow_hash64(&arp);
+        let mut other = arp.clone();
+        other[0] ^= 0xFF;
+        assert_ne!(inner_flow_hash64(&other), h, "MAC-sensitive for non-IP");
     }
 
     #[test]
