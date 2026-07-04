@@ -1,0 +1,6 @@
+{
+  "name": "dc2",
+  "local": "2001:db8:a::/64",
+  "remote": "2001:db8:b::/64",
+  "mss": "auto"
+}

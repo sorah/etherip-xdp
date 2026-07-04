@@ -17,6 +17,7 @@
 const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
 
 const ETH_HDR_LEN: usize = 14;
 const IPV6_HDR_LEN: usize = 40;
@@ -213,13 +214,58 @@ pub fn inner_flow_hash<P: Packet>(pkt: &P) -> u32 {
     h & 0xFFFFF
 }
 
+/// 64-bit entropy hash of the inner frame at offset 0, filling the host bits of
+/// prefixed outer endpoints. Mirrors [`crate::inner_flow_hash64`] (the
+/// slice-based host reference) byte for byte, including the port-inclusion
+/// rules (TCP/UDP only, unfragmented IPv4, no IPv6 extension-header walking).
+#[inline(always)]
+pub fn inner_flow_hash64<P: Packet>(pkt: &P) -> u64 {
+    let Ok(eth) = pkt.load::<[u8; ETH_HDR_LEN]>(0) else {
+        return 0;
+    };
+    let ethertype = u16::from_be_bytes([eth[12], eth[13]]);
+    if ethertype == ETH_P_IP
+        && let Ok(ip) = pkt.load::<[u8; 20]>(ETH_HDR_LEN)
+    {
+        let mut h = crate::fnv64(crate::FNV64_OFFSET, &ip[12..20]); // saddr + daddr
+        let proto = ip[9];
+        h = crate::fnv64(h, &[proto]);
+        let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x3FFF; // MF | offset
+        let ihl = (ip[0] & 0x0F) as usize;
+        if (proto == IPPROTO_TCP || proto == IPPROTO_UDP)
+            && frag == 0
+            && ihl >= 5
+            && let Ok(ports) = pkt.load_var::<[u8; 4]>(ETH_HDR_LEN + ihl * 4)
+        {
+            h = crate::fnv64(h, &ports);
+        }
+        return h;
+    }
+    if ethertype == ETH_P_IPV6
+        && let Ok(ip6) = pkt.load::<[u8; IPV6_HDR_LEN]>(ETH_HDR_LEN)
+    {
+        let mut h = crate::fnv64(crate::FNV64_OFFSET, &ip6[8..40]); // saddr + daddr
+        let nexthdr = ip6[6];
+        h = crate::fnv64(h, &[nexthdr]);
+        if (nexthdr == IPPROTO_TCP || nexthdr == IPPROTO_UDP)
+            && let Ok(ports) = pkt.load::<[u8; 4]>(ETH_HDR_LEN + IPV6_HDR_LEN)
+        {
+            h = crate::fnv64(h, &ports);
+        }
+        return h;
+    }
+    crate::fnv64(crate::FNV64_OFFSET, &eth)
+}
+
 /// Write the outer IPv6 and EtherIP headers over the freshly grown headroom (the
-/// outer Ethernet header is written by the caller).
+/// outer Ethernet header is written by the caller). `entropy` fills the host
+/// bits of prefixed endpoint addresses (a no-op for /128 endpoints).
 #[inline(always)]
 pub fn build_outer_headers<P: Packet>(
     pkt: &mut P,
     cfg: &crate::TunnelConfig,
     flow_hash: u32,
+    entropy: u64,
 ) -> Result<(), ()> {
     let eip_off = ETH_HDR_LEN + IPV6_HDR_LEN;
     // Outer IPv6 payload length = EtherIP + inner frame = total length minus the
@@ -236,8 +282,8 @@ pub fn build_outer_headers<P: Packet>(
         payload_len: payload_len.to_be_bytes(),
         nexthdr: crate::ETHERIP_PROTO,
         hop_limit: crate::HOP_LIMIT_DEFAULT,
-        saddr: cfg.src_addr,
-        daddr: cfg.dst_addr,
+        saddr: crate::fill_host_bits(cfg.src_addr, cfg.src_plen, entropy),
+        daddr: crate::fill_host_bits(cfg.dst_addr, cfg.dst_plen, crate::mix_entropy(entropy)),
     };
     pkt.store(ETH_HDR_LEN, ip6)?;
 
@@ -308,12 +354,15 @@ pub fn encap<P: Packet>(pkt: &mut P, cfg: &crate::TunnelConfig) -> EncapOutcome 
         return EncapOutcome::Abort;
     }
     let flow_hash = inner_flow_hash(pkt);
+    // Computed before adjust_head like flow_hash: both read the inner frame at
+    // offset 0.
+    let entropy = inner_flow_hash64(pkt);
 
     let outer_len = crate::OUTER_OVERHEAD;
     if pkt.adjust_head(-(outer_len as i32)).is_err() {
         return EncapOutcome::AdjustFail;
     }
-    if build_outer_headers(pkt, cfg, flow_hash).is_err() {
+    if build_outer_headers(pkt, cfg, flow_hash, entropy).is_err() {
         return EncapOutcome::BuildFail;
     }
     if clamp_inner_tcp_mss(pkt, outer_len, cfg).is_err() {
@@ -357,14 +406,19 @@ pub enum DecapOutcome {
 /// Ethernet frame unchanged. The inner MACs are left intact (encap is likewise
 /// transparent), so the path is a transparent L2 pseudo-wire: it works both for an
 /// L3 endpoint (whose MAC inner frames reach via ARP/ND) and for a `<name>`
-/// enslaved to a bridge. `find` returns the tunnel config for a [`DecapKey`] (the
+/// enslaved to a bridge.
+///
+/// The demux masks (saddr, daddr) by each `plens` entry in turn and calls `find`
+/// with the resulting base-address [`DecapKey`], so prefixed endpoints accept any
+/// host bits below their prefix; the first hit wins (config validation keeps the
+/// combinations unambiguous). `find` returns the tunnel config for a key (the
 /// eBPF program backs it with the `DECAP_CONFIG` map; the host backs it with a
 /// fixed table).
 #[inline(always)]
-pub fn decap<P, F>(pkt: &mut P, find: F) -> DecapOutcome
+pub fn decap<P, F>(pkt: &mut P, plens: &crate::DecapPlens, mut find: F) -> DecapOutcome
 where
     P: Packet,
-    F: FnOnce(&crate::DecapKey) -> Option<crate::TunnelConfig>,
+    F: FnMut(&crate::DecapKey) -> Option<crate::TunnelConfig>,
 {
     let eth: EthHdr = match pkt.load(0) {
         Ok(e) => e,
@@ -388,17 +442,29 @@ where
         return DecapOutcome::NotEtherip;
     }
 
-    let key = crate::DecapKey {
-        remote: ip6.saddr,
-        local: ip6.daddr,
-    };
-    let cfg = match find(&key) {
+    let mut cfg: Option<crate::TunnelConfig> = None;
+    for i in 0..crate::DECAP_PLEN_PAIRS_MAX {
+        if i >= plens.len as usize {
+            break;
+        }
+        let pair = plens.pairs[i];
+        let key = crate::DecapKey {
+            remote: crate::mask_addr(ip6.saddr, pair.remote_plen),
+            local: crate::mask_addr(ip6.daddr, pair.local_plen),
+        };
+        if let Some(c) = find(&key) {
+            cfg = Some(c);
+            break;
+        }
+    }
+    let cfg = match cfg {
         Some(c) => c,
         None => return DecapOutcome::NoTunnel,
     };
 
-    // Loopback guard: drop frames sourced from our own tunnel address.
-    if ip6.saddr == cfg.src_addr {
+    // Loopback guard: drop frames sourced from our own tunnel prefix
+    // (`src_addr` is the masked base, so this is exact for /128).
+    if crate::mask_addr(ip6.saddr, cfg.src_plen) == cfg.src_addr {
         return DecapOutcome::OwnPkt;
     }
 

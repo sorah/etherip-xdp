@@ -30,9 +30,31 @@ pub fn encap_cfg() -> etherip_xdp_common::TunnelConfig {
         tunnel_mac: TUNNEL_MAC,
         external_mac: EXTERNAL_MAC,
         dst_mac: DST_MAC,
-        _pad: [0; 2],
+        src_plen: 128,
+        dst_plen: 128,
         mss_clamp_ipv4: 1404,
         mss_clamp_ipv6: 1384,
+    }
+}
+
+/// Prefixed A-end local base (`fd00:a::/112`).
+pub const PREFIX_A: [u8; 16] = [0xfd, 0x00, 0, 0x0a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+/// Prefixed B-end local base (`fd00:b::/64`), the remote as seen from A.
+pub const PREFIX_B: [u8; 16] = [0xfd, 0x00, 0, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+/// Prefix length of [`PREFIX_A`].
+pub const PLEN_A: u8 = 112;
+/// Prefix length of [`PREFIX_B`].
+pub const PLEN_B: u8 = 64;
+
+/// As [`encap_cfg`] but with prefixed endpoints, so encap fills the host bits
+/// of both outer addresses from the inner flow hash.
+pub fn encap_cfg_prefixed() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        src_addr: PREFIX_A,
+        dst_addr: PREFIX_B,
+        src_plen: PLEN_A,
+        dst_plen: PLEN_B,
+        ..encap_cfg()
     }
 }
 
@@ -57,10 +79,45 @@ pub fn decap_cfg() -> etherip_xdp_common::TunnelConfig {
         tunnel_mac: TUNNEL_MAC,
         external_mac: EXTERNAL_MAC,
         dst_mac: DST_MAC,
-        _pad: [0; 2],
+        src_plen: 128,
+        dst_plen: 128,
         mss_clamp_ipv4: 0,
         mss_clamp_ipv6: 0,
     }
+}
+
+/// As [`encap_cfg_prefixed`] but with MSS clamping disabled (round-trip use).
+pub fn encap_cfg_prefixed_no_clamp() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        mss_clamp_ipv4: 0,
+        mss_clamp_ipv6: 0,
+        ..encap_cfg_prefixed()
+    }
+}
+
+/// The B-end decap config for the prefixed tunnel: local `PREFIX_B/PLEN_B`,
+/// remote `PREFIX_A/PLEN_A`.
+pub fn decap_cfg_prefixed() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        src_addr: PREFIX_B,
+        dst_addr: PREFIX_A,
+        src_plen: PLEN_B,
+        dst_plen: PLEN_A,
+        ..decap_cfg()
+    }
+}
+
+/// Build a `DecapPlens` table from `(remote_plen, local_plen)` pairs.
+pub fn plens(pairs: &[(u8, u8)]) -> etherip_xdp_common::DecapPlens {
+    let mut p = etherip_xdp_common::DecapPlens::zeroed();
+    for (i, &(remote_plen, local_plen)) in pairs.iter().enumerate() {
+        p.pairs[i] = etherip_xdp_common::PlenPair {
+            remote_plen,
+            local_plen,
+        };
+        p.len = (i + 1) as u32;
+    }
+    p
 }
 
 /// Layer-3 choice for a generated inner frame.

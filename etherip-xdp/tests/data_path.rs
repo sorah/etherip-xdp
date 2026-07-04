@@ -61,9 +61,22 @@ fn test_config() -> etherip_xdp_common::TunnelConfig {
         tunnel_mac: TUNNEL_MAC,
         external_mac: EXTERNAL_MAC,
         dst_mac: DST_MAC,
-        _pad: [0; 2],
+        src_plen: 128,
+        dst_plen: 128,
         mss_clamp_ipv4: MSS_V4,
         mss_clamp_ipv6: MSS_V6,
+    }
+}
+
+/// A prefixed-endpoint variant: local fd00:a::/112, remote fd00:b::/64, so
+/// encap must fill 16 and 64 host bits from the inner flow hash.
+fn prefixed_config() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        src_addr: "fd00:a::".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+        dst_addr: "fd00:b::".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+        src_plen: 112,
+        dst_plen: 64,
+        ..test_config()
     }
 }
 
@@ -105,6 +118,7 @@ fn load_and_setup() -> aya::Ebpf {
         > = aya::maps::HashMap::try_from(ebpf.map_mut("DECAP_CONFIG").unwrap()).unwrap();
         m.insert(key, cfg, 0).unwrap();
     }
+    set_plens(&mut ebpf, &plens(&[(128, 128)]));
     {
         let mut d: aya::maps::xdp::DevMapHash<_> =
             aya::maps::xdp::DevMapHash::try_from(ebpf.map_mut("REDIRECT_UPLINK").unwrap()).unwrap();
@@ -117,6 +131,25 @@ fn load_and_setup() -> aya::Ebpf {
         d.insert(PEER_IFINDEX, PEER_IFINDEX, None, 0).unwrap();
     }
     ebpf
+}
+
+/// Build a `DecapPlens` table from `(remote_plen, local_plen)` pairs.
+fn plens(pairs: &[(u8, u8)]) -> etherip_xdp_common::DecapPlens {
+    let mut p = etherip_xdp_common::DecapPlens::zeroed();
+    for (i, &(remote_plen, local_plen)) in pairs.iter().enumerate() {
+        p.pairs[i] = etherip_xdp_common::PlenPair {
+            remote_plen,
+            local_plen,
+        };
+        p.len = (i + 1) as u32;
+    }
+    p
+}
+
+fn set_plens(ebpf: &mut aya::Ebpf, table: &etherip_xdp_common::DecapPlens) {
+    let mut m: aya::maps::Array<_, etherip_xdp_common::DecapPlens> =
+        aya::maps::Array::try_from(ebpf.map_mut("DECAP_PLENS").unwrap()).unwrap();
+    m.set(0, *table, 0).unwrap();
 }
 
 fn run(
@@ -156,8 +189,15 @@ fn run(
 /// coverage-guided fuzzing of this same core (see `test/fuzzing/`) carries over to the
 /// kernel program.
 fn host_encap(input: &[u8]) -> (etherip_xdp_common::data_path::EncapOutcome, Vec<u8>) {
+    host_encap_with(input, &test_config())
+}
+
+fn host_encap_with(
+    input: &[u8],
+    cfg: &etherip_xdp_common::TunnelConfig,
+) -> (etherip_xdp_common::data_path::EncapOutcome, Vec<u8>) {
     let mut pkt = etherip_xdp_common::data_path::HostPacket::new(input.to_vec());
-    let outcome = etherip_xdp_common::data_path::encap(&mut pkt, &test_config());
+    let outcome = etherip_xdp_common::data_path::encap(&mut pkt, cfg);
     (outcome, pkt.into_inner())
 }
 
@@ -170,8 +210,16 @@ fn host_decap(input: &[u8]) -> (etherip_xdp_common::data_path::DecapOutcome, Vec
         remote: remote().octets(),
         local: local().octets(),
     };
+    host_decap_with(input, &plens(&[(128, 128)]), |k| (*k == key).then_some(cfg))
+}
+
+fn host_decap_with(
+    input: &[u8],
+    table: &etherip_xdp_common::DecapPlens,
+    find: impl FnMut(&etherip_xdp_common::DecapKey) -> Option<etherip_xdp_common::TunnelConfig>,
+) -> (etherip_xdp_common::data_path::DecapOutcome, Vec<u8>) {
     let mut pkt = etherip_xdp_common::data_path::HostPacket::new(input.to_vec());
-    let outcome = etherip_xdp_common::data_path::decap(&mut pkt, |k| (*k == key).then_some(cfg));
+    let outcome = etherip_xdp_common::data_path::decap(&mut pkt, table, find);
     (outcome, pkt.into_inner())
 }
 
@@ -192,7 +240,12 @@ fn ipv4_tcp_syn(mss: u16) -> Vec<u8> {
     buf
 }
 
-fn expected_outer_headers(inner_len: usize, flow_hash: u32) -> Vec<u8> {
+fn expected_outer_headers(
+    inner_len: usize,
+    flow_hash: u32,
+    src: [u8; 16],
+    dst: [u8; 16],
+) -> Vec<u8> {
     let mut h = Vec::with_capacity(etherip_xdp_common::OUTER_OVERHEAD);
     h.extend_from_slice(&DST_MAC); // outer eth dst = next hop
     h.extend_from_slice(&EXTERNAL_MAC); // outer eth src = uplink
@@ -207,11 +260,55 @@ fn expected_outer_headers(inner_len: usize, flow_hash: u32) -> Vec<u8> {
     h.extend_from_slice(&payload_len.to_be_bytes());
     h.push(etherip_xdp_common::ETHERIP_PROTO);
     h.push(etherip_xdp_common::HOP_LIMIT_DEFAULT);
-    h.extend_from_slice(&local().octets()); // src
-    h.extend_from_slice(&remote().octets()); // dst
+    h.extend_from_slice(&src);
+    h.extend_from_slice(&dst);
     h.push(etherip_xdp_common::ETHERIP_VERSION);
     h.push(0x00);
     h
+}
+
+#[test]
+fn flow_hash64_host_matches_slice_reference() {
+    // The slice reference (`inner_flow_hash64`) and the `Packet`-generic twin
+    // must agree byte for byte; the fuzz targets extend this to arbitrary
+    // frames and the BPF tests to the kernel build.
+    let mut frames: Vec<Vec<u8>> = vec![
+        ipv4_tcp_syn(1460),
+        vec![0u8; 13],    // too short
+        vec![0xFFu8; 14], // unknown ethertype
+    ];
+    // IPv4 fragment (MF set) and non-TCP proto variants.
+    let mut frag = ipv4_tcp_syn(1460);
+    frag[20] = 0x20;
+    frames.push(frag);
+    let mut gre = ipv4_tcp_syn(1460);
+    gre[23] = 47;
+    frames.push(gre);
+    // IPv6 TCP and IPv6-with-extension-header variants.
+    let v6 = {
+        let builder = etherparse::PacketBuilder::ethernet2(
+            [0x00, 0x00, 0x5e, 0x00, 0x11, 0x02],
+            [0x00, 0x00, 0x5e, 0x00, 0x11, 0x01],
+        )
+        .ipv6([0xfd; 16], [0xfc; 16], 64)
+        .tcp(4321, 443, 0, 0);
+        let mut buf = Vec::new();
+        builder.write(&mut buf, &[]).unwrap();
+        buf
+    };
+    let mut v6_ext = v6.clone();
+    v6_ext[20] = 60; // dest-options in place of TCP
+    frames.push(v6);
+    frames.push(v6_ext);
+
+    for frame in frames {
+        let pkt = etherip_xdp_common::data_path::HostPacket::new(frame.clone());
+        assert_eq!(
+            etherip_xdp_common::data_path::inner_flow_hash64(&pkt),
+            etherip_xdp_common::inner_flow_hash64(&frame),
+            "frame {frame:02x?}"
+        );
+    }
 }
 
 #[test]
@@ -224,8 +321,12 @@ fn encap_ipv4_tcp_syn_is_clamped_and_redirected() {
     let (action, out) = run(&mut ebpf, "xdp_encap", &input, PEER_IFINDEX);
     assert_eq!(action, 4, "expected XDP_REDIRECT");
 
-    let mut expected =
-        expected_outer_headers(input.len(), etherip_xdp_common::inner_flow_hash(&input));
+    let mut expected = expected_outer_headers(
+        input.len(),
+        etherip_xdp_common::inner_flow_hash(&input),
+        local().octets(),
+        remote().octets(),
+    );
     expected.extend_from_slice(&expected_inner);
     assert_eq!(out.len(), expected.len(), "output length");
     assert_eq!(out, expected, "byte-exact encap output");
@@ -257,6 +358,55 @@ fn encap_mss_not_raised_when_below_clamp() {
     assert_eq!(host_out, out, "host core matches eBPF byte-exact (encap)");
 }
 
+#[test]
+#[ignore = "requires root and kernel >= 5.15"]
+fn encap_prefixed_fills_host_bits_from_flow_hash() {
+    let mut ebpf = load_and_setup();
+    let cfg = prefixed_config();
+    {
+        let mut m: aya::maps::HashMap<_, u32, etherip_xdp_common::TunnelConfig> =
+            aya::maps::HashMap::try_from(ebpf.map_mut("ENCAP_CONFIG").unwrap()).unwrap();
+        m.insert(PEER_IFINDEX, cfg, 0).unwrap();
+    }
+
+    let input = ipv4_tcp_syn(1460);
+    let (action, out) = run(&mut ebpf, "xdp_encap", &input, PEER_IFINDEX);
+    assert_eq!(action, 4, "expected XDP_REDIRECT");
+
+    // Outer src/dst host bits are predicted with the independent host
+    // reference: base | (inner_flow_hash64 & host mask), dst side mixed.
+    let entropy = etherip_xdp_common::inner_flow_hash64(&input);
+    let src = etherip_xdp_common::fill_host_bits(cfg.src_addr, cfg.src_plen, entropy);
+    let dst = etherip_xdp_common::fill_host_bits(
+        cfg.dst_addr,
+        cfg.dst_plen,
+        etherip_xdp_common::mix_entropy(entropy),
+    );
+    assert_ne!(src, cfg.src_addr, "/112 must fill some host bits");
+    assert_ne!(dst, cfg.dst_addr, "/64 must fill some host bits");
+    assert_eq!(
+        etherip_xdp_common::mask_addr(src, cfg.src_plen),
+        cfg.src_addr,
+        "fill must stay below the prefix"
+    );
+
+    let mut expected = expected_outer_headers(
+        input.len(),
+        etherip_xdp_common::inner_flow_hash(&input),
+        src,
+        dst,
+    );
+    expected.extend_from_slice(&ipv4_tcp_syn(MSS_V4));
+    assert_eq!(out, expected, "byte-exact prefixed encap output");
+
+    let (outcome, host_out) = host_encap_with(&input, &cfg);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::EncapOutcome::Redirect
+    );
+    assert_eq!(host_out, out, "host core matches eBPF byte-exact (encap)");
+}
+
 fn etherip_wrap(inner: &[u8], src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x02]); // outer dst (us) — unused by decap
@@ -272,6 +422,71 @@ fn etherip_wrap(inner: &[u8], src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) 
     buf.push(0x00);
     buf.extend_from_slice(inner);
     buf
+}
+
+#[test]
+fn decap_host_prefix_pair_demux() {
+    let cfg = prefixed_config();
+    let key = etherip_xdp_common::DecapKey {
+        remote: cfg.dst_addr,
+        local: cfg.src_addr,
+    };
+    // Two masking rules; the prefixed tunnel demuxes via the second entry.
+    let table = plens(&[(128, 128), (cfg.dst_plen, cfg.src_plen)]);
+    let find = |k: &etherip_xdp_common::DecapKey| (*k == key).then_some(cfg);
+    let inner = ipv4_tcp_syn(1000);
+
+    // Any host bits within remote fd00:b::/64 and local fd00:a::/112 match.
+    let src = "fd00:b::dead:beef:1234:5678".parse().unwrap();
+    let dst = "fd00:a::beef".parse().unwrap();
+    let input = etherip_wrap(&inner, src, dst);
+    let (outcome, out) = host_decap_with(&input, &table, find);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::Redirect {
+            internal_ifindex: PEER_IFINDEX
+        }
+    );
+    assert_eq!(out, inner);
+
+    // A source outside the remote prefix must not match.
+    let bad_src = etherip_wrap(&inner, "fd00:c::1".parse().unwrap(), dst);
+    let (outcome, out) = host_decap_with(&bad_src, &table, find);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::NoTunnel
+    );
+    assert_eq!(out, bad_src);
+
+    // A destination whose bits differ inside the local /112 must not match.
+    let bad_dst = etherip_wrap(&inner, src, "fd00:a:0:0:0:1::".parse().unwrap());
+    let (outcome, _) = host_decap_with(&bad_dst, &table, find);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::NoTunnel
+    );
+
+    // An empty table demuxes nothing, even with a permissive lookup.
+    let (outcome, _) = host_decap_with(&input, &plens(&[]), |_| Some(cfg));
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::NoTunnel
+    );
+}
+
+#[test]
+fn decap_host_prefixed_loopback_guard() {
+    // A frame sourced from inside our own local prefix (fd00:a::/112) that
+    // still resolves to a tunnel must be dropped by the loopback guard.
+    let cfg = prefixed_config();
+    let inner = ipv4_tcp_syn(1000);
+    let input = etherip_wrap(
+        &inner,
+        "fd00:a::1234".parse().unwrap(),
+        "fd00:a::beef".parse().unwrap(),
+    );
+    let (outcome, _) = host_decap_with(&input, &plens(&[(64, 64)]), |_| Some(cfg));
+    assert_eq!(outcome, etherip_xdp_common::data_path::DecapOutcome::OwnPkt);
 }
 
 #[test]
@@ -342,4 +557,58 @@ fn decap_passes_unknown_tunnel_pair() {
         host_out, input,
         "decap must not mutate a passed-through frame"
     );
+}
+
+#[test]
+#[ignore = "requires root and kernel >= 5.15"]
+fn decap_prefixed_accepts_host_bits_within_prefixes() {
+    let mut ebpf = load_and_setup();
+    let cfg = prefixed_config();
+    let key = etherip_xdp_common::DecapKey {
+        remote: cfg.dst_addr,
+        local: cfg.src_addr,
+    };
+    {
+        let mut m: aya::maps::HashMap<
+            _,
+            etherip_xdp_common::DecapKey,
+            etherip_xdp_common::TunnelConfig,
+        > = aya::maps::HashMap::try_from(ebpf.map_mut("DECAP_CONFIG").unwrap()).unwrap();
+        m.insert(key, cfg, 0).unwrap();
+    }
+    // Two masking rules: the /128 tunnel from load_and_setup stays reachable
+    // via the first entry, the prefixed one demuxes via the second (also
+    // exercising the in-kernel pair-loop fallthrough).
+    let table = plens(&[(128, 128), (cfg.dst_plen, cfg.src_plen)]);
+    set_plens(&mut ebpf, &table);
+
+    let inner = ipv4_tcp_syn(1460);
+    let src: std::net::Ipv6Addr = "fd00:b::dead:beef:1234:5678".parse().unwrap();
+    let dst: std::net::Ipv6Addr = "fd00:a::beef".parse().unwrap();
+    let input = etherip_wrap(&inner, src, dst);
+
+    let (action, out) = run(&mut ebpf, "xdp_decap", &input, EXTERNAL_IFINDEX);
+    assert_eq!(action, 4, "expected XDP_REDIRECT for in-prefix host bits");
+    assert_eq!(out, inner, "byte-exact decap output");
+
+    let find = |k: &etherip_xdp_common::DecapKey| (*k == key).then_some(cfg);
+    let (outcome, host_out) = host_decap_with(&input, &table, find);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::Redirect {
+            internal_ifindex: PEER_IFINDEX
+        }
+    );
+    assert_eq!(host_out, out, "host core matches eBPF byte-exact (decap)");
+
+    // The /128 tunnel still demuxes via the first pair.
+    let exact = etherip_wrap(&inner, remote(), local());
+    let (action, out) = run(&mut ebpf, "xdp_decap", &exact, EXTERNAL_IFINDEX);
+    assert_eq!(action, 4, "expected XDP_REDIRECT for the exact /128 pair");
+    assert_eq!(out, inner);
+
+    // Out-of-prefix source: no tunnel.
+    let bad = etherip_wrap(&inner, "fd00:c::1".parse().unwrap(), dst);
+    let (action, _) = run(&mut ebpf, "xdp_decap", &bad, EXTERNAL_IFINDEX);
+    assert_eq!(action, 2, "expected XDP_PASS for an out-of-prefix source");
 }

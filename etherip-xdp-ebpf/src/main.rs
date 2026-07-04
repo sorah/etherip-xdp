@@ -58,6 +58,16 @@ static DECAP_CONFIG: aya_ebpf::maps::HashMap<
     NO_PREALLOC,
 );
 
+/// Distinct (remote_plen, local_plen) masking rules for the decap demux, as a
+/// single-value table the daemon replaces wholesale. Unlike the `NO_PREALLOC`
+/// hash maps above, array values are updated in place (no RCU swap); a torn
+/// read can only mis-mask one packet into a lookup miss (`XDP_PASS`), never a
+/// wrong-tunnel match, because every pair is tried against `DECAP_CONFIG`
+/// anyway and the daemon keeps the combinations unambiguous.
+#[aya_ebpf::macros::map]
+static DECAP_PLENS: aya_ebpf::maps::Array<etherip_xdp_common::DecapPlens> =
+    aya_ebpf::maps::Array::with_max_entries(1, 0);
+
 /// Encap redirect target: the shared uplink, keyed by its ifindex. Held separate
 /// from [`REDIRECT_PEER`] so a veth-peer ifindex — which, when the peer lives in a
 /// hidden network namespace, is allocated independently of the uplink's and
@@ -247,7 +257,13 @@ fn handle_encap(
 fn handle_decap(ctx: &aya_ebpf::programs::XdpContext) -> u32 {
     dbg_inc(etherip_xdp_common::DBG_DECAP_ENTER);
     let mut pkt = XdpPacket { ctx };
-    let outcome = etherip_xdp_common::data_path::decap(&mut pkt, |key| {
+    // Copied to the stack so decap never touches map memory; a missing entry
+    // (nothing installed yet) is an empty table, matching no tunnel.
+    let plens = match DECAP_PLENS.get(0) {
+        Some(p) => *p,
+        None => etherip_xdp_common::DecapPlens::zeroed(),
+    };
+    let outcome = etherip_xdp_common::data_path::decap(&mut pkt, &plens, |key| {
         // SAFETY: aya's `HashMap::get` is unsafe because it returns a reference
         // into map memory. DECAP_CONFIG is BPF_F_NO_PREALLOC and XDP runs under
         // RCU, so the element cannot be freed/recycled mid-run even if userspace

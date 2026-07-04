@@ -143,9 +143,9 @@ One JSON file per tunnel under `/etc/etherip-xdp/interfaces.d/<uplink>/`:
 
 | Field    | Required | Description |
 |----------|----------|-------------|
-| `remote` | yes      | Remote outer IPv6 endpoint. |
+| `remote` | yes      | Remote outer IPv6 endpoint; a single address or a routed prefix `addr/N` (see [prefixed endpoints](#prefixed-endpoints-ecmplag-entropy)). |
 | `name`   | no       | Tunnel / interface name (default: file stem). Max 11 chars. |
-| `local`  | no       | Local outer IPv6 source. Omit to auto-select the kernel's preferred source for the route to `remote` (re-evaluated as the underlay changes). |
+| `local`  | no       | Local outer IPv6 source; a single address or a routed prefix `addr/N`. Omit to auto-select the kernel's preferred source for the route to `remote` (re-evaluated as the underlay changes); auto-select always yields a single address. |
 | `mss`    | no       | `"auto"` (default), `"off"`, an integer (both families), or `{ "ipv4": N, "ipv6": N }`. |
 | `mtu`    | no       | Tunnel MTU override (default: uplink MTU − 56). |
 | `mac`    | no       | MAC the interface presents: omit to keep the kernel default, `"inherit"` to copy the uplink's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"`. |
@@ -153,6 +153,30 @@ One JSON file per tunnel under `/etc/etherip-xdp/interfaces.d/<uplink>/`:
 
 The uplink is the directory name, so it is **not** repeated inside the file. See
 `packaging/etc/etherip-xdp/interfaces.d/eth1/` for examples.
+
+**Prefixed endpoints (ECMP/LAG entropy).** <a name="prefixed-endpoints-ecmplag-entropy"></a>
+EtherIP is neither TCP nor UDP, so transit routers hashing flows for ECMP/LAG
+see one tunnel as a single flow and put all of it on one path. When the
+underlay *routes* a whole IPv6 prefix to a node (rather than assigning one
+address), configure that prefix — `"local": "2001:db8:a::/64"`, and the peer's
+routed prefix as `"remote"` — and the daemon uses the whole space: the bits
+below `/N` of the outer source and destination are filled with a hash of the
+inner L3/L4 headers, giving transit routers per-flow entropy, and decap accepts
+any host bits within the configured prefixes. Requirements and notes:
+
+- The prefix must be **routed to the node** (e.g. via its underlay /128 or
+  link-local next hop). The individual per-flow addresses are never assigned or
+  ND-resolved — XDP matches them before the kernel stack sees them; next-hop
+  resolution targets the base address.
+- Prefix lengths 64–128 are accepted (the host bits carry a 64-bit flow hash).
+  A prefixed `local` must be explicit, and the base must have zero host bits.
+- `/65` and longer let several tunnels between the same node pair share a /64:
+  the fixed bits between /64 and /N distinguish the tunnels, e.g.
+  `2001:db8:a::/65` and `2001:db8:a:0:8000::/65`.
+- At most 8 distinct (remote, local) prefix-length combinations per uplink; the
+  fast-path demux cost scales with that count (usually 1), not tunnel count.
+- Both fragments of a fragmented inner datagram hash identically (ports are
+  skipped for fragments), so per-flow paths stay reorder-free.
 
 **Config directories.** The default is `/etc/etherip-xdp/interfaces.d/<uplink>/`.
 The systemd unit also searches `/run/etherip-xdp/interfaces.d/<uplink>/` *ahead*

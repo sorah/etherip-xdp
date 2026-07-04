@@ -45,6 +45,7 @@ assets = [
     ["../README.md", "usr/share/doc/etherip-xdp/README.md", "644"],
     ["../packaging/etc/etherip-xdp/interfaces.d/eth1/peer.json", "usr/share/doc/etherip-xdp/examples/interfaces.d/eth1/", "644"],
     ["../packaging/etc/etherip-xdp/interfaces.d/eth1/example-explicit-mss.json", "usr/share/doc/etherip-xdp/examples/interfaces.d/eth1/", "644"],
+    ["../packaging/etc/etherip-xdp/interfaces.d/eth1/example-prefixed.json", "usr/share/doc/etherip-xdp/examples/interfaces.d/eth1/", "644"],
 ]
 
 # Templated unit (etherip-xdp@.service): no default instance, and enable/start =

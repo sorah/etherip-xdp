@@ -35,13 +35,33 @@ pub(crate) fn run(opts: Options, _workspace_root: &std::path::Path) -> anyhow::R
     let scenario = crate::build::require(&binaries, "etherip-xdp-e2e")?.clone();
 
     // Clean any leftovers from a previous aborted run, then set up fresh.
-    teardown();
-    setup()?;
+    // Two passes over a fresh namespace pair each: the full scenario with the
+    // restart phases on plain /128 endpoints, then the traffic checks over
+    // routed /112 endpoint prefixes (per-flow outer addresses).
+    for pass in [Pass::Plain, Pass::OuterPrefix] {
+        println!("running the {} pass…", pass.label());
+        teardown();
+        setup()?;
+        let result = run_scenarios(&opts, &daemon, &scenario, pass);
+        teardown();
+        result?;
+    }
+    Ok(())
+}
 
-    let result = run_scenarios(&opts, &daemon, &scenario);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Plain,
+    OuterPrefix,
+}
 
-    teardown();
-    result
+impl Pass {
+    fn label(self) -> &'static str {
+        match self {
+            Pass::Plain => "plain-endpoint",
+            Pass::OuterPrefix => "prefixed-endpoint",
+        }
+    }
 }
 
 fn setup() -> anyhow::Result<()> {
@@ -71,9 +91,10 @@ fn run_scenarios(
     opts: &Options,
     daemon: &std::path::Path,
     scenario: &std::path::Path,
+    pass: Pass,
 ) -> anyhow::Result<()> {
-    let mut server = spawn_scenario(opts, daemon, scenario, NS_A, "server", UPLINK_A)?;
-    let mut client = spawn_scenario(opts, daemon, scenario, NS_B, "client", UPLINK_B)?;
+    let mut server = spawn_scenario(opts, daemon, scenario, NS_A, "server", UPLINK_A, pass)?;
+    let mut client = spawn_scenario(opts, daemon, scenario, NS_B, "client", UPLINK_B, pass)?;
 
     let server_ok = server
         .wait()
@@ -90,6 +111,7 @@ fn run_scenarios(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_scenario(
     opts: &Options,
     daemon: &std::path::Path,
@@ -97,8 +119,9 @@ fn spawn_scenario(
     netns: &str,
     role: &str,
     uplink: &str,
+    pass: Pass,
 ) -> anyhow::Result<std::process::Child> {
-    let config_dir = opts.work_dir.join(role);
+    let config_dir = opts.work_dir.join(format!("{}-{role}", pass.label()));
     let mut cmd = std::process::Command::new("ip");
     cmd.args(["netns", "exec", netns])
         .arg(scenario)
@@ -108,8 +131,17 @@ fn spawn_scenario(
         .arg("--config-dir")
         .arg(&config_dir)
         .arg("--timeout-secs")
-        .arg(opts.timeout_secs.to_string())
-        .arg("--restart-scenarios");
+        .arg(opts.timeout_secs.to_string());
+    match pass {
+        // The restart phases are endpoint-agnostic; run them once, on the
+        // plain pass, and keep the prefixed pass to the traffic checks.
+        Pass::Plain => {
+            cmd.arg("--restart-scenarios");
+        }
+        Pass::OuterPrefix => {
+            cmd.arg("--outer-prefix");
+        }
+    }
     if !opts.no_sandbox {
         cmd.arg("--sandbox");
     }

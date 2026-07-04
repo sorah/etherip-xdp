@@ -105,12 +105,32 @@ struct Opt {
     /// never stops.
     #[arg(long, default_value_t = false)]
     restart_scenarios: bool,
+
+    /// Configure the tunnel endpoints as routed /112 prefixes instead of the
+    /// uplink addresses: per-flow outer addresses (ECMP entropy) on encap,
+    /// prefix-masked demux on decap. Adds a route to the peer's tunnel prefix
+    /// via its uplink address, mirroring a real routed-prefix deployment.
+    #[arg(long, default_value_t = false)]
+    outer_prefix: bool,
 }
 
 mod minisystemd;
 mod sandbox;
 
 const PAYLOAD: &[u8] = b"etherip-xdp integration payload; the quick brown fox jumps; 0123456789";
+
+/// Tunnel endpoint prefixes for `--outer-prefix` mode. Routed (via the peer's
+/// uplink address), never assigned to an interface.
+const TUNNEL_PREFIX_SERVER: &str = "fd00:a::/112";
+const TUNNEL_PREFIX_CLIENT: &str = "fd00:b::/112";
+
+/// (own, peer's) tunnel prefix by role.
+fn tunnel_prefixes(role: Role) -> (&'static str, &'static str) {
+    match role {
+        Role::Server => (TUNNEL_PREFIX_SERVER, TUNNEL_PREFIX_CLIENT),
+        Role::Client => (TUNNEL_PREFIX_CLIENT, TUNNEL_PREFIX_SERVER),
+    }
+}
 
 fn main() {
     // Wrapper subcommands, intercepted before clap and before any threads
@@ -221,6 +241,16 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
     )
     .await?;
     set_up(&handle, uplink_idx).await?;
+
+    if opt.outer_prefix {
+        // The peer's tunnel prefix is routed via its uplink address, as a real
+        // routed-prefix deployment would; the per-flow addresses inside it are
+        // never assigned or ND-resolved.
+        let (_, peer_prefix) = tunnel_prefixes(opt.role);
+        let (dst, plen) = parse_cidr_v6(peer_prefix)?;
+        log("routing the peer's tunnel prefix via its uplink address");
+        add_route_v6(&handle, dst, plen, peer_uplink).await?;
+    }
 
     log("writing tunnel config and launching etherip-xdp");
     write_config(opt, uplink_ip, peer_uplink, None)?;
@@ -786,6 +816,37 @@ async fn add_address(
         .map_err(|e| anyhow::anyhow!("add address {addr}/{prefix} to ifindex {index}: {e}"))
 }
 
+/// Add a static IPv6 route, retrying while the gateway is still unreachable
+/// (the freshly-added uplink address may sit in DAD for a moment).
+async fn add_route_v6(
+    handle: &rtnetlink::Handle,
+    dst: std::net::Ipv6Addr,
+    prefix: u8,
+    gateway: std::net::Ipv6Addr,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let route = rtnetlink::RouteMessageBuilder::<std::net::Ipv6Addr>::new()
+            .destination_prefix(dst, prefix)
+            .gateway(gateway)
+            .build();
+        match handle.route().add(route).execute().await {
+            Ok(()) => return Ok(()),
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                log(&format!(
+                    "route {dst}/{prefix} via {gateway} not yet addable ({e}); retrying"
+                ));
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "add route {dst}/{prefix} via {gateway}: {e}"
+                ));
+            }
+        }
+    }
+}
+
 async fn set_up(handle: &rtnetlink::Handle, index: u32) -> anyhow::Result<()> {
     handle
         .link()
@@ -807,9 +868,15 @@ fn write_config(
         .map_err(|e| anyhow::anyhow!("create {}: {e}", opt.config_dir.display()))?;
     let path = opt.config_dir.join(format!("{}.json", opt.tunnel_name));
     let mtu_field = mtu.map(|m| format!(",\"mtu\":{m}")).unwrap_or_default();
+    let (local, remote) = if opt.outer_prefix {
+        let (mine, theirs) = tunnel_prefixes(opt.role);
+        (mine.to_string(), theirs.to_string())
+    } else {
+        (uplink_ip.to_string(), peer_uplink.to_string())
+    };
     let json = format!(
-        "{{\"name\":\"{}\",\"local\":\"{}\",\"remote\":\"{}\",\"mss\":\"auto\"{mtu_field}}}\n",
-        opt.tunnel_name, uplink_ip, peer_uplink
+        "{{\"name\":\"{}\",\"local\":\"{local}\",\"remote\":\"{remote}\",\"mss\":\"auto\"{mtu_field}}}\n",
+        opt.tunnel_name
     );
     std::fs::write(&path, json).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
     if opt.sandbox {

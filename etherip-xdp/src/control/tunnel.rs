@@ -382,6 +382,9 @@ impl Manager {
         if adopt_mode.is_some() {
             manager.sweep_stale_map_entries();
         }
+        // Cover the adoption path too (add_tunnel syncs on its own): the table
+        // starts empty, and an empty table demuxes nothing.
+        manager.sync_decap_plens();
         // Stamp the pins as belonging to this build only now, with the data
         // plane fully set up under it — a crash mid-adoption must re-run the
         // program swap, never masquerade as "identical".
@@ -436,13 +439,14 @@ impl Manager {
         let (mss4, mss6) = spec.mss.resolve(tunnel_mtu);
         etherip_xdp_common::TunnelConfig {
             src_addr: src.octets(),
-            dst_addr: spec.remote.octets(),
+            dst_addr: spec.remote.addr.octets(),
             internal_ifindex: peer_index,
             external_ifindex: self.external.index,
             tunnel_mac,
             external_mac: self.external.mac,
             dst_mac,
-            _pad: [0; 2],
+            src_plen: spec.local_plen(),
+            dst_plen: spec.remote.plen,
             mss_clamp_ipv4: mss4,
             mss_clamp_ipv6: mss6,
         }
@@ -463,10 +467,18 @@ impl Manager {
         }
     }
 
-    fn decap_key(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> etherip_xdp_common::DecapKey {
+    /// Build the (masked-base) decap demux key. `src` is the effective outer
+    /// source — for a prefixed local, its base address — and `src_plen` its
+    /// prefix length; the masking keeps the invariant explicit even though
+    /// both inputs already arrive masked.
+    fn decap_key(
+        src: std::net::Ipv6Addr,
+        src_plen: u8,
+        remote: crate::control::config::EndpointPrefix,
+    ) -> etherip_xdp_common::DecapKey {
         etherip_xdp_common::DecapKey {
-            remote: dst.octets(),
-            local: src.octets(),
+            remote: etherip_xdp_common::mask_addr(remote.addr.octets(), remote.plen),
+            local: etherip_xdp_common::mask_addr(src.octets(), src_plen),
         }
     }
 
@@ -476,7 +488,16 @@ impl Manager {
     /// reverse-path filtering. Auto-selected sources are always local, so skip.
     async fn warn_if_src_unassigned(&self, spec: &crate::control::config::TunnelSpec) {
         let Some(src) = spec.local else { return };
-        match self.nl.is_local_address(src).await {
+        if src.plen < 128 {
+            // A routed prefix is intentionally not assigned to any interface;
+            // XDP matches it before the stack ever sees the addresses.
+            log::debug!(
+                "tunnel {}: source {src} is a routed prefix; skipping the local-address check",
+                spec.name
+            );
+            return;
+        }
+        match self.nl.is_local_address(src.addr).await {
             Ok(true) => {}
             Ok(false) => log::warn!(
                 "tunnel {}: configured source {src} is not assigned to any local \
@@ -669,7 +690,7 @@ impl Manager {
                     [0u8; 6],
                     user.mtu as i32,
                 );
-                (config, Self::decap_key(unspecified, spec.remote), None)
+                (config, Self::decap_key(unspecified, 128, spec.remote), None)
             }
         };
         self.tunnels.insert(
@@ -748,6 +769,21 @@ impl Manager {
         }
     }
 
+    /// Rewrite the `DECAP_PLENS` masking table from the running tunnels, after
+    /// any decap map change, so the demux masks and the installed keys stay in
+    /// step.
+    fn sync_decap_plens(&mut self) {
+        let plens = decap_plen_pairs(
+            self.tunnels
+                .values()
+                .filter(|t| t.effective_src.is_some())
+                .map(|t| &t.config),
+        );
+        if let Err(e) = self.bpf.set_decap_plens(&plens) {
+            log::warn!("update decap prefix-length table: {e:#}");
+        }
+    }
+
     /// Create a new tunnel: veth pair, MTU/offload, map population, attach.
     async fn add_tunnel(
         &mut self,
@@ -816,8 +852,8 @@ impl Manager {
             &self.nl,
             self.external.index,
             &self.external.name,
-            spec.local,
-            spec.remote,
+            spec.local.map(|e| e.addr),
+            spec.remote.addr,
             spec.next_hop_on_link,
             crate::control::resolver::Probe::Bringup,
         )
@@ -843,7 +879,7 @@ impl Manager {
             Some(src) => {
                 let config =
                     self.build_config(&spec, peer_index, src, tunnel_mac, dst_mac, tunnel_mtu);
-                let decap_key = Self::decap_key(src, spec.remote);
+                let decap_key = Self::decap_key(src, spec.local_plen(), spec.remote);
                 self.bpf.set_encap(peer_index, &config)?;
                 self.bpf.set_decap(&decap_key, &config)?;
                 if dst_mac == [0u8; 6] {
@@ -871,7 +907,7 @@ impl Manager {
                     dst_mac,
                     tunnel_mtu,
                 );
-                let decap_key = Self::decap_key(unspecified, spec.remote);
+                let decap_key = Self::decap_key(unspecified, 128, spec.remote);
                 log::warn!(
                     "tunnel {name}: no source address resolved yet (src auto-select); \
                      pending until a route to {} appears",
@@ -898,6 +934,7 @@ impl Manager {
                 pass_link,
             },
         );
+        self.sync_decap_plens();
         Ok(())
     }
 
@@ -914,6 +951,7 @@ impl Manager {
         }
         self.bpf.remove_encap(t.peer_index).ok();
         self.bpf.remove_decap(&t.decap_key).ok();
+        self.sync_decap_plens();
         self.bpf.remove_peer_redirect(t.peer_index).ok();
         if let Some(pins) = &self.pins
             && let Err(e) = pins.remove_tunnel_dir(name)
@@ -986,8 +1024,8 @@ impl Manager {
             &self.nl,
             self.external.index,
             &self.external.name,
-            spec.local,
-            spec.remote,
+            spec.local.map(|e| e.addr),
+            spec.remote.addr,
             spec.next_hop_on_link,
             crate::control::resolver::Probe::Bringup,
         )
@@ -1020,7 +1058,7 @@ impl Manager {
                 t.config_path = config_path;
                 t.tunnel_mtu = tunnel_mtu;
                 t.config = config;
-                t.decap_key = Self::decap_key(unspecified, t.spec.remote);
+                t.decap_key = Self::decap_key(unspecified, 128, t.spec.remote);
                 t.effective_src = None;
                 t.next_hop = resolved.next_hop;
                 t.next_hop_on_link = resolved.on_link;
@@ -1031,7 +1069,7 @@ impl Manager {
         };
 
         let config = self.build_config(&spec, peer_index, src, tunnel_mac, dst_mac, tunnel_mtu);
-        let new_key = Self::decap_key(src, spec.remote);
+        let new_key = Self::decap_key(src, spec.local_plen(), spec.remote);
 
         self.bpf.set_encap(peer_index, &config)?;
         if was_installed && new_key != old_key {
@@ -1064,6 +1102,7 @@ impl Manager {
             t.next_hop_on_link = resolved.on_link;
             t.neigh_state = resolved.neigh_state;
         }
+        self.sync_decap_plens();
         Ok(())
     }
 
@@ -1155,8 +1194,8 @@ impl Manager {
                 &self.nl,
                 self.external.index,
                 &self.external.name,
-                spec.local,
-                spec.remote,
+                spec.local.map(|e| e.addr),
+                spec.remote.addr,
                 spec.next_hop_on_link,
                 probe,
             )
@@ -1193,7 +1232,7 @@ impl Manager {
                 dst_mac,
                 tunnel_mtu,
             );
-            let new_key = Self::decap_key(src, spec.remote);
+            let new_key = Self::decap_key(src, spec.local_plen(), spec.remote);
             let was_installed = eff_src.is_some();
 
             if was_installed && new_config == cur_config && new_key == cur_key {
@@ -1231,6 +1270,7 @@ impl Manager {
                 );
             }
         }
+        self.sync_decap_plens();
     }
 
     /// Service a control-plane request from the embedded varlink server. Runs
@@ -1330,11 +1370,47 @@ fn reconstruct_adopted_state(
     cfg: &etherip_xdp_common::TunnelConfig,
 ) -> (etherip_xdp_common::DecapKey, Option<std::net::Ipv6Addr>) {
     let src = std::net::Ipv6Addr::from(cfg.src_addr);
+    // Installed addresses are already masked bases; masking here keeps the
+    // key derivation aligned with `decap_key` by construction.
     let decap_key = etherip_xdp_common::DecapKey {
-        remote: cfg.dst_addr,
-        local: cfg.src_addr,
+        remote: etherip_xdp_common::mask_addr(cfg.dst_addr, cfg.dst_plen),
+        local: etherip_xdp_common::mask_addr(cfg.src_addr, cfg.src_plen),
     };
     (decap_key, (!src.is_unspecified()).then_some(src))
+}
+
+/// Distinct (remote_plen, local_plen) combinations of the installed decap
+/// entries, sorted for determinism. Pure core of `sync_decap_plens`. Truncates
+/// at the map capacity — config validation enforces the cap, so hitting it
+/// here can only cost the dropped shape a lookup miss, never a wrong match.
+fn decap_plen_pairs<'a>(
+    configs: impl Iterator<Item = &'a etherip_xdp_common::TunnelConfig>,
+) -> etherip_xdp_common::DecapPlens {
+    // The outer source is the remote endpoint (dst_addr), the destination ours.
+    let mut pairs: Vec<(u8, u8)> = configs.map(|c| (c.dst_plen, c.src_plen)).collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    if pairs.len() > etherip_xdp_common::DECAP_PLEN_PAIRS_MAX {
+        log::warn!(
+            "{} distinct decap prefix-length combinations exceed the table \
+             capacity {}; some tunnels will not demux",
+            pairs.len(),
+            etherip_xdp_common::DECAP_PLEN_PAIRS_MAX
+        );
+    }
+    let mut out = etherip_xdp_common::DecapPlens::zeroed();
+    for (i, (remote_plen, local_plen)) in pairs
+        .into_iter()
+        .take(etherip_xdp_common::DECAP_PLEN_PAIRS_MAX)
+        .enumerate()
+    {
+        out.pairs[i] = etherip_xdp_common::PlenPair {
+            remote_plen,
+            local_plen,
+        };
+        out.len = (i + 1) as u32;
+    }
+    out
 }
 
 /// Observed map keys not owned by any running tunnel. Pure sweep core.
@@ -1352,7 +1428,11 @@ fn stale_entries<K: Eq + std::hash::Hash>(
 /// means the next hop has not resolved yet: the encap/decap entries are installed
 /// but the data path drops every frame (addressed to the null MAC) until a
 /// neighbour appears. That is a failure the operator must see, hence `warn`.
-fn warn_next_hop_unresolved(name: &str, src: std::net::Ipv6Addr, remote: std::net::Ipv6Addr) {
+fn warn_next_hop_unresolved(
+    name: &str,
+    src: std::net::Ipv6Addr,
+    remote: crate::control::config::EndpointPrefix,
+) {
     log::warn!(
         "tunnel {name}: {src} -> {remote} installed but next-hop MAC unresolved; \
          frames are dropped until a neighbour resolves"
@@ -1471,7 +1551,14 @@ mod tests {
         cfg.src_addr = src.octets();
         cfg.dst_addr = remote.octets();
         let (key, eff) = reconstruct_adopted_state(&cfg);
-        assert_eq!(key, Manager::decap_key(src, remote));
+        assert_eq!(
+            key,
+            Manager::decap_key(
+                src,
+                128,
+                crate::control::config::EndpointPrefix::host(remote)
+            )
+        );
         assert_eq!(eff, Some(src));
     }
 
@@ -1480,6 +1567,40 @@ mod tests {
         let cfg = etherip_xdp_common::TunnelConfig::zeroed();
         let (_, eff) = reconstruct_adopted_state(&cfg);
         assert_eq!(eff, None);
+    }
+
+    #[test]
+    fn decap_plen_pairs_dedup_sort_truncate() {
+        let mk = |dst_plen, src_plen| etherip_xdp_common::TunnelConfig {
+            src_plen,
+            dst_plen,
+            ..etherip_xdp_common::TunnelConfig::zeroed()
+        };
+
+        let configs = [mk(128, 128), mk(112, 64), mk(128, 128), mk(112, 64)];
+        let plens = decap_plen_pairs(configs.iter());
+        assert_eq!(plens.len, 2);
+        assert_eq!(
+            plens.pairs[0],
+            etherip_xdp_common::PlenPair {
+                remote_plen: 112,
+                local_plen: 64
+            }
+        );
+        assert_eq!(
+            plens.pairs[1],
+            etherip_xdp_common::PlenPair {
+                remote_plen: 128,
+                local_plen: 128
+            }
+        );
+
+        assert_eq!(decap_plen_pairs([].iter()).len, 0);
+
+        // One distinct combination past capacity is dropped, not panicked on.
+        let many: Vec<_> = (64u8..64 + 9).map(|p| mk(p, 128)).collect();
+        let plens = decap_plen_pairs(many.iter());
+        assert_eq!(plens.len as usize, etherip_xdp_common::DECAP_PLEN_PAIRS_MAX);
     }
 
     #[test]
