@@ -105,14 +105,58 @@ impl TunnelConfig {
 }
 
 /// Decap demux key: the outer IPv6 (source, destination) pair, i.e. the
-/// remote endpoint as `remote` and our local endpoint as `local`.
+/// remote endpoint as `remote` and our local endpoint as `local`. Both hold
+/// the endpoint's **masked base address** (host bits below its prefix length
+/// zero); the decap path masks the incoming pair by each [`DecapPlens`] entry
+/// before looking up, so a /128 endpoint keeps exact matching.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DecapKey {
-    /// Expected outer IPv6 source (remote endpoint).
+    /// Expected outer IPv6 source (remote endpoint) base.
     pub remote: [u8; 16],
-    /// Expected outer IPv6 destination (our local endpoint).
+    /// Expected outer IPv6 destination (our local endpoint) base.
     pub local: [u8; 16],
+}
+
+/// Maximum distinct [`PlenPair`]s the decap demux iterates (`DECAP_PLENS`
+/// capacity; config validation enforces the cap).
+pub const DECAP_PLEN_PAIRS_MAX: usize = 8;
+
+/// One decap masking rule: the prefix lengths applied to the outer
+/// (source, destination) pair before the [`DecapKey`] lookup.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlenPair {
+    /// Prefix length applied to the outer source (the remote endpoint).
+    pub remote_plen: u8,
+    /// Prefix length applied to the outer destination (our local endpoint).
+    pub local_plen: u8,
+}
+
+/// The whole decap masking table, stored as the single value of the
+/// `DECAP_PLENS` array map so userspace replaces it in one map update. It
+/// holds the *distinct* prefix-length combinations across all tunnels, not
+/// one entry per tunnel: the demux cost scales with prefix-length shapes
+/// (usually one), not tunnel count.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecapPlens {
+    /// Number of valid leading entries in `pairs`.
+    pub len: u32,
+    pub pairs: [PlenPair; DECAP_PLEN_PAIRS_MAX],
+}
+
+impl DecapPlens {
+    /// An empty table (matches nothing).
+    pub const fn zeroed() -> Self {
+        DecapPlens {
+            len: 0,
+            pairs: [PlenPair {
+                remote_plen: 0,
+                local_plen: 0,
+            }; DECAP_PLEN_PAIRS_MAX],
+        }
+    }
 }
 
 /// Expected [`PinnedState::magic`] value ("eXdP", little-endian).
@@ -426,6 +470,12 @@ unsafe impl aya::Pod for DecapKey {}
 // contract).
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PinnedState {}
+// SAFETY: `DecapPlens` is `#[repr(C)]`, `Copy`, a naturally-aligned `u32`
+// followed by an array of two-`u8` pairs (20 bytes total, no padding —
+// asserted by `decap_plens_has_no_padding`); every bit pattern is a valid
+// value (aya `Pod` contract).
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for DecapPlens {}
 
 #[cfg(test)]
 mod tests {
@@ -522,6 +572,16 @@ mod tests {
         // The struct is a bpffs map value read by external tooling; its size
         // must be exactly the sum of its fields on every target.
         assert_eq!(core::mem::size_of::<PinnedState>(), 4 + 4 + 32 + 32);
+    }
+
+    #[test]
+    fn decap_plens_has_no_padding() {
+        // Map value shared with the eBPF program and validated by size against
+        // pinned maps; must be exactly the sum of its fields on every target.
+        assert_eq!(
+            core::mem::size_of::<DecapPlens>(),
+            4 + 2 * DECAP_PLEN_PAIRS_MAX
+        );
     }
 
     #[test]

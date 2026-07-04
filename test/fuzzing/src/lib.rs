@@ -86,6 +86,40 @@ pub fn decap_cfg() -> etherip_xdp_common::TunnelConfig {
     }
 }
 
+/// As [`encap_cfg_prefixed`] but with MSS clamping disabled (round-trip use).
+pub fn encap_cfg_prefixed_no_clamp() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        mss_clamp_ipv4: 0,
+        mss_clamp_ipv6: 0,
+        ..encap_cfg_prefixed()
+    }
+}
+
+/// The B-end decap config for the prefixed tunnel: local `PREFIX_B/PLEN_B`,
+/// remote `PREFIX_A/PLEN_A`.
+pub fn decap_cfg_prefixed() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        src_addr: PREFIX_B,
+        dst_addr: PREFIX_A,
+        src_plen: PLEN_B,
+        dst_plen: PLEN_A,
+        ..decap_cfg()
+    }
+}
+
+/// Build a `DecapPlens` table from `(remote_plen, local_plen)` pairs.
+pub fn plens(pairs: &[(u8, u8)]) -> etherip_xdp_common::DecapPlens {
+    let mut p = etherip_xdp_common::DecapPlens::zeroed();
+    for (i, &(remote_plen, local_plen)) in pairs.iter().enumerate() {
+        p.pairs[i] = etherip_xdp_common::PlenPair {
+            remote_plen,
+            local_plen,
+        };
+        p.len = (i + 1) as u32;
+    }
+    p
+}
+
 /// Layer-3 choice for a generated inner frame.
 #[derive(arbitrary::Arbitrary, Debug)]
 pub enum L3 {

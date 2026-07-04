@@ -406,14 +406,19 @@ pub enum DecapOutcome {
 /// Ethernet frame unchanged. The inner MACs are left intact (encap is likewise
 /// transparent), so the path is a transparent L2 pseudo-wire: it works both for an
 /// L3 endpoint (whose MAC inner frames reach via ARP/ND) and for a `<name>`
-/// enslaved to a bridge. `find` returns the tunnel config for a [`DecapKey`] (the
+/// enslaved to a bridge.
+///
+/// The demux masks (saddr, daddr) by each `plens` entry in turn and calls `find`
+/// with the resulting base-address [`DecapKey`], so prefixed endpoints accept any
+/// host bits below their prefix; the first hit wins (config validation keeps the
+/// combinations unambiguous). `find` returns the tunnel config for a key (the
 /// eBPF program backs it with the `DECAP_CONFIG` map; the host backs it with a
 /// fixed table).
 #[inline(always)]
-pub fn decap<P, F>(pkt: &mut P, find: F) -> DecapOutcome
+pub fn decap<P, F>(pkt: &mut P, plens: &crate::DecapPlens, mut find: F) -> DecapOutcome
 where
     P: Packet,
-    F: FnOnce(&crate::DecapKey) -> Option<crate::TunnelConfig>,
+    F: FnMut(&crate::DecapKey) -> Option<crate::TunnelConfig>,
 {
     let eth: EthHdr = match pkt.load(0) {
         Ok(e) => e,
@@ -437,17 +442,29 @@ where
         return DecapOutcome::NotEtherip;
     }
 
-    let key = crate::DecapKey {
-        remote: ip6.saddr,
-        local: ip6.daddr,
-    };
-    let cfg = match find(&key) {
+    let mut cfg: Option<crate::TunnelConfig> = None;
+    for i in 0..crate::DECAP_PLEN_PAIRS_MAX {
+        if i >= plens.len as usize {
+            break;
+        }
+        let pair = plens.pairs[i];
+        let key = crate::DecapKey {
+            remote: crate::mask_addr(ip6.saddr, pair.remote_plen),
+            local: crate::mask_addr(ip6.daddr, pair.local_plen),
+        };
+        if let Some(c) = find(&key) {
+            cfg = Some(c);
+            break;
+        }
+    }
+    let cfg = match cfg {
         Some(c) => c,
         None => return DecapOutcome::NoTunnel,
     };
 
-    // Loopback guard: drop frames sourced from our own tunnel address.
-    if ip6.saddr == cfg.src_addr {
+    // Loopback guard: drop frames sourced from our own tunnel prefix
+    // (`src_addr` is the masked base, so this is exact for /128).
+    if crate::mask_addr(ip6.saddr, cfg.src_plen) == cfg.src_addr {
         return DecapOutcome::OwnPkt;
     }
 

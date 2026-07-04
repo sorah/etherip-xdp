@@ -382,6 +382,9 @@ impl Manager {
         if adopt_mode.is_some() {
             manager.sweep_stale_map_entries();
         }
+        // Cover the adoption path too (add_tunnel syncs on its own): the table
+        // starts empty, and an empty table demuxes nothing.
+        manager.sync_decap_plens();
         // Stamp the pins as belonging to this build only now, with the data
         // plane fully set up under it — a crash mid-adoption must re-run the
         // program swap, never masquerade as "identical".
@@ -749,6 +752,21 @@ impl Manager {
         }
     }
 
+    /// Rewrite the `DECAP_PLENS` masking table from the running tunnels, after
+    /// any decap map change, so the demux masks and the installed keys stay in
+    /// step.
+    fn sync_decap_plens(&mut self) {
+        let plens = decap_plen_pairs(
+            self.tunnels
+                .values()
+                .filter(|t| t.effective_src.is_some())
+                .map(|t| &t.config),
+        );
+        if let Err(e) = self.bpf.set_decap_plens(&plens) {
+            log::warn!("update decap prefix-length table: {e:#}");
+        }
+    }
+
     /// Create a new tunnel: veth pair, MTU/offload, map population, attach.
     async fn add_tunnel(
         &mut self,
@@ -899,6 +917,7 @@ impl Manager {
                 pass_link,
             },
         );
+        self.sync_decap_plens();
         Ok(())
     }
 
@@ -915,6 +934,7 @@ impl Manager {
         }
         self.bpf.remove_encap(t.peer_index).ok();
         self.bpf.remove_decap(&t.decap_key).ok();
+        self.sync_decap_plens();
         self.bpf.remove_peer_redirect(t.peer_index).ok();
         if let Some(pins) = &self.pins
             && let Err(e) = pins.remove_tunnel_dir(name)
@@ -1065,6 +1085,7 @@ impl Manager {
             t.next_hop_on_link = resolved.on_link;
             t.neigh_state = resolved.neigh_state;
         }
+        self.sync_decap_plens();
         Ok(())
     }
 
@@ -1232,6 +1253,7 @@ impl Manager {
                 );
             }
         }
+        self.sync_decap_plens();
     }
 
     /// Service a control-plane request from the embedded varlink server. Runs
@@ -1336,6 +1358,40 @@ fn reconstruct_adopted_state(
         local: cfg.src_addr,
     };
     (decap_key, (!src.is_unspecified()).then_some(src))
+}
+
+/// Distinct (remote_plen, local_plen) combinations of the installed decap
+/// entries, sorted for determinism. Pure core of `sync_decap_plens`. Truncates
+/// at the map capacity — config validation enforces the cap, so hitting it
+/// here can only cost the dropped shape a lookup miss, never a wrong match.
+fn decap_plen_pairs<'a>(
+    configs: impl Iterator<Item = &'a etherip_xdp_common::TunnelConfig>,
+) -> etherip_xdp_common::DecapPlens {
+    // The outer source is the remote endpoint (dst_addr), the destination ours.
+    let mut pairs: Vec<(u8, u8)> = configs.map(|c| (c.dst_plen, c.src_plen)).collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    if pairs.len() > etherip_xdp_common::DECAP_PLEN_PAIRS_MAX {
+        log::warn!(
+            "{} distinct decap prefix-length combinations exceed the table \
+             capacity {}; some tunnels will not demux",
+            pairs.len(),
+            etherip_xdp_common::DECAP_PLEN_PAIRS_MAX
+        );
+    }
+    let mut out = etherip_xdp_common::DecapPlens::zeroed();
+    for (i, (remote_plen, local_plen)) in pairs
+        .into_iter()
+        .take(etherip_xdp_common::DECAP_PLEN_PAIRS_MAX)
+        .enumerate()
+    {
+        out.pairs[i] = etherip_xdp_common::PlenPair {
+            remote_plen,
+            local_plen,
+        };
+        out.len = (i + 1) as u32;
+    }
+    out
 }
 
 /// Observed map keys not owned by any running tunnel. Pure sweep core.
@@ -1481,6 +1537,40 @@ mod tests {
         let cfg = etherip_xdp_common::TunnelConfig::zeroed();
         let (_, eff) = reconstruct_adopted_state(&cfg);
         assert_eq!(eff, None);
+    }
+
+    #[test]
+    fn decap_plen_pairs_dedup_sort_truncate() {
+        let mk = |dst_plen, src_plen| etherip_xdp_common::TunnelConfig {
+            src_plen,
+            dst_plen,
+            ..etherip_xdp_common::TunnelConfig::zeroed()
+        };
+
+        let configs = [mk(128, 128), mk(112, 64), mk(128, 128), mk(112, 64)];
+        let plens = decap_plen_pairs(configs.iter());
+        assert_eq!(plens.len, 2);
+        assert_eq!(
+            plens.pairs[0],
+            etherip_xdp_common::PlenPair {
+                remote_plen: 112,
+                local_plen: 64
+            }
+        );
+        assert_eq!(
+            plens.pairs[1],
+            etherip_xdp_common::PlenPair {
+                remote_plen: 128,
+                local_plen: 128
+            }
+        );
+
+        assert_eq!(decap_plen_pairs([].iter()).len, 0);
+
+        // One distinct combination past capacity is dropped, not panicked on.
+        let many: Vec<_> = (64u8..64 + 9).map(|p| mk(p, 128)).collect();
+        let plens = decap_plen_pairs(many.iter());
+        assert_eq!(plens.len as usize, etherip_xdp_common::DECAP_PLEN_PAIRS_MAX);
     }
 
     #[test]

@@ -22,6 +22,7 @@ const PASS_PROG: &str = "xdp_pass";
 
 const ENCAP_CONFIG: &str = "ENCAP_CONFIG";
 const DECAP_CONFIG: &str = "DECAP_CONFIG";
+const DECAP_PLENS: &str = "DECAP_PLENS";
 const REDIRECT_UPLINK: &str = "REDIRECT_UPLINK";
 const REDIRECT_PEER: &str = "REDIRECT_PEER";
 const DEBUG_COUNTERS: &str = "DEBUG_COUNTERS";
@@ -29,9 +30,10 @@ const DEBUG_COUNTERS: &str = "DEBUG_COUNTERS";
 const STATE_MAP: &str = "ETHERIP_STATE";
 
 /// Map names of the embedded object, i.e. what [`Bpf::load`] pins.
-const OBJECT_MAPS: [&str; 5] = [
+const OBJECT_MAPS: [&str; 6] = [
     ENCAP_CONFIG,
     DECAP_CONFIG,
+    DECAP_PLENS,
     REDIRECT_UPLINK,
     REDIRECT_PEER,
     DEBUG_COUNTERS,
@@ -237,7 +239,7 @@ impl MapSpec {
 
 /// The expected shape of every pinned map, mirroring the eBPF declarations
 /// (via the shared `*_MAX_ENTRIES` constants) plus the userspace state map.
-pub fn expected_map_specs() -> [MapSpec; 6] {
+pub fn expected_map_specs() -> [MapSpec; 7] {
     [
         MapSpec {
             name: ENCAP_CONFIG,
@@ -252,6 +254,13 @@ pub fn expected_map_specs() -> [MapSpec; 6] {
             key_size: std::mem::size_of::<etherip_xdp_common::DecapKey>() as u32,
             value_size: std::mem::size_of::<etherip_xdp_common::TunnelConfig>() as u32,
             max_entries: etherip_xdp_common::DECAP_CONFIG_MAX_ENTRIES,
+        },
+        MapSpec {
+            name: DECAP_PLENS,
+            map_type: aya::maps::MapType::Array,
+            key_size: 4,
+            value_size: std::mem::size_of::<etherip_xdp_common::DecapPlens>() as u32,
+            max_entries: 1,
         },
         MapSpec {
             name: REDIRECT_UPLINK,
@@ -704,6 +713,21 @@ impl Bpf {
     pub fn remove_decap(&mut self, key: &etherip_xdp_common::DecapKey) -> anyhow::Result<()> {
         let mut map = self.hash_map(DECAP_CONFIG)?;
         map.remove(key)?;
+        Ok(())
+    }
+
+    /// Replace the decap prefix-length table (the single `DECAP_PLENS` value).
+    pub fn set_decap_plens(
+        &mut self,
+        plens: &etherip_xdp_common::DecapPlens,
+    ) -> anyhow::Result<()> {
+        let map = self
+            .ebpf
+            .map_mut(DECAP_PLENS)
+            .ok_or_else(|| anyhow::anyhow!("map {DECAP_PLENS} missing"))?;
+        let mut map: aya::maps::Array<_, etherip_xdp_common::DecapPlens> =
+            aya::maps::Array::try_from(map)?;
+        map.set(0, *plens, 0)?;
         Ok(())
     }
 
