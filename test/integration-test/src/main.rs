@@ -319,23 +319,32 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
     terminate(&mut daemon).await;
 
     // A SIGTERM stop is a full teardown: the pins must be gone, and the netns
-    // fd released from the store, with it.
-    let pin_dir = bpffs_instance_dir(opt);
-    anyhow::ensure!(
-        !pin_dir.exists(),
-        "pin dir {} survived SIGTERM teardown",
-        pin_dir.display()
-    );
-    if opt.restart_scenarios {
+    // fd released from the store, with it. Skipped when the scenario already
+    // failed — a failure can legitimately leave the daemon stopped mid-phase
+    // with the pins deliberately in place, and this check must not shadow the
+    // real error.
+    let teardown = async {
+        let pin_dir = bpffs_instance_dir(opt);
         anyhow::ensure!(
-            notify
-                .wait_unstored("netns", std::time::Duration::from_secs(5))
-                .await,
-            "netns fd still in the store after SIGTERM teardown"
+            !pin_dir.exists(),
+            "pin dir {} survived SIGTERM teardown",
+            pin_dir.display()
         );
+        if opt.restart_scenarios {
+            anyhow::ensure!(
+                notify
+                    .wait_unstored("netns", std::time::Duration::from_secs(5))
+                    .await,
+                "netns fd still in the store after SIGTERM teardown"
+            );
+        }
+        log("pins removed on teardown");
+        Ok(())
+    };
+    match result {
+        Ok(()) => teardown.await,
+        Err(e) => Err(e),
     }
-    log("pins removed on teardown");
-    result
 }
 
 /// The daemon's per-uplink pin directory (`control/bpf.rs::PinPaths`).
@@ -431,6 +440,9 @@ async fn restart_phases(
 
     let phases = async {
         let adopted = format!("tunnel {}: adopted running data plane", opt.tunnel_name);
+        // Signal only after the daemon's signal loop is up (deterministic exit codes).
+        const READY: &str = "etherip-xdp ready";
+        wait_daemon_log(opt, 0, READY, 20).await?;
 
         log("restart phase 1: SIGUSR2 handoff, identical object (skip swap)");
         stop_daemon(daemon, nix::sys::signal::Signal::SIGUSR2).await?;
@@ -438,6 +450,7 @@ async fn restart_phases(
         wait_daemon_log(opt, 1, "eBPF object unchanged", 20).await?;
         wait_daemon_log(opt, 1, "adopted the uplink decap link", 20).await?;
         wait_daemon_log(opt, 1, &adopted, 20).await?;
+        wait_daemon_log(opt, 1, READY, 20).await?;
 
         log("restart phase 2: SIGUSR2 handoff, changed object digest (atomic swap)");
         stop_daemon(daemon, nix::sys::signal::Signal::SIGUSR2).await?;
@@ -445,17 +458,20 @@ async fn restart_phases(
         *daemon = respawn_daemon(opt, notify, 2)?;
         wait_daemon_log(opt, 2, "updating attached programs atomically", 20).await?;
         wait_daemon_log(opt, 2, &adopted, 20).await?;
+        wait_daemon_log(opt, 2, READY, 20).await?;
 
         log("restart phase 3: crash (SIGKILL) and respawn");
         stop_daemon(daemon, nix::sys::signal::Signal::SIGKILL).await?;
         *daemon = respawn_daemon(opt, notify, 3)?;
         wait_daemon_log(opt, 3, &adopted, 20).await?;
+        wait_daemon_log(opt, 3, READY, 20).await?;
 
         log("restart phase 4: config edited while down (mtu applied on adopt)");
         stop_daemon(daemon, nix::sys::signal::Signal::SIGUSR2).await?;
         write_config(opt, uplink_ip, peer_uplink, Some(RESTART_MTU))?;
         *daemon = respawn_daemon(opt, notify, 4)?;
         wait_daemon_log(opt, 4, &adopted, 20).await?;
+        wait_daemon_log(opt, 4, READY, 20).await?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             if link_mtu(handle, &opt.tunnel_name).await? == Some(RESTART_MTU) {

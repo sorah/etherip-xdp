@@ -188,6 +188,10 @@ pub async fn run(inherited: crate::control::systemd::InheritedFds) -> anyhow::Re
     bump_memlock_rlimit();
 
     let device = opt.device.clone();
+    // Installed before set-up so a restart racing it exits as a logged handoff,
+    // not a signal death; TERM/INT stay default to keep a blocked set-up stoppable.
+    let mut sigusr2 =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?;
     let mut manager = crate::control::tunnel::Manager::start(
         opt.device,
         config_dirs,
@@ -217,8 +221,6 @@ pub async fn run(inherited: crate::control::systemd::InheritedFds) -> anyhow::Re
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut sigusr2 =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())?;
     let mut reresolve = spawn_bounce(crate::control::netlink::spawn_change_monitor()?);
     let mut ticker = tokio::time::interval(RERESOLVE_INTERVAL);
     ticker.tick().await; // consume the immediate first tick
