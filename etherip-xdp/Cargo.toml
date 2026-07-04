@@ -1,6 +1,6 @@
 [package]
 name = "etherip-xdp"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 description = "XDP-accelerated EtherIP (RFC 3378) over IPv6 tunnels"
 
