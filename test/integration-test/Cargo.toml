@@ -23,8 +23,9 @@ aya = { workspace = true }
 caps = "0.5"
 clap = { workspace = true, features = ["std", "derive", "help", "usage", "error-context"] }
 futures-util = { workspace = true }
-# `uio` for recvmsg/SCM_RIGHTS in the mini-systemd fd store (minisystemd.rs).
-nix = { workspace = true, features = ["signal", "user", "process", "fs", "uio"] }
+# `uio` for recvmsg/SCM_RIGHTS in the mini-systemd fd store (minisystemd.rs);
+# `mount` to supply a bpffs inside `ip netns exec`'s fresh mount namespace.
+nix = { workspace = true, features = ["signal", "user", "process", "fs", "uio", "mount"] }
 rtnetlink = { workspace = true }
 socket2 = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "net", "io-util", "time", "process"] }

@@ -346,6 +346,24 @@ fn bpffs_instance_dir(opt: &Opt) -> std::path::PathBuf {
 /// Stand-in for the packaged tmpfiles.d entry: the pin root, group-writable
 /// for the sandboxed daemon (setgid so its subdirectories inherit the group).
 fn prepare_bpffs_root(opt: &Opt) -> anyhow::Result<()> {
+    // `ip netns exec` (local mode) runs the scenario in a fresh mount
+    // namespace with /sys re-mounted, losing the host's bpffs sub-mount —
+    // mount one. It is private to the scenario and the daemons it spawns,
+    // which is exactly the lifetime pin persistence needs here. The VM init
+    // already mounts bpffs; leave a mounted one alone.
+    let is_bpffs = nix::sys::statfs::statfs("/sys/fs/bpf")
+        .map(|s| s.filesystem_type() == nix::sys::statfs::BPF_FS_MAGIC)
+        .unwrap_or(false);
+    if !is_bpffs {
+        nix::mount::mount(
+            Some("bpf"),
+            "/sys/fs/bpf",
+            Some("bpf"),
+            nix::mount::MsFlags::empty(),
+            None::<&str>,
+        )
+        .map_err(|e| anyhow::anyhow!("mount bpffs at /sys/fs/bpf: {e}"))?;
+    }
     let root = std::path::Path::new("/sys/fs/bpf/etherip-xdp");
     std::fs::create_dir_all(root).map_err(|e| anyhow::anyhow!("create {}: {e}", root.display()))?;
     if opt.sandbox {
