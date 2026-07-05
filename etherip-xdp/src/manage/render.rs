@@ -84,6 +84,14 @@ pub fn render_detail(iface: &generated::InterfaceStatus, t: &generated::Tunnel) 
         None => String::new(),
     };
     let _ = writeln!(out, "  mtu:              {}{}", t.mtu, mtu_override);
+    if let Some(vlan) = t.vlan {
+        let check = if t.checkVlanTagOnDecap {
+            " (decap tag check on)"
+        } else {
+            ""
+        };
+        let _ = writeln!(out, "  vlan:             {vlan}{check}");
+    }
     let _ = writeln!(
         out,
         "  mac:              {} (policy {})",
@@ -236,6 +244,8 @@ mod tests {
             ),
             mssClampIpv4: 1404,
             mssClampIpv6: 0,
+            vlan: None,
+            checkVlanTagOnDecap: false,
             peerIfindex: 7,
         }
     }

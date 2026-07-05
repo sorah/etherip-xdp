@@ -72,4 +72,16 @@ libfuzzer_sys::fuzz_target!(|spec: etherip_xdp_fuzz::InnerSpec| {
             local: etherip_xdp_fuzz::PREFIX_B,
         },
     );
+    // Tagged tunnel: encap adds an 802.1Q tag that decap must strip to recover
+    // the inner frame, over the same arbitrary inner frames.
+    roundtrip(
+        &inner,
+        &etherip_xdp_fuzz::encap_cfg_vlan_no_clamp(),
+        &etherip_xdp_fuzz::decap_cfg_vlan(),
+        &etherip_xdp_fuzz::plens(&[(128, 128)]),
+        &etherip_xdp_common::DecapKey {
+            remote: etherip_xdp_fuzz::ADDR_A,
+            local: etherip_xdp_fuzz::ADDR_B,
+        },
+    );
 });

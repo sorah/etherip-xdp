@@ -45,6 +45,24 @@ pub struct Ipv6Hdr {
     pub daddr: [u8; 16],
 }
 
+/// Outer Ethernet header with an 802.1Q tag: the two MACs, the tag's TPID and
+/// TCI, and the EtherType that an untagged header carries in [`EthHdr`]. Written
+/// by encap when a tunnel is VLAN-tagged; 4 bytes ([`crate::VLAN_TAG_LEN`])
+/// longer than [`EthHdr`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VlanEthHdr {
+    pub dst: [u8; 6],
+    pub src: [u8; 6],
+    /// Tag protocol identifier (0x8100 for 802.1Q).
+    pub tpid: [u8; 2],
+    /// Tag control information: PCP (3) | DEI (1) | VID (12). This build writes
+    /// PCP/DEI 0, so it holds the VLAN id alone.
+    pub tci: [u8; 2],
+    /// EtherType of the encapsulated protocol (IPv6 here).
+    pub ethertype: [u8; 2],
+}
+
 /// EtherIP header (RFC 3378): a version nibble and a zero pad byte.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -257,20 +275,22 @@ pub fn inner_flow_hash64<P: Packet>(pkt: &P) -> u64 {
     crate::fnv64(crate::FNV64_OFFSET, &eth)
 }
 
-/// Write the outer IPv6 and EtherIP headers over the freshly grown headroom (the
-/// outer Ethernet header is written by the caller). `entropy` fills the host
-/// bits of prefixed endpoint addresses (a no-op for /128 endpoints).
+/// Write the outer IPv6 and EtherIP headers over the freshly grown headroom,
+/// after an outer L2 header of `L2` bytes (14 untagged, 18 with an 802.1Q tag),
+/// which the caller writes. `L2` is a const so both offsets stay constant per
+/// monomorphization. `entropy` fills the host bits of prefixed endpoint
+/// addresses (a no-op for /128 endpoints).
 #[inline(always)]
-pub fn build_outer_headers<P: Packet>(
+pub fn build_outer_headers<P: Packet, const L2: usize>(
     pkt: &mut P,
     cfg: &crate::TunnelConfig,
     flow_hash: u32,
     entropy: u64,
 ) -> Result<(), ()> {
-    let eip_off = ETH_HDR_LEN + IPV6_HDR_LEN;
+    let eip_off = L2 + IPV6_HDR_LEN;
     // Outer IPv6 payload length = EtherIP + inner frame = total length minus the
-    // outer Ethernet+IPv6 headers. Computed from the scalar buffer length to
-    // avoid a packet-pointer subtraction the verifier rejects on newer kernels.
+    // outer L2+IPv6 headers. Computed from the scalar buffer length to avoid a
+    // packet-pointer subtraction the verifier rejects on newer kernels.
     let payload_len = pkt.buff_len().saturating_sub(eip_off) as u16; // EtherIP + inner
     let ip6 = Ipv6Hdr {
         vtf: [
@@ -285,7 +305,7 @@ pub fn build_outer_headers<P: Packet>(
         saddr: crate::fill_host_bits(cfg.src_addr, cfg.src_plen, entropy),
         daddr: crate::fill_host_bits(cfg.dst_addr, cfg.dst_plen, crate::mix_entropy(entropy)),
     };
-    pkt.store(ETH_HDR_LEN, ip6)?;
+    pkt.store(L2, ip6)?;
 
     let eip = EtherIpHdr {
         ver: crate::ETHERIP_VERSION,
@@ -347,7 +367,9 @@ pub enum EncapOutcome {
 }
 
 /// Encapsulate the inner frame currently in `pkt`: grow headroom, write the outer
-/// Ethernet/IPv6/EtherIP headers, and clamp the inner TCP MSS.
+/// Ethernet/IPv6/EtherIP headers, and clamp the inner TCP MSS. A tunnel with a
+/// non-zero `cfg.vlan_id` prepends an 802.1Q tag, growing the outer L2 header
+/// from 14 to 18 bytes.
 #[inline(always)]
 pub fn encap<P: Packet>(pkt: &mut P, cfg: &crate::TunnelConfig) -> EncapOutcome {
     if pkt.load::<EthHdr>(0).is_err() {
@@ -358,24 +380,57 @@ pub fn encap<P: Packet>(pkt: &mut P, cfg: &crate::TunnelConfig) -> EncapOutcome 
     // offset 0.
     let entropy = inner_flow_hash64(pkt);
 
-    let outer_len = crate::OUTER_OVERHEAD;
+    // Split on the tag so each L2 length is a compile-time constant (constant
+    // packet offsets throughout, as the verifier requires).
+    if cfg.vlan_id != 0 {
+        encap_l2::<P, { ETH_HDR_LEN + crate::VLAN_TAG_LEN }>(pkt, cfg, flow_hash, entropy)
+    } else {
+        encap_l2::<P, ETH_HDR_LEN>(pkt, cfg, flow_hash, entropy)
+    }
+}
+
+/// Encap for a fixed outer L2 header length `L2` (14 untagged, 18 tagged): grow
+/// the headroom by `L2 + IPv6 + EtherIP`, write the outer headers, clamp the
+/// inner MSS, then lay down the L2 header (plain [`EthHdr`] or [`VlanEthHdr`]).
+#[inline(always)]
+fn encap_l2<P: Packet, const L2: usize>(
+    pkt: &mut P,
+    cfg: &crate::TunnelConfig,
+    flow_hash: u32,
+    entropy: u64,
+) -> EncapOutcome {
+    let outer_len = L2 + IPV6_HDR_LEN + ETHERIP_HDR_LEN;
     if pkt.adjust_head(-(outer_len as i32)).is_err() {
         return EncapOutcome::AdjustFail;
     }
-    if build_outer_headers(pkt, cfg, flow_hash, entropy).is_err() {
+    if build_outer_headers::<P, L2>(pkt, cfg, flow_hash, entropy).is_err() {
         return EncapOutcome::BuildFail;
     }
     if clamp_inner_tcp_mss(pkt, outer_len, cfg).is_err() {
         return EncapOutcome::MssFail;
     }
 
-    let eth = EthHdr {
-        dst: cfg.dst_mac,
-        src: cfg.external_mac,
-        ethertype: ETH_P_IPV6.to_be_bytes(),
-    };
-    if pkt.store(0, eth).is_err() {
-        return EncapOutcome::BoundsFail;
+    if L2 == ETH_HDR_LEN {
+        let eth = EthHdr {
+            dst: cfg.dst_mac,
+            src: cfg.external_mac,
+            ethertype: ETH_P_IPV6.to_be_bytes(),
+        };
+        if pkt.store(0, eth).is_err() {
+            return EncapOutcome::BoundsFail;
+        }
+    } else {
+        let eth = VlanEthHdr {
+            dst: cfg.dst_mac,
+            src: cfg.external_mac,
+            tpid: crate::ETH_P_8021Q.to_be_bytes(),
+            // PCP/DEI 0, so the TCI is the 12-bit VID alone.
+            tci: (cfg.vlan_id & 0x0FFF).to_be_bytes(),
+            ethertype: ETH_P_IPV6.to_be_bytes(),
+        };
+        if pkt.store(0, eth).is_err() {
+            return EncapOutcome::BoundsFail;
+        }
     }
 
     EncapOutcome::Redirect
@@ -395,6 +450,11 @@ pub enum DecapOutcome {
     NoTunnel,
     /// Frame is sourced from our own tunnel address — loopback guard (`XDP_PASS`).
     OwnPkt,
+    /// The tunnel enables [`crate::TUNNEL_FLAG_CHECK_VLAN_TAG`] and the outer
+    /// 802.1Q VLAN id did not match its `vlan_id` (an untagged frame for a
+    /// tagged tunnel, the wrong id, or — with the tag stripped by RX offload —
+    /// no visible tag) (`XDP_PASS`).
+    VlanMismatch,
     /// EtherIP version/pad mismatch (`XDP_PASS`).
     BadHeader,
     /// Decapsulated; redirect to the veth peer (`internal_ifindex`).
@@ -424,20 +484,40 @@ where
         Ok(e) => e,
         Err(()) => return DecapOutcome::Abort,
     };
-    if u16::from_be_bytes(eth.ethertype) != ETH_P_IPV6 {
+    // `eth.ethertype` sits at offset 12; on a tagged frame it holds the tag's
+    // TPID, with the TCI (VID) and the real EtherType following. Skip the tag if
+    // present so the same code path handles tagged and untagged frames; `vid` is
+    // validated against the matched tunnel below.
+    let mut ethertype = u16::from_be_bytes(eth.ethertype);
+    let mut l2_len = ETH_HDR_LEN;
+    let mut vid: u16 = 0;
+    if ethertype == crate::ETH_P_8021Q {
+        let tci = match pkt.load::<[u8; 2]>(ETH_HDR_LEN) {
+            Ok(t) => u16::from_be_bytes(t),
+            Err(()) => return DecapOutcome::Abort,
+        };
+        vid = tci & 0x0FFF;
+        ethertype = match pkt.load::<[u8; 2]>(ETH_HDR_LEN + 2) {
+            Ok(t) => u16::from_be_bytes(t),
+            Err(()) => return DecapOutcome::Abort,
+        };
+        l2_len = ETH_HDR_LEN + crate::VLAN_TAG_LEN;
+    }
+    if ethertype != ETH_P_IPV6 {
         return DecapOutcome::NotIpv6;
     }
 
-    let ip6: Ipv6Hdr = match pkt.load(ETH_HDR_LEN) {
+    // `l2_len` is packet-derived (a runtime scalar), so the IPv6 header and the
+    // offsets past it go through the variable-offset primitives.
+    let ip6: Ipv6Hdr = match pkt.load_var(l2_len) {
         Ok(h) => h,
         Err(()) => return DecapOutcome::Abort,
     };
 
-    let (eip_off, final_nexthdr) =
-        match skip_ext_headers(pkt, ETH_HDR_LEN + IPV6_HDR_LEN, ip6.nexthdr) {
-            Ok(v) => v,
-            Err(()) => return DecapOutcome::Abort,
-        };
+    let (eip_off, final_nexthdr) = match skip_ext_headers(pkt, l2_len + IPV6_HDR_LEN, ip6.nexthdr) {
+        Ok(v) => v,
+        Err(()) => return DecapOutcome::Abort,
+    };
     if final_nexthdr != crate::ETHERIP_PROTO {
         return DecapOutcome::NotEtherip;
     }
@@ -466,6 +546,17 @@ where
     // (`src_addr` is the masked base, so this is exact for /128).
     if crate::mask_addr(ip6.saddr, cfg.src_plen) == cfg.src_addr {
         return DecapOutcome::OwnPkt;
+    }
+
+    // By default decap is VLAN-agnostic: it strips whatever L2 header is present
+    // (tagged or not) and has already demuxed by the outer address pair, which
+    // uniquely identifies the tunnel. This works whether or not the receiving
+    // NIC stripped the tag in hardware (RX VLAN offload), which would otherwise
+    // hide it from XDP. Only when the tunnel opts in does decap enforce that the
+    // observed VLAN equals `vlan_id` — a wrong-VLAN drop guard that then relies
+    // on the tag being visible (offload disabled).
+    if cfg.flags & crate::TUNNEL_FLAG_CHECK_VLAN_TAG != 0 && vid != cfg.vlan_id {
+        return DecapOutcome::VlanMismatch;
     }
 
     let eip: EtherIpHdr = match pkt.load_var(eip_off) {

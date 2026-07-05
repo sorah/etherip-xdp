@@ -145,6 +145,16 @@ pub struct TunnelSpec {
     /// e.g. source-keyed policy routing, or a routed prefix base the FIB
     /// rules don't cover.
     pub next_hop_src: Option<std::net::Ipv6Addr>,
+    /// Outer 802.1Q VLAN id (1..=4094) the underlay runs on; `None` means
+    /// untagged. The data path tags encapsulated frames with it, and next-hop
+    /// resolution runs on the matching VLAN subinterface of the uplink rather
+    /// than the physical device.
+    pub vlan: Option<u16>,
+    /// Enforce on decap that a frame's outer VLAN matches [`Self::vlan`]
+    /// (default `false`). Off, decap is VLAN-agnostic and works regardless of
+    /// the uplink's RX VLAN offload; on, it drops wrong-VLAN frames but then
+    /// requires the tag to be visible to XDP (RX VLAN offload disabled).
+    pub check_vlan_tag_on_decap: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -158,6 +168,8 @@ struct RawTunnel {
     mac: Option<String>,
     next_hop_on_link: Option<String>,
     next_hop_src: Option<std::net::Ipv6Addr>,
+    vlan: Option<u16>,
+    check_vlan_tag_on_decap: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -198,6 +210,15 @@ fn convert_on_link(raw: Option<String>) -> anyhow::Result<crate::control::resolv
             ),
         },
     })
+}
+
+/// Validate an optional VLAN id: 1..=4094 (0 and 4095 are reserved by 802.1Q).
+fn convert_vlan(raw: Option<u16>) -> anyhow::Result<Option<u16>> {
+    match raw {
+        None => Ok(None),
+        Some(v) if (1..=4094).contains(&v) => Ok(Some(v)),
+        Some(v) => anyhow::bail!("invalid vlan {v}: id must be between 1 and 4094"),
+    }
 }
 
 fn convert_mac(raw: Option<String>) -> anyhow::Result<MacConfig> {
@@ -352,6 +373,8 @@ impl TunnelSpec {
             mac: convert_mac(raw.mac)?,
             next_hop_on_link: convert_on_link(raw.next_hop_on_link)?,
             next_hop_src: raw.next_hop_src.map(validate_next_hop_src).transpose()?,
+            vlan: convert_vlan(raw.vlan)?,
+            check_vlan_tag_on_decap: raw.check_vlan_tag_on_decap.unwrap_or(false),
         })
     }
 
@@ -528,6 +551,8 @@ mod tests {
             mac: MacConfig::Auto,
             next_hop_on_link: crate::control::resolver::NextHopOnLink::default(),
             next_hop_src: None,
+            vlan: None,
+            check_vlan_tag_on_decap: false,
         }
     }
 
@@ -673,6 +698,47 @@ mod tests {
         assert_eq!(
             spec(r#"{"remote":"2001:db8::2","mac":"02:00:5e:10:00:01"}"#).mac,
             MacConfig::Explicit([0x02, 0x00, 0x5e, 0x10, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn vlan_variants() {
+        // Omitted -> untagged.
+        assert_eq!(spec(r#"{"remote":"2001:db8::2"}"#).vlan, None);
+        // A valid id is carried through.
+        assert_eq!(
+            spec(r#"{"remote":"2001:db8::2","vlan":100}"#).vlan,
+            Some(100)
+        );
+        // Boundary ids (1 and 4094) are accepted.
+        assert_eq!(spec(r#"{"remote":"2001:db8::2","vlan":1}"#).vlan, Some(1));
+        assert_eq!(
+            spec(r#"{"remote":"2001:db8::2","vlan":4094}"#).vlan,
+            Some(4094)
+        );
+        // Reserved/out-of-range ids are rejected (0, 4095, and above the u16 is
+        // caught by serde before us).
+        for bad in ["0", "4095", "5000"] {
+            assert!(
+                TunnelSpec::from_json(&format!(r#"{{"remote":"2001:db8::2","vlan":{bad}}}"#), "n")
+                    .is_err(),
+                "vlan {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn check_vlan_tag_on_decap_defaults_off() {
+        // Omitted -> false (VLAN-agnostic decap).
+        assert!(!spec(r#"{"remote":"2001:db8::2","vlan":100}"#).check_vlan_tag_on_decap);
+        // Explicit true is carried through.
+        assert!(
+            spec(r#"{"remote":"2001:db8::2","vlan":100,"check_vlan_tag_on_decap":true}"#)
+                .check_vlan_tag_on_decap
+        );
+        assert!(
+            !spec(r#"{"remote":"2001:db8::2","check_vlan_tag_on_decap":false}"#)
+                .check_vlan_tag_on_decap
         );
     }
 

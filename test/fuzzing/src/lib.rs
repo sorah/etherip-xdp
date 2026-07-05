@@ -34,6 +34,8 @@ pub fn encap_cfg() -> etherip_xdp_common::TunnelConfig {
         dst_plen: 128,
         mss_clamp_ipv4: 1404,
         mss_clamp_ipv6: 1384,
+        vlan_id: 0,
+        flags: 0,
     }
 }
 
@@ -83,6 +85,8 @@ pub fn decap_cfg() -> etherip_xdp_common::TunnelConfig {
         dst_plen: 128,
         mss_clamp_ipv4: 0,
         mss_clamp_ipv6: 0,
+        vlan_id: 0,
+        flags: 0,
     }
 }
 
@@ -103,6 +107,27 @@ pub fn decap_cfg_prefixed() -> etherip_xdp_common::TunnelConfig {
         dst_addr: PREFIX_A,
         src_plen: PLEN_B,
         dst_plen: PLEN_A,
+        ..decap_cfg()
+    }
+}
+
+/// VLAN id shared by the tagged fuzz configs.
+pub const VLAN_ID: u16 = 100;
+
+/// As [`encap_cfg_no_clamp`] but tagged on VLAN [`VLAN_ID`], so encap adds an
+/// 802.1Q tag the round-trip drives through decap on arbitrary inner frames.
+pub fn encap_cfg_vlan_no_clamp() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        vlan_id: VLAN_ID,
+        ..encap_cfg_no_clamp()
+    }
+}
+
+/// The B-end decap config for the tagged tunnel (same VLAN as
+/// [`encap_cfg_vlan_no_clamp`]).
+pub fn decap_cfg_vlan() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        vlan_id: VLAN_ID,
         ..decap_cfg()
     }
 }
