@@ -868,14 +868,24 @@ fn write_config(
         .map_err(|e| anyhow::anyhow!("create {}: {e}", opt.config_dir.display()))?;
     let path = opt.config_dir.join(format!("{}.json", opt.tunnel_name));
     let mtu_field = mtu.map(|m| format!(",\"mtu\":{m}")).unwrap_or_default();
-    let (local, remote) = if opt.outer_prefix {
+    // The prefixed pass also sets next_hop_src to the assigned uplink address,
+    // exercising the explicit route-lookup hint end to end.
+    let (local, remote, hint_field) = if opt.outer_prefix {
         let (mine, theirs) = tunnel_prefixes(opt.role);
-        (mine.to_string(), theirs.to_string())
+        (
+            mine.to_string(),
+            theirs.to_string(),
+            format!(",\"next_hop_src\":\"{uplink_ip}\""),
+        )
     } else {
-        (uplink_ip.to_string(), peer_uplink.to_string())
+        (
+            uplink_ip.to_string(),
+            peer_uplink.to_string(),
+            String::new(),
+        )
     };
     let json = format!(
-        "{{\"name\":\"{}\",\"local\":\"{local}\",\"remote\":\"{remote}\",\"mss\":\"auto\"{mtu_field}}}\n",
+        "{{\"name\":\"{}\",\"local\":\"{local}\",\"remote\":\"{remote}\",\"mss\":\"auto\"{hint_field}{mtu_field}}}\n",
         opt.tunnel_name
     );
     std::fs::write(&path, json).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;

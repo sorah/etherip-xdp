@@ -163,11 +163,16 @@ fn next_hop_summary(nh: &generated::NextHop) -> String {
     s
 }
 
-/// Verbose next-hop line for the detail view, including the configured policy.
+/// Verbose next-hop line for the detail view, including the configured policy
+/// and route-lookup source hint.
 fn next_hop_detail(t: &generated::Tunnel) -> String {
     let policy = next_hop_on_link_policy_str(&t.nextHopOnLinkPolicy);
+    let hint = match t.nextHopSource.as_deref() {
+        Some(src) => format!(", src hint {src}"),
+        None => String::new(),
+    };
     match &t.nextHop.address {
-        None => format!("unresolved (on-link policy {policy})"),
+        None => format!("unresolved (on-link policy {policy}{hint})"),
         Some(addr) => {
             let kind = if t.nextHop.onLink {
                 "on-link"
@@ -176,7 +181,7 @@ fn next_hop_detail(t: &generated::Tunnel) -> String {
             };
             let mac = t.nextHop.mac.as_deref().unwrap_or("unresolved");
             let nstate = t.nextHop.neighbourState.as_deref().unwrap_or("-");
-            format!("{addr} ({kind}, on-link policy {policy}) mac {mac} [{nstate}]")
+            format!("{addr} ({kind}, on-link policy {policy}{hint}) mac {mac} [{nstate}]")
         }
     }
 }
@@ -222,6 +227,7 @@ mod tests {
             macPolicy: generated::MacPolicy::auto,
             mac: "02:00:00:00:00:09".to_string(),
             nextHopOnLinkPolicy: generated::NextHopOnLinkPolicy::maybe,
+            nextHopSource: None,
             nextHop: next_hop(
                 Some("fe80::1"),
                 false,

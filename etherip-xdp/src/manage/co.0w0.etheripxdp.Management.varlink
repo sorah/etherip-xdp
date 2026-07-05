@@ -68,6 +68,9 @@ type Tunnel (
   # User-facing interface MAC currently presented.
   mac: string,
   nextHopOnLinkPolicy: NextHopOnLinkPolicy,
+  # Configured source hint for the next-hop route lookup; null when the local
+  # endpoint (or auto-selection) hints it.
+  nextHopSource: ?string,
   nextHop: NextHop,
   # Effective inner MSS clamps; 0 means clamping disabled.
   mssClampIpv4: int,
