@@ -150,6 +150,7 @@ One JSON file per tunnel under `/etc/etherip-xdp/interfaces.d/<uplink>/`:
 | `mtu`    | no       | Tunnel MTU override (default: uplink MTU − 56). |
 | `mac`    | no       | MAC the interface presents: omit to keep the kernel default, `"inherit"` to copy the uplink's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"`. |
 | `next_hop_on_link` | no | On-link policy when the route returns no gateway: `"maybe"` (default), `"always"`, or `"never"`. |
+| `next_hop_src` | no | Source address hinting the route lookup that resolves the next hop for `remote` (default: `local`'s address or prefix base). Set it to an assigned address when the default selects no route — source-keyed policy routing, or a routed prefix base the FIB rules don't cover. |
 
 The uplink is the directory name, so it is **not** repeated inside the file. See
 `packaging/etc/etherip-xdp/interfaces.d/eth1/` for examples.
@@ -167,7 +168,9 @@ any host bits within the configured prefixes. Requirements and notes:
 - The prefix must be **routed to the node** (e.g. via its underlay /128 or
   link-local next hop). The individual per-flow addresses are never assigned or
   ND-resolved — XDP matches them before the kernel stack sees them; next-hop
-  resolution targets the base address.
+  resolution targets the base address. If hinting that lookup with the
+  (unassigned) base selects no route on your host, point `next_hop_src` at an
+  assigned uplink address.
 - Prefix lengths 64–128 are accepted (the host bits carry a 64-bit flow hash).
   A prefixed `local` must be explicit, and the base must have zero host bits.
 - `/65` and longer let several tunnels between the same node pair share a /64:

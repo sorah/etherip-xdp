@@ -126,6 +126,7 @@ fn tunnel(t: &crate::control::types::TunnelSnapshot) -> crate::manage::generated
         macPolicy: mac_policy(t.mac_policy),
         mac: fmt_mac(&t.tunnel_mac),
         nextHopOnLinkPolicy: next_hop_on_link_policy(t.next_hop_on_link_policy),
+        nextHopSource: t.next_hop_src.map(|a| a.to_string()),
         nextHop: crate::manage::generated::NextHop {
             address: t.next_hop.map(|a| a.to_string()),
             onLink: t.next_hop_on_link,

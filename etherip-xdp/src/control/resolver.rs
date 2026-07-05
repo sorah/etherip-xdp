@@ -93,6 +93,16 @@ pub struct Resolved {
     pub neigh_state: Option<crate::control::netlink::NeighState>,
 }
 
+/// Source-address configuration driving resolution: the configured outer
+/// source (adopted verbatim when set; a prefixed local's base) and the
+/// optional `next_hop_src` route-lookup hint that overrides it as the
+/// lookup's `from` key.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SrcConfig {
+    pub configured: Option<std::net::Ipv6Addr>,
+    pub next_hop_hint: Option<std::net::Ipv6Addr>,
+}
+
 /// Pick the effective outer source address. An explicit configuration always
 /// wins; otherwise the route's preferred source (`RTA_PREFSRC`) is adopted, if
 /// the kernel returned one for an IPv6 route. Pure so it can be unit-tested.
@@ -186,6 +196,10 @@ async fn route_get_oif_pinned(
 /// policy routing accurately. Returns `(src, route_info)`; either may be `None`
 /// when unresolved. The source hint is chosen so source-keyed `ip rule`s match:
 ///
+/// - **Explicit `next_hop_src`:** used as the hint verbatim, overriding the
+///   configured source — for setups where the configured source (e.g. a routed
+///   prefix base) selects no route as a flow key. The adopted outer source is
+///   still the configured one.
 /// - **Explicit `src`:** used as the hint verbatim, subject to the `oif` pin (see
 ///   [`route_get_oif_pinned`]): if the `from`+`oif` lookup egresses another
 ///   interface, the gateway is re-resolved sourcelessly while the configured
@@ -200,15 +214,20 @@ async fn route_get_oif_pinned(
 async fn resolve_route_and_src(
     nl: &crate::control::netlink::Netlink,
     external_ifindex: u32,
-    configured_src: Option<std::net::Ipv6Addr>,
+    src_cfg: SrcConfig,
     dst: std::net::Ipv6Addr,
 ) -> (
     Option<std::net::Ipv6Addr>,
     Option<crate::control::netlink::RouteInfo>,
 ) {
-    if configured_src.is_some() {
-        let info = route_get_oif_pinned(nl, dst, configured_src, external_ifindex).await;
-        return (choose_src(configured_src, info), info);
+    let hint = src_cfg.next_hop_hint.or(src_cfg.configured);
+    if hint.is_some() {
+        let info = route_get_oif_pinned(nl, dst, hint, external_ifindex).await;
+        if let Some(src) = choose_src(src_cfg.configured, info) {
+            return (Some(src), info);
+        }
+        // A bare `next_hop_src` (auto local) whose lookup adopted no source:
+        // fall through to the auto-select paths.
     }
 
     let info = route_get_oif(nl, dst, None, external_ifindex).await;
@@ -242,7 +261,7 @@ pub async fn resolve_endpoint(
     nl: &crate::control::netlink::Netlink,
     external_ifindex: u32,
     external_name: &str,
-    configured_src: Option<std::net::Ipv6Addr>,
+    src_cfg: SrcConfig,
     dst: std::net::Ipv6Addr,
     on_link: NextHopOnLink,
     probe: Probe,
@@ -251,7 +270,7 @@ pub async fn resolve_endpoint(
     // routing accurately (see `resolve_route_and_src`). A failed lookup is not
     // fatal: it leaves the relevant field `None` and resolution is retried on
     // netlink changes.
-    let (src, info) = resolve_route_and_src(nl, external_ifindex, configured_src, dst).await;
+    let (src, info) = resolve_route_and_src(nl, external_ifindex, src_cfg, dst).await;
     let Some(next_hop) = choose_next_hop(on_link, info, dst) else {
         log::debug!(
             "no next hop for {dst} (no gateway and on-link policy is {on_link:?}); \

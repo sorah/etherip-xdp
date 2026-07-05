@@ -28,6 +28,9 @@
 //! device's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"` address.
 //! `next_hop_on_link` selects how the remote endpoint is treated when the route
 //! lookup returns no gateway: `"maybe"` (default), `"always"`, or `"never"`.
+//! `next_hop_src` overrides the source address hinting the route lookup that
+//! resolves the next hop (default: `local`'s address or prefix base) — for
+//! source-keyed policy routing, or when a routed prefix base selects no route.
 
 /// How to clamp the inner TCP MSS for a tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -136,6 +139,12 @@ pub struct TunnelSpec {
     pub mac: MacConfig,
     /// On-link policy for the next hop when the route lookup returns no gateway.
     pub next_hop_on_link: crate::control::resolver::NextHopOnLink,
+    /// Source address used as the `from` hint of the route lookup that
+    /// resolves the next hop for `remote`. `None` hints with `local`'s
+    /// address (or prefix base). Needed when that default selects no route —
+    /// e.g. source-keyed policy routing, or a routed prefix base the FIB
+    /// rules don't cover.
+    pub next_hop_src: Option<std::net::Ipv6Addr>,
 }
 
 #[derive(serde::Deserialize)]
@@ -148,6 +157,7 @@ struct RawTunnel {
     mtu: Option<u32>,
     mac: Option<String>,
     next_hop_on_link: Option<String>,
+    next_hop_src: Option<std::net::Ipv6Addr>,
 }
 
 #[derive(serde::Deserialize)]
@@ -224,6 +234,18 @@ fn parse_mac(s: &str) -> anyhow::Result<[u8; 6]> {
         anyhow::bail!("invalid mac {s:?}: the all-zero address cannot be an interface MAC");
     }
     Ok(octets)
+}
+
+fn validate_next_hop_src(addr: std::net::Ipv6Addr) -> anyhow::Result<std::net::Ipv6Addr> {
+    if addr.to_ipv4_mapped().is_some() {
+        anyhow::bail!(
+            "next_hop_src address {addr} is an IPv4-mapped address, not a genuine IPv6 source"
+        );
+    }
+    if addr.is_unspecified() {
+        anyhow::bail!("next_hop_src must not be the unspecified address");
+    }
+    Ok(addr)
 }
 
 /// Parse an endpoint as `addr` or `addr/plen` (64..=128), rejecting non-zero
@@ -329,6 +351,7 @@ impl TunnelSpec {
             mtu: raw.mtu,
             mac: convert_mac(raw.mac)?,
             next_hop_on_link: convert_on_link(raw.next_hop_on_link)?,
+            next_hop_src: raw.next_hop_src.map(validate_next_hop_src).transpose()?,
         })
     }
 
@@ -474,6 +497,27 @@ mod tests {
         assert!(err.contains("2001:db8::/64"), "unhelpful error: {err}");
     }
 
+    #[test]
+    fn next_hop_src_variants() {
+        // Omitted -> the local endpoint hints the lookup.
+        assert_eq!(spec(r#"{"remote":"2001:db8::2"}"#).next_hop_src, None);
+        assert_eq!(
+            spec(r#"{"remote":"2001:db8::2","next_hop_src":"2001:db8::a"}"#).next_hop_src,
+            Some("2001:db8::a".parse().unwrap())
+        );
+        // A plain address only: no prefix suffix, no IPv4-mapped, no ::.
+        for bad in [
+            r#"{"remote":"2001:db8::2","next_hop_src":"2001:db8::/64"}"#,
+            r#"{"remote":"2001:db8::2","next_hop_src":"::ffff:1.2.3.4"}"#,
+            r#"{"remote":"2001:db8::2","next_hop_src":"::"}"#,
+        ] {
+            assert!(
+                TunnelSpec::from_json(bad, "t").is_err(),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
     fn named(name: &str, local: Option<&str>, remote: &str) -> TunnelSpec {
         TunnelSpec {
             name: name.to_string(),
@@ -483,6 +527,7 @@ mod tests {
             mtu: None,
             mac: MacConfig::Auto,
             next_hop_on_link: crate::control::resolver::NextHopOnLink::default(),
+            next_hop_src: None,
         }
     }
 

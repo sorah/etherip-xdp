@@ -54,6 +54,8 @@ pub struct TunnelSnapshot {
     pub mac_policy: &'static str,
     pub tunnel_mac: [u8; 6],
     pub next_hop_on_link_policy: &'static str,
+    /// Configured `next_hop_src` route-lookup hint, if any.
+    pub next_hop_src: Option<std::net::Ipv6Addr>,
     pub mss_clamp_ipv4: u16,
     pub mss_clamp_ipv6: u16,
     pub peer_ifindex: u32,

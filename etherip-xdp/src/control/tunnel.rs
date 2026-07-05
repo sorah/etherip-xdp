@@ -487,6 +487,22 @@ impl Manager {
     /// usually means a typo or a since-removed address and tends to be dropped by
     /// reverse-path filtering. Auto-selected sources are always local, so skip.
     async fn warn_if_src_unassigned(&self, spec: &crate::control::config::TunnelSpec) {
+        // The next-hop hint only matches source-keyed FIB rules when it is a
+        // real local address, so an unassigned one is almost certainly a typo.
+        if let Some(hint) = spec.next_hop_src {
+            match self.nl.is_local_address(hint).await {
+                Ok(true) => {}
+                Ok(false) => log::warn!(
+                    "tunnel {}: next_hop_src {hint} is not assigned to any local interface; \
+                     the route lookup may select no route",
+                    spec.name
+                ),
+                Err(e) => log::debug!(
+                    "tunnel {}: could not verify next_hop_src {hint} is local: {e}",
+                    spec.name
+                ),
+            }
+        }
         let Some(src) = spec.local else { return };
         if src.plen < 128 {
             // A routed prefix is intentionally not assigned to any interface;
@@ -852,7 +868,10 @@ impl Manager {
             &self.nl,
             self.external.index,
             &self.external.name,
-            spec.local.map(|e| e.addr),
+            crate::control::resolver::SrcConfig {
+                configured: spec.local.map(|e| e.addr),
+                next_hop_hint: spec.next_hop_src,
+            },
             spec.remote.addr,
             spec.next_hop_on_link,
             crate::control::resolver::Probe::Bringup,
@@ -1024,7 +1043,10 @@ impl Manager {
             &self.nl,
             self.external.index,
             &self.external.name,
-            spec.local.map(|e| e.addr),
+            crate::control::resolver::SrcConfig {
+                configured: spec.local.map(|e| e.addr),
+                next_hop_hint: spec.next_hop_src,
+            },
             spec.remote.addr,
             spec.next_hop_on_link,
             crate::control::resolver::Probe::Bringup,
@@ -1194,7 +1216,10 @@ impl Manager {
                 &self.nl,
                 self.external.index,
                 &self.external.name,
-                spec.local.map(|e| e.addr),
+                crate::control::resolver::SrcConfig {
+                    configured: spec.local.map(|e| e.addr),
+                    next_hop_hint: spec.next_hop_src,
+                },
                 spec.remote.addr,
                 spec.next_hop_on_link,
                 probe,
@@ -1473,6 +1498,7 @@ fn snapshot_tunnel(t: &RunningTunnel) -> crate::control::types::TunnelSnapshot {
         mac_policy,
         tunnel_mac: t.config.tunnel_mac,
         next_hop_on_link_policy,
+        next_hop_src: t.spec.next_hop_src,
         mss_clamp_ipv4: t.config.mss_clamp_ipv4,
         mss_clamp_ipv6: t.config.mss_clamp_ipv6,
         peer_ifindex: t.peer_index,
@@ -1500,6 +1526,7 @@ mod tests {
             mtu: None,
             mac: crate::control::config::MacConfig::Auto,
             next_hop_on_link: crate::control::resolver::NextHopOnLink::default(),
+            next_hop_src: None,
         }
     }
 
