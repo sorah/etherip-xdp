@@ -147,13 +147,43 @@ One JSON file per tunnel under `/etc/etherip-xdp/interfaces.d/<uplink>/`:
 | `name`   | no       | Tunnel / interface name (default: file stem). Max 11 chars. |
 | `local`  | no       | Local outer IPv6 source; a single address or a routed prefix `addr/N`. Omit to auto-select the kernel's preferred source for the route to `remote` (re-evaluated as the underlay changes); auto-select always yields a single address. |
 | `mss`    | no       | `"auto"` (default), `"off"`, an integer (both families), or `{ "ipv4": N, "ipv6": N }`. |
-| `mtu`    | no       | Tunnel MTU override (default: uplink MTU − 56). |
+| `mtu`    | no       | Tunnel MTU override (default: uplink MTU − 56, or − 60 when `vlan` is set). |
 | `mac`    | no       | MAC the interface presents: omit to keep the kernel default, `"inherit"` to copy the uplink's MAC, or an explicit `"xx:xx:xx:xx:xx:xx"`. |
 | `next_hop_on_link` | no | On-link policy when the route returns no gateway: `"maybe"` (default), `"always"`, or `"never"`. |
 | `next_hop_src` | no | Source address hinting the route lookup that resolves the next hop for `remote` (default: `local`'s address or prefix base). Set it to an assigned address when the default selects no route — source-keyed policy routing, or a routed prefix base the FIB rules don't cover. |
+| `vlan`   | no       | 802.1Q VLAN id (1–4094) the underlay runs on (see [VLAN underlays](#vlan-underlays)). Omit for an untagged underlay. |
+| `check_vlan_tag_on_decap` | no | Enforce on decap that a frame's VLAN matches `vlan` (default `false`). See [VLAN underlays](#vlan-underlays). |
 
 The uplink is the directory name, so it is **not** repeated inside the file. See
 `packaging/etc/etherip-xdp/interfaces.d/eth1/` for examples.
+
+**VLAN underlays.** <a name="vlan-underlays"></a>
+The kernel cannot attach XDP to a VLAN subinterface, so when the underlay runs on
+a tagged VLAN, point the daemon at the **physical** uplink (`etherip-xdp@eth1`)
+and set `"vlan": N` per tunnel. Encap adds an 802.1Q tag (TPID 0x8100,
+priority 0) to each frame. One physical uplink can carry tunnels on several
+VLANs at once.
+
+Decap is **VLAN-agnostic by default**: it demultiplexes by the outer IPv6
+`(remote, local)` address pair (the tunnel's unique identity) and strips whatever
+L2 header is present, so it works **regardless of the NIC's RX VLAN offload** — a
+NIC that strips the tag in hardware before XDP would otherwise hide it, which is
+a real limitation on most drivers (only `ice`/`mlx5`/`veth` expose the stripped
+tag to XDP, and never through a bond). No `ethtool` change is needed.
+
+If you want the stricter check — drop a frame that arrives on the wrong VLAN —
+set `"check_vlan_tag_on_decap": true`. That restores the guard but then requires
+the tag to be visible to XDP, so you must disable RX VLAN offload on the uplink
+(`ethtool -K eth1 rxvlan off`, and on the individual slaves of a bond); with
+offload on and enforcement on, tagged tunnels would drop everything. The default
+(`false`) is recommended unless you specifically rely on the wrong-VLAN drop.
+
+Routes and neighbours for a tagged underlay live on the kernel VLAN
+subinterface, not the physical device, so **configure `eth1.<N>` as usual** (with
+its address and route to `remote`); the daemon auto-discovers that subinterface
+by VLAN id and resolves the outer source and next-hop MAC there, while XDP stays
+on `eth1`. Until the subinterface exists the tunnel is pending, like any other
+unresolved endpoint.
 
 **Prefixed endpoints (ECMP/LAG entropy).** <a name="prefixed-endpoints-ecmplag-entropy"></a>
 EtherIP is neither TCP nor UDP, so transit routers hashing flows for ECMP/LAG

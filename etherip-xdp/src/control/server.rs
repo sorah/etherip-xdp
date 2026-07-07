@@ -135,6 +135,8 @@ fn tunnel(t: &crate::control::types::TunnelSnapshot) -> crate::manage::generated
         },
         mssClampIpv4: t.mss_clamp_ipv4.into(),
         mssClampIpv6: t.mss_clamp_ipv6.into(),
+        vlan: t.vlan.map(i64::from),
+        checkVlanTagOnDecap: t.check_vlan_tag_on_decap,
         peerIfindex: t.peer_ifindex.into(),
     }
 }

@@ -58,6 +58,10 @@ pub struct TunnelSnapshot {
     pub next_hop_src: Option<std::net::Ipv6Addr>,
     pub mss_clamp_ipv4: u16,
     pub mss_clamp_ipv6: u16,
+    /// Outer 802.1Q VLAN id the underlay runs on; `None` when untagged.
+    pub vlan: Option<u16>,
+    /// Whether decap enforces the VLAN tag against `vlan` (off by default).
+    pub check_vlan_tag_on_decap: bool,
     pub peer_ifindex: u32,
     /// The resolved next hop (gateway, or the remote itself when on-link);
     /// `None` while no next hop has resolved.

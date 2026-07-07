@@ -65,6 +65,27 @@ fn test_config() -> etherip_xdp_common::TunnelConfig {
         dst_plen: 128,
         mss_clamp_ipv4: MSS_V4,
         mss_clamp_ipv6: MSS_V6,
+        vlan_id: 0,
+        flags: 0,
+    }
+}
+
+const VLAN_ID: u16 = 100;
+
+/// A VLAN-tagged variant of [`test_config`]: the underlay runs on 802.1Q VLAN
+/// 100, so encap emits a tag. Decap is VLAN-agnostic by default.
+fn vlan_config() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        vlan_id: VLAN_ID,
+        ..test_config()
+    }
+}
+
+/// As [`vlan_config`] but with the opt-in decap VLAN-tag enforcement enabled.
+fn vlan_checked_config() -> etherip_xdp_common::TunnelConfig {
+    etherip_xdp_common::TunnelConfig {
+        flags: etherip_xdp_common::TUNNEL_FLAG_CHECK_VLAN_TAG,
+        ..vlan_config()
     }
 }
 
@@ -267,6 +288,38 @@ fn expected_outer_headers(
     h
 }
 
+/// Expected outer headers for a VLAN-tagged tunnel: the 802.1Q tag (TPID
+/// 0x8100, PCP/DEI 0) is inserted between the source MAC and the IPv6
+/// EtherType, adding 4 bytes; the IPv6 payload length is unaffected.
+fn expected_outer_headers_vlan(
+    inner_len: usize,
+    flow_hash: u32,
+    src: [u8; 16],
+    dst: [u8; 16],
+    vlan_id: u16,
+) -> Vec<u8> {
+    let mut h = Vec::new();
+    h.extend_from_slice(&DST_MAC);
+    h.extend_from_slice(&EXTERNAL_MAC);
+    h.extend_from_slice(&[0x81, 0x00]); // TPID
+    h.extend_from_slice(&(vlan_id & 0x0FFF).to_be_bytes()); // TCI (PCP/DEI 0)
+    h.extend_from_slice(&[0x86, 0xDD]); // IPv6
+    h.extend_from_slice(&[
+        0x60,
+        ((flow_hash >> 16) & 0x0F) as u8,
+        ((flow_hash >> 8) & 0xFF) as u8,
+        (flow_hash & 0xFF) as u8,
+    ]);
+    h.extend_from_slice(&((2 + inner_len) as u16).to_be_bytes()); // etherip(2) + inner
+    h.push(etherip_xdp_common::ETHERIP_PROTO);
+    h.push(etherip_xdp_common::HOP_LIMIT_DEFAULT);
+    h.extend_from_slice(&src);
+    h.extend_from_slice(&dst);
+    h.push(etherip_xdp_common::ETHERIP_VERSION);
+    h.push(0x00);
+    h
+}
+
 #[test]
 fn flow_hash64_host_matches_slice_reference() {
     // The slice reference (`inner_flow_hash64`) and the `Packet`-generic twin
@@ -405,6 +458,275 @@ fn encap_prefixed_fills_host_bits_from_flow_hash() {
         etherip_xdp_common::data_path::EncapOutcome::Redirect
     );
     assert_eq!(host_out, out, "host core matches eBPF byte-exact (encap)");
+}
+
+#[test]
+fn encap_vlan_host_tags_frame() {
+    // Host core: a VLAN tunnel prepends an 802.1Q tag and clamps as usual.
+    let input = ipv4_tcp_syn(1460);
+    let (outcome, out) = host_encap_with(&input, &vlan_config());
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::EncapOutcome::Redirect
+    );
+    let mut expected = expected_outer_headers_vlan(
+        input.len(),
+        etherip_xdp_common::inner_flow_hash(&input),
+        local().octets(),
+        remote().octets(),
+        VLAN_ID,
+    );
+    expected.extend_from_slice(&ipv4_tcp_syn(MSS_V4));
+    assert_eq!(out, expected, "byte-exact tagged encap output");
+    // The tagged overhead is 4 bytes more than untagged.
+    assert_eq!(
+        out.len(),
+        input.len() + etherip_xdp_common::OUTER_OVERHEAD + etherip_xdp_common::VLAN_TAG_LEN
+    );
+}
+
+#[test]
+#[ignore = "requires root and kernel >= 5.15"]
+fn encap_vlan_tags_frame_and_redirects() {
+    let mut ebpf = load_and_setup();
+    let cfg = vlan_config();
+    {
+        let mut m: aya::maps::HashMap<_, u32, etherip_xdp_common::TunnelConfig> =
+            aya::maps::HashMap::try_from(ebpf.map_mut("ENCAP_CONFIG").unwrap()).unwrap();
+        m.insert(PEER_IFINDEX, cfg, 0).unwrap();
+    }
+
+    let input = ipv4_tcp_syn(1460);
+    let (action, out) = run(&mut ebpf, "xdp_encap", &input, PEER_IFINDEX);
+    assert_eq!(action, 4, "expected XDP_REDIRECT");
+
+    let mut expected = expected_outer_headers_vlan(
+        input.len(),
+        etherip_xdp_common::inner_flow_hash(&input),
+        local().octets(),
+        remote().octets(),
+        VLAN_ID,
+    );
+    expected.extend_from_slice(&ipv4_tcp_syn(MSS_V4));
+    assert_eq!(out, expected, "byte-exact tagged encap output");
+
+    let (outcome, host_out) = host_encap_with(&input, &cfg);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::EncapOutcome::Redirect
+    );
+    assert_eq!(
+        host_out, out,
+        "host core matches eBPF byte-exact (vlan encap)"
+    );
+}
+
+/// Like [`etherip_wrap`] but the outer frame carries an 802.1Q tag (VLAN
+/// `vlan_id`) between the source MAC and the IPv6 EtherType.
+fn etherip_wrap_vlan(
+    inner: &[u8],
+    src: std::net::Ipv6Addr,
+    dst: std::net::Ipv6Addr,
+    vlan_id: u16,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&[0x02, 0x02, 0x02, 0x02, 0x02, 0x02]); // outer dst (us)
+    buf.extend_from_slice(&[0x03, 0x03, 0x03, 0x03, 0x03, 0x03]); // outer src (remote)
+    buf.extend_from_slice(&[0x81, 0x00]); // TPID
+    buf.extend_from_slice(&(vlan_id & 0x0FFF).to_be_bytes()); // TCI (PCP/DEI 0)
+    buf.extend_from_slice(&[0x86, 0xDD]);
+    buf.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    buf.extend_from_slice(&((2 + inner.len()) as u16).to_be_bytes());
+    buf.push(etherip_xdp_common::ETHERIP_PROTO);
+    buf.push(etherip_xdp_common::HOP_LIMIT_DEFAULT);
+    buf.extend_from_slice(&src.octets());
+    buf.extend_from_slice(&dst.octets());
+    buf.push(etherip_xdp_common::ETHERIP_VERSION);
+    buf.push(0x00);
+    buf.extend_from_slice(inner);
+    buf
+}
+
+/// Host decap backed by a single tunnel matching `cfg`'s (remote, local) pair.
+fn host_decap_cfg(
+    input: &[u8],
+    cfg: etherip_xdp_common::TunnelConfig,
+) -> (etherip_xdp_common::data_path::DecapOutcome, Vec<u8>) {
+    let key = etherip_xdp_common::DecapKey {
+        remote: cfg.dst_addr,
+        local: cfg.src_addr,
+    };
+    host_decap_with(input, &plens(&[(128, 128)]), |k| (*k == key).then_some(cfg))
+}
+
+#[test]
+fn decap_vlan_host_strips_tag() {
+    // A tagged frame on the tunnel's VLAN decaps to the bare inner frame.
+    let inner = ipv4_tcp_syn(1000);
+    let input = etherip_wrap_vlan(&inner, remote(), local(), VLAN_ID);
+    let (outcome, out) = host_decap_cfg(&input, vlan_config());
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::Redirect {
+            internal_ifindex: PEER_IFINDEX
+        }
+    );
+    assert_eq!(out, inner, "inner frame delivered unchanged");
+}
+
+#[test]
+fn decap_vlan_host_agnostic_by_default() {
+    // Without the opt-in check, decap demuxes by the address pair and strips
+    // whatever L2 header is present, so it works regardless of the tag — this
+    // is what makes it robust to hardware RX VLAN stripping.
+    let inner = ipv4_tcp_syn(1000);
+    let redirect = etherip_xdp_common::data_path::DecapOutcome::Redirect {
+        internal_ifindex: PEER_IFINDEX,
+    };
+
+    // An untagged frame (as a stripping NIC would deliver it) still decaps on a
+    // VLAN tunnel.
+    let untagged = etherip_wrap(&inner, remote(), local());
+    let (outcome, out) = host_decap_cfg(&untagged, vlan_config());
+    assert_eq!(outcome, redirect);
+    assert_eq!(out, inner);
+
+    // A frame carrying a *different* in-band VLAN id also decaps (tag stripped,
+    // not validated).
+    let wrong = etherip_wrap_vlan(&inner, remote(), local(), VLAN_ID + 1);
+    let (outcome, out) = host_decap_cfg(&wrong, vlan_config());
+    assert_eq!(outcome, redirect);
+    assert_eq!(
+        out, inner,
+        "the in-band tag is stripped regardless of its id"
+    );
+
+    // A tagged frame on an untagged tunnel decaps too (tag stripped).
+    let tagged = etherip_wrap_vlan(&inner, remote(), local(), VLAN_ID);
+    let (outcome, out) = host_decap_cfg(&tagged, test_config());
+    assert_eq!(outcome, redirect);
+    assert_eq!(out, inner);
+}
+
+#[test]
+fn decap_vlan_host_check_enforces_tag() {
+    // With the opt-in check, the observed VLAN must equal the tunnel's.
+    let inner = ipv4_tcp_syn(1000);
+
+    // Correct in-band tag -> decaps.
+    let ok = etherip_wrap_vlan(&inner, remote(), local(), VLAN_ID);
+    let (outcome, out) = host_decap_cfg(&ok, vlan_checked_config());
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::Redirect {
+            internal_ifindex: PEER_IFINDEX
+        }
+    );
+    assert_eq!(out, inner);
+
+    // Wrong in-band VLAN id -> mismatch (pass, unmodified).
+    let wrong = etherip_wrap_vlan(&inner, remote(), local(), VLAN_ID + 1);
+    let (outcome, passed) = host_decap_cfg(&wrong, vlan_checked_config());
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::VlanMismatch
+    );
+    assert_eq!(passed, wrong, "a mismatched frame is passed unmodified");
+
+    // No tag visible (e.g. stripped by RX offload) -> can't verify -> mismatch.
+    let untagged = etherip_wrap(&inner, remote(), local());
+    let (outcome, _) = host_decap_cfg(&untagged, vlan_checked_config());
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::VlanMismatch
+    );
+}
+
+#[test]
+#[ignore = "requires root and kernel >= 5.15"]
+fn decap_vlan_strips_tag_and_redirects() {
+    let mut ebpf = load_and_setup();
+    let cfg = vlan_config();
+    let key = etherip_xdp_common::DecapKey {
+        remote: remote().octets(),
+        local: local().octets(),
+    };
+    {
+        let mut m: aya::maps::HashMap<
+            _,
+            etherip_xdp_common::DecapKey,
+            etherip_xdp_common::TunnelConfig,
+        > = aya::maps::HashMap::try_from(ebpf.map_mut("DECAP_CONFIG").unwrap()).unwrap();
+        m.insert(key, cfg, 0).unwrap();
+    }
+
+    let inner = ipv4_tcp_syn(1460);
+    let input = etherip_wrap_vlan(&inner, remote(), local(), VLAN_ID);
+    let (action, out) = run(&mut ebpf, "xdp_decap", &input, EXTERNAL_IFINDEX);
+    assert_eq!(action, 4, "expected XDP_REDIRECT");
+    assert_eq!(out, inner, "byte-exact tagged decap output");
+
+    let (outcome, host_out) = host_decap_cfg(&input, cfg);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::Redirect {
+            internal_ifindex: PEER_IFINDEX
+        }
+    );
+    assert_eq!(
+        host_out, out,
+        "host core matches eBPF byte-exact (vlan decap)"
+    );
+
+    // By default decap is VLAN-agnostic: an untagged frame for the same
+    // (remote, local) pair (as a tag-stripping NIC would deliver) still decaps.
+    let untagged = etherip_wrap(&inner, remote(), local());
+    let (action, out) = run(&mut ebpf, "xdp_decap", &untagged, EXTERNAL_IFINDEX);
+    assert_eq!(action, 4, "untagged frame on a VLAN tunnel still decaps");
+    assert_eq!(out, inner);
+}
+
+#[test]
+#[ignore = "requires root and kernel >= 5.15"]
+fn decap_vlan_check_enforces_tag() {
+    let mut ebpf = load_and_setup();
+    let cfg = vlan_checked_config();
+    let key = etherip_xdp_common::DecapKey {
+        remote: remote().octets(),
+        local: local().octets(),
+    };
+    {
+        let mut m: aya::maps::HashMap<
+            _,
+            etherip_xdp_common::DecapKey,
+            etherip_xdp_common::TunnelConfig,
+        > = aya::maps::HashMap::try_from(ebpf.map_mut("DECAP_CONFIG").unwrap()).unwrap();
+        m.insert(key, cfg, 0).unwrap();
+    }
+
+    let inner = ipv4_tcp_syn(1460);
+
+    // Correct tag decaps.
+    let ok = etherip_wrap_vlan(&inner, remote(), local(), VLAN_ID);
+    let (action, out) = run(&mut ebpf, "xdp_decap", &ok, EXTERNAL_IFINDEX);
+    assert_eq!(action, 4, "correct tag under enforcement -> XDP_REDIRECT");
+    assert_eq!(out, inner);
+    let (outcome, host_out) = host_decap_cfg(&ok, cfg);
+    assert_eq!(
+        outcome,
+        etherip_xdp_common::data_path::DecapOutcome::Redirect {
+            internal_ifindex: PEER_IFINDEX
+        }
+    );
+    assert_eq!(
+        host_out, out,
+        "host core matches eBPF byte-exact (vlan check)"
+    );
+
+    // Wrong VLAN id is dropped (passed) under enforcement.
+    let wrong = etherip_wrap_vlan(&inner, remote(), local(), VLAN_ID + 1);
+    let (action, _) = run(&mut ebpf, "xdp_decap", &wrong, EXTERNAL_IFINDEX);
+    assert_eq!(action, 2, "wrong tag under enforcement -> XDP_PASS");
 }
 
 fn etherip_wrap(inner: &[u8], src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> Vec<u8> {

@@ -35,10 +35,11 @@ pub(crate) fn run(opts: Options, _workspace_root: &std::path::Path) -> anyhow::R
     let scenario = crate::build::require(&binaries, "etherip-xdp-e2e")?.clone();
 
     // Clean any leftovers from a previous aborted run, then set up fresh.
-    // Two passes over a fresh namespace pair each: the full scenario with the
-    // restart phases on plain /128 endpoints, then the traffic checks over
-    // routed /112 endpoint prefixes (per-flow outer addresses).
-    for pass in [Pass::Plain, Pass::OuterPrefix] {
+    // Three passes over a fresh namespace pair each: the full scenario with the
+    // restart phases on plain /128 endpoints, the traffic checks over routed
+    // /112 endpoint prefixes (per-flow outer addresses), and the traffic checks
+    // over an 802.1Q VLAN underlay (tagged encap/decap).
+    for pass in [Pass::Plain, Pass::OuterPrefix, Pass::Vlan] {
         println!("running the {} pass…", pass.label());
         teardown();
         setup()?;
@@ -53,13 +54,18 @@ pub(crate) fn run(opts: Options, _workspace_root: &std::path::Path) -> anyhow::R
 enum Pass {
     Plain,
     OuterPrefix,
+    Vlan,
 }
+
+/// VLAN id for the `Vlan` pass.
+const VLAN_ID: u16 = 100;
 
 impl Pass {
     fn label(self) -> &'static str {
         match self {
             Pass::Plain => "plain-endpoint",
             Pass::OuterPrefix => "prefixed-endpoint",
+            Pass::Vlan => "vlan-underlay",
         }
     }
 }
@@ -134,12 +140,15 @@ fn spawn_scenario(
         .arg(opts.timeout_secs.to_string());
     match pass {
         // The restart phases are endpoint-agnostic; run them once, on the
-        // plain pass, and keep the prefixed pass to the traffic checks.
+        // plain pass, and keep the other passes to the traffic checks.
         Pass::Plain => {
             cmd.arg("--restart-scenarios");
         }
         Pass::OuterPrefix => {
             cmd.arg("--outer-prefix");
+        }
+        Pass::Vlan => {
+            cmd.args(["--vlan", &VLAN_ID.to_string()]);
         }
     }
     if !opts.no_sandbox {

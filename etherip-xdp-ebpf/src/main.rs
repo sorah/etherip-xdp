@@ -289,6 +289,10 @@ fn handle_decap(ctx: &aya_ebpf::programs::XdpContext) -> u32 {
             dbg_inc(etherip_xdp_common::DBG_DECAP_OWN_PKT);
             xdp_action::XDP_PASS
         }
+        etherip_xdp_common::data_path::DecapOutcome::VlanMismatch => {
+            dbg_inc(etherip_xdp_common::DBG_DECAP_VLAN_MISMATCH);
+            xdp_action::XDP_PASS
+        }
         etherip_xdp_common::data_path::DecapOutcome::BadHeader => {
             dbg_inc(etherip_xdp_common::DBG_DECAP_BAD_HEADER);
             xdp_action::XDP_PASS
