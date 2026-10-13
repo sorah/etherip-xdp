@@ -26,8 +26,25 @@ pub const HOP_LIMIT_DEFAULT: u8 = 64;
 /// EtherIP version nibble in the high 4 bits of the first header byte (v3 << 4).
 pub const ETHERIP_VERSION: u8 = 0x30;
 
-/// Outer encapsulation overhead: Ethernet (14) + IPv6 (40) + EtherIP (2).
+/// Outer encapsulation overhead of an **untagged** frame: Ethernet (14) +
+/// IPv6 (40) + EtherIP (2). A VLAN-tagged tunnel adds [`VLAN_TAG_LEN`].
 pub const OUTER_OVERHEAD: usize = 14 + 40 + 2;
+
+/// TPID of an 802.1Q VLAN tag (the only tag protocol this build emits/accepts).
+pub const ETH_P_8021Q: u16 = 0x8100;
+/// Bytes an 802.1Q tag adds to the outer L2 header (TPID + TCI), inserted
+/// between the source MAC and the EtherType.
+pub const VLAN_TAG_LEN: usize = 4;
+
+/// Outer encapsulation overhead for a tunnel with `vlan_id` (0 = untagged):
+/// [`OUTER_OVERHEAD`] plus the 802.1Q tag when tagged.
+pub const fn outer_overhead(vlan_id: u16) -> usize {
+    if vlan_id != 0 {
+        OUTER_OVERHEAD + VLAN_TAG_LEN
+    } else {
+        OUTER_OVERHEAD
+    }
+}
 
 // Map capacities, shared by the eBPF map declarations and the userspace
 // validator that decides whether an existing set of bpffs pins is still
@@ -81,7 +98,24 @@ pub struct TunnelConfig {
     pub mss_clamp_ipv4: u16,
     /// IPv6 inner MSS clamp; 0 disables clamping.
     pub mss_clamp_ipv6: u16,
+    /// Outer 802.1Q VLAN id (1..=4094); 0 means the underlay is untagged. Encap
+    /// emits a tag with this id (PCP/DEI 0), so the outer L2 overhead grows by
+    /// [`VLAN_TAG_LEN`] when set. Decap only *validates* the incoming tag
+    /// against this id when [`TUNNEL_FLAG_CHECK_VLAN_TAG`] is set (see below);
+    /// otherwise it demuxes purely by the outer address pair.
+    pub vlan_id: u16,
+    /// Bit flags ([`TUNNEL_FLAG_*`](TUNNEL_FLAG_CHECK_VLAN_TAG)). Also keeps the
+    /// struct free of tail padding.
+    pub flags: u16,
 }
+
+/// [`TunnelConfig::flags`]: enforce that a decapped frame's outer 802.1Q VLAN
+/// matches [`TunnelConfig::vlan_id`] (dropping — `XDP_PASS` — a mismatch). Off
+/// by default: decap is otherwise VLAN-agnostic, so it works whether or not the
+/// receiving NIC strips the tag in hardware (RX VLAN offload). Enabling it
+/// restores the wrong-VLAN drop guard but then requires the tag to be visible
+/// to XDP, i.e. RX VLAN offload disabled on the uplink.
+pub const TUNNEL_FLAG_CHECK_VLAN_TAG: u16 = 1 << 0;
 
 impl TunnelConfig {
     /// A zeroed config (all addresses/MACs unset, clamping off).
@@ -100,6 +134,8 @@ impl TunnelConfig {
             dst_plen: 128,
             mss_clamp_ipv4: 0,
             mss_clamp_ipv6: 0,
+            vlan_id: 0,
+            flags: 0,
         }
     }
 }
@@ -170,7 +206,11 @@ pub const PINNED_STATE_MAGIC: u32 = u32::from_le_bytes(*b"eXdP");
 /// Revision 2: `TunnelConfig` gained `src_plen`/`dst_plen` (repurposing the
 /// former `_pad` bytes, which a revision-1 daemon wrote as zero — an invalid
 /// prefix length under the new semantics).
-pub const PINNED_LAYOUT_REVISION: u32 = 2;
+///
+/// Revision 3: `TunnelConfig` gained `vlan_id`/`flags` (growing the value) and
+/// the debug-counter array gained `decap_vlan_mismatch` (growing `DBG_MAX`);
+/// both change a pinned map's shape.
+pub const PINNED_LAYOUT_REVISION: u32 = 3;
 
 /// Identity record stored in the pinned `ETHERIP_STATE` map (a 1-entry array
 /// on bpffs, next to the data-plane maps). This is the cross-process contract
@@ -240,10 +280,12 @@ pub const DBG_DECAP_NOT_ETHERIP: u32 = 8;
 pub const DBG_DECAP_NO_TUNNEL: u32 = 9;
 pub const DBG_DECAP_OWN_PKT: u32 = 10;
 pub const DBG_DECAP_BAD_HEADER: u32 = 11;
-pub const DBG_DECAP_REDIRECT: u32 = 12;
-pub const DBG_MAIN_ENTER: u32 = 13;
+/// Outer VLAN tag did not match the matched tunnel's `vlan_id` (`XDP_PASS`).
+pub const DBG_DECAP_VLAN_MISMATCH: u32 = 12;
+pub const DBG_DECAP_REDIRECT: u32 = 13;
+pub const DBG_MAIN_ENTER: u32 = 14;
 /// Number of debug counters (PERCPU_ARRAY `max_entries`).
-pub const DBG_MAX: u32 = 14;
+pub const DBG_MAX: u32 = 15;
 
 /// Human-readable counter names, indexed by the `DBG_*` constants.
 pub const COUNTER_NAMES: [&str; DBG_MAX as usize] = [
@@ -259,6 +301,7 @@ pub const COUNTER_NAMES: [&str; DBG_MAX as usize] = [
     "decap_no_tunnel",
     "decap_own_pkt",
     "decap_bad_header",
+    "decap_vlan_mismatch",
     "decap_redirect",
     "main_enter",
 ];
@@ -456,9 +499,11 @@ pub fn checksum_update(csum: u16, old: u16, new: u16) -> u16 {
 }
 
 // SAFETY: `TunnelConfig` is `#[repr(C)]`, `Copy`, and contains only `u8`/`u16`/
-// `u32` and byte arrays laid out without implicit padding — no padding-dependent
-// or otherwise-invalid bit patterns and no pointers. Every byte sequence of its
-// size is therefore a valid value, satisfying aya's `Pod` contract.
+// `u32` and byte arrays laid out without implicit padding (the `flags` u16
+// pads the trailing u16s to the u32 alignment; size asserted by
+// `tunnel_config_has_no_padding`) — no padding-dependent or otherwise-invalid
+// bit patterns and no pointers. Every byte sequence of its size is therefore a
+// valid value, satisfying aya's `Pod` contract.
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TunnelConfig {}
 // SAFETY: `DecapKey` is `#[repr(C)]`, `Copy`, and is just two 16-byte arrays
@@ -572,6 +617,22 @@ mod tests {
         // The struct is a bpffs map value read by external tooling; its size
         // must be exactly the sum of its fields on every target.
         assert_eq!(core::mem::size_of::<PinnedState>(), 4 + 4 + 32 + 32);
+    }
+
+    #[test]
+    fn tunnel_config_has_no_padding() {
+        // Map value shared with the eBPF program and size-checked against pinned
+        // maps; must be exactly the sum of its fields on every target.
+        assert_eq!(
+            core::mem::size_of::<TunnelConfig>(),
+            16 + 16 + 4 + 4 + 6 + 6 + 6 + 1 + 1 + 2 + 2 + 2 + 2
+        );
+    }
+
+    #[test]
+    fn outer_overhead_accounts_for_the_tag() {
+        assert_eq!(outer_overhead(0), OUTER_OVERHEAD);
+        assert_eq!(outer_overhead(100), OUTER_OVERHEAD + VLAN_TAG_LEN);
     }
 
     #[test]

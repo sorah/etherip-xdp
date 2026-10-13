@@ -420,10 +420,75 @@ impl Manager {
             .join(", ")
     }
 
+    /// The interface next-hop resolution should run against for `spec`: the
+    /// physical uplink for an untagged tunnel, or its 802.1Q VLAN subinterface
+    /// (where the underlay's routes and neighbours live) for a tagged one.
+    /// `Ok(None)` for a tagged tunnel whose subinterface does not exist yet — the
+    /// tunnel stays pending until it appears, like any other unresolved endpoint.
+    async fn resolution_device(
+        &self,
+        spec: &crate::control::config::TunnelSpec,
+    ) -> anyhow::Result<Option<(u32, String)>> {
+        match spec.vlan {
+            None => Ok(Some((self.external.index, self.external.name.clone()))),
+            Some(vid) => self.nl.find_vlan_subif(self.external.index, vid).await,
+        }
+    }
+
+    /// Resolve a tunnel's outer endpoint on its resolution device (see
+    /// [`Self::resolution_device`]). A missing VLAN subinterface or a resolution
+    /// error is folded into a default (unresolved) result — the tunnel stays
+    /// pending and resolution is retried on the next netlink change or tick.
+    async fn resolve_tunnel(
+        &self,
+        spec: &crate::control::config::TunnelSpec,
+        probe: crate::control::resolver::Probe,
+    ) -> crate::control::resolver::Resolved {
+        let (idx, name) = match self.resolution_device(spec).await {
+            Ok(Some(dev)) => dev,
+            Ok(None) => {
+                log::warn!(
+                    "tunnel {}: vlan {} subinterface of {} not found; pending until it appears",
+                    spec.name,
+                    spec.vlan.unwrap_or(0),
+                    self.external.name
+                );
+                return crate::control::resolver::Resolved::default();
+            }
+            Err(e) => {
+                log::warn!("tunnel {}: locate vlan subinterface: {e:#}", spec.name);
+                return crate::control::resolver::Resolved::default();
+            }
+        };
+        match crate::control::resolver::resolve_endpoint(
+            &self.nl,
+            idx,
+            &name,
+            crate::control::resolver::SrcConfig {
+                configured: spec.local.map(|e| e.addr),
+                next_hop_hint: spec.next_hop_src,
+            },
+            spec.remote.addr,
+            spec.next_hop_on_link,
+            probe,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("tunnel {}: endpoint resolution error: {e:#}", spec.name);
+                crate::control::resolver::Resolved::default()
+            }
+        }
+    }
+
     fn tunnel_mtu(&self, spec: &crate::control::config::TunnelSpec) -> i32 {
         match spec.mtu {
             Some(m) => m as i32,
-            None => self.external.mtu as i32 - etherip_xdp_common::OUTER_OVERHEAD as i32,
+            None => {
+                self.external.mtu as i32
+                    - etherip_xdp_common::outer_overhead(spec.vlan.unwrap_or(0)) as i32
+            }
         }
     }
 
@@ -449,6 +514,12 @@ impl Manager {
             dst_plen: spec.remote.plen,
             mss_clamp_ipv4: mss4,
             mss_clamp_ipv6: mss6,
+            vlan_id: spec.vlan.unwrap_or(0),
+            flags: if spec.check_vlan_tag_on_decap {
+                etherip_xdp_common::TUNNEL_FLAG_CHECK_VLAN_TAG
+            } else {
+                0
+            },
         }
     }
 
@@ -864,26 +935,9 @@ impl Manager {
         let (peer_index, encap_link) = self.setup_peer(&peer, mtu, encap_pin).await?;
 
         self.warn_if_src_unassigned(&spec).await;
-        let resolved = match crate::control::resolver::resolve_endpoint(
-            &self.nl,
-            self.external.index,
-            &self.external.name,
-            crate::control::resolver::SrcConfig {
-                configured: spec.local.map(|e| e.addr),
-                next_hop_hint: spec.next_hop_src,
-            },
-            spec.remote.addr,
-            spec.next_hop_on_link,
-            crate::control::resolver::Probe::Bringup,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("tunnel {name}: endpoint resolution error: {e:#}");
-                crate::control::resolver::Resolved::default()
-            }
-        };
+        let resolved = self
+            .resolve_tunnel(&spec, crate::control::resolver::Probe::Bringup)
+            .await;
         let dst_mac = resolved.dst_mac.unwrap_or([0u8; 6]);
 
         // The user-facing end stays in the host namespace; its pass-through attach
@@ -1039,26 +1093,9 @@ impl Manager {
         // Re-resolve the endpoint for the new spec. Keep the last-known source and
         // MAC on a transient resolution failure rather than tearing the tunnel
         // down; a ready tunnel never flaps back to pending.
-        let resolved = match crate::control::resolver::resolve_endpoint(
-            &self.nl,
-            self.external.index,
-            &self.external.name,
-            crate::control::resolver::SrcConfig {
-                configured: spec.local.map(|e| e.addr),
-                next_hop_hint: spec.next_hop_src,
-            },
-            spec.remote.addr,
-            spec.next_hop_on_link,
-            crate::control::resolver::Probe::Bringup,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("tunnel {name}: endpoint resolution error: {e:#}");
-                crate::control::resolver::Resolved::default()
-            }
-        };
+        let resolved = self
+            .resolve_tunnel(&spec, crate::control::resolver::Probe::Bringup)
+            .await;
         let dst_mac = resolved.dst_mac.unwrap_or(old_dst_mac);
         let was_installed = old_src.is_some();
 
@@ -1212,26 +1249,7 @@ impl Manager {
                 // Reactive with a MAC in hand: read only, no probe feedback.
                 crate::control::resolver::Probe::Passive
             };
-            let resolved = match crate::control::resolver::resolve_endpoint(
-                &self.nl,
-                self.external.index,
-                &self.external.name,
-                crate::control::resolver::SrcConfig {
-                    configured: spec.local.map(|e| e.addr),
-                    next_hop_hint: spec.next_hop_src,
-                },
-                spec.remote.addr,
-                spec.next_hop_on_link,
-                probe,
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!("tunnel {name}: re-resolve error: {e:#}");
-                    continue;
-                }
-            };
+            let resolved = self.resolve_tunnel(&spec, probe).await;
 
             // Record the freshly-observed next-hop diagnostics (reported over the
             // management interface) regardless of whether the data-path entries
@@ -1501,6 +1519,8 @@ fn snapshot_tunnel(t: &RunningTunnel) -> crate::control::types::TunnelSnapshot {
         next_hop_src: t.spec.next_hop_src,
         mss_clamp_ipv4: t.config.mss_clamp_ipv4,
         mss_clamp_ipv6: t.config.mss_clamp_ipv6,
+        vlan: t.spec.vlan,
+        check_vlan_tag_on_decap: t.spec.check_vlan_tag_on_decap,
         peer_ifindex: t.peer_index,
         next_hop: t.next_hop,
         next_hop_on_link: t.next_hop_on_link,
@@ -1527,6 +1547,8 @@ mod tests {
             mac: crate::control::config::MacConfig::Auto,
             next_hop_on_link: crate::control::resolver::NextHopOnLink::default(),
             next_hop_src: None,
+            vlan: None,
+            check_vlan_tag_on_decap: false,
         }
     }
 

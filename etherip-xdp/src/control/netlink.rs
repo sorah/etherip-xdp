@@ -181,6 +181,57 @@ impl Netlink {
         Ok(self.link_info(name).await?.map(|i| i.index))
     }
 
+    /// Find the kernel 802.1Q VLAN subinterface of `parent` carrying VLAN id
+    /// `vid` (e.g. `eth1.100` over `eth1`), returning its `(ifindex, name)`.
+    /// XDP cannot attach to a VLAN device, so the daemon attaches to the physical
+    /// uplink and tags frames itself; but the underlay's routes and neighbours
+    /// live on this subinterface, so next-hop resolution must run against it. The
+    /// links are dumped and matched by parent (`IFLA_LINK`) and VLAN id.
+    pub async fn find_vlan_subif(
+        &self,
+        parent: u32,
+        vid: u16,
+    ) -> anyhow::Result<Option<(u32, String)>> {
+        let mut links = self.handle.link().get().execute();
+        while let Some(msg) = links.try_next().await? {
+            let mut link_parent = None;
+            let mut name = None;
+            let mut found_vid = None;
+            for attr in &msg.attributes {
+                match attr {
+                    rtnetlink::packet_route::link::LinkAttribute::Link(idx) => {
+                        link_parent = Some(*idx);
+                    }
+                    rtnetlink::packet_route::link::LinkAttribute::IfName(n) => {
+                        name = Some(n.clone());
+                    }
+                    rtnetlink::packet_route::link::LinkAttribute::LinkInfo(infos) => {
+                        for info in infos {
+                            if let rtnetlink::packet_route::link::LinkInfo::Data(
+                                rtnetlink::packet_route::link::InfoData::Vlan(vlan),
+                            ) = info
+                            {
+                                for v in vlan {
+                                    if let rtnetlink::packet_route::link::InfoVlan::Id(id) = v {
+                                        found_vid = Some(*id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if link_parent == Some(parent)
+                && found_vid == Some(vid)
+                && let Some(name) = name
+            {
+                return Ok(Some((msg.header.index, name)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Create a veth pair (`name` <-> `peer`).
     pub async fn create_veth(&self, name: &str, peer: &str) -> anyhow::Result<()> {
         self.handle

@@ -112,6 +112,13 @@ struct Opt {
     /// via its uplink address, mirroring a real routed-prefix deployment.
     #[arg(long, default_value_t = false)]
     outer_prefix: bool,
+
+    /// Run the underlay over an 802.1Q VLAN: create a `<uplink>.<vlan>`
+    /// subinterface, put the outer address there, and set `"vlan": N` in the
+    /// tunnel config, so XDP tags/strips on the physical uplink and the daemon
+    /// resolves the next hop on the subinterface.
+    #[arg(long)]
+    vlan: Option<u16>,
 }
 
 mod minisystemd;
@@ -225,6 +232,11 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
         modprobe("virtio_net")?;
         modprobe("veth")?;
     }
+    if opt.vlan.is_some() {
+        // The 802.1Q subinterface needs the `8021q` module (built-in on the
+        // host in `local` mode, a no-op then; shipped in the VM initramfs).
+        modprobe("8021q")?;
+    }
 
     let (connection, handle, _rx) =
         rtnetlink::new_connection().map_err(|e| anyhow::anyhow!("netlink: {e}"))?;
@@ -233,14 +245,43 @@ async fn run(opt: &Opt) -> anyhow::Result<()> {
     log("bringing up uplink");
     let uplink_idx =
         wait_for_link(&handle, &opt.uplink, std::time::Duration::from_secs(20)).await?;
-    add_address(
-        &handle,
-        uplink_idx,
-        std::net::IpAddr::V6(uplink_ip),
-        uplink_prefix,
-    )
-    .await?;
     set_up(&handle, uplink_idx).await?;
+
+    // The outer address lives on the physical uplink normally, but on the VLAN
+    // subinterface when the underlay is tagged — that is where the daemon
+    // resolves the next hop (XDP still attaches to, and redirects out of, the
+    // physical uplink).
+    match opt.vlan {
+        None => {
+            add_address(
+                &handle,
+                uplink_idx,
+                std::net::IpAddr::V6(uplink_ip),
+                uplink_prefix,
+            )
+            .await?;
+        }
+        Some(vid) => {
+            // Decap is VLAN-agnostic by default, so no RX-VLAN-offload change is
+            // needed; the veth/virtio transports don't strip in-band tags anyway.
+            let vlan_name = format!("{}.{vid}", opt.uplink);
+            log(&format!(
+                "creating VLAN subinterface {vlan_name} (id {vid}) on {}",
+                opt.uplink
+            ));
+            add_vlan(&handle, &vlan_name, uplink_idx, vid).await?;
+            let vlan_idx =
+                wait_for_link(&handle, &vlan_name, std::time::Duration::from_secs(20)).await?;
+            add_address(
+                &handle,
+                vlan_idx,
+                std::net::IpAddr::V6(uplink_ip),
+                uplink_prefix,
+            )
+            .await?;
+            set_up(&handle, vlan_idx).await?;
+        }
+    }
 
     if opt.outer_prefix {
         // The peer's tunnel prefix is routed via its uplink address, as a real
@@ -847,6 +888,23 @@ async fn add_route_v6(
     }
 }
 
+/// Create an 802.1Q VLAN subinterface `name` with id `vid` on top of the link
+/// at `base_index` (equivalent to `ip link add link <uplink> name <uplink>.<N>
+/// type vlan id <N>`).
+async fn add_vlan(
+    handle: &rtnetlink::Handle,
+    name: &str,
+    base_index: u32,
+    vid: u16,
+) -> anyhow::Result<()> {
+    handle
+        .link()
+        .add(rtnetlink::LinkVlan::new(name, base_index, vid).build())
+        .execute()
+        .await
+        .map_err(|e| anyhow::anyhow!("create vlan {name} (id {vid}) on ifindex {base_index}: {e}"))
+}
+
 async fn set_up(handle: &rtnetlink::Handle, index: u32) -> anyhow::Result<()> {
     handle
         .link()
@@ -868,6 +926,10 @@ fn write_config(
         .map_err(|e| anyhow::anyhow!("create {}: {e}", opt.config_dir.display()))?;
     let path = opt.config_dir.join(format!("{}.json", opt.tunnel_name));
     let mtu_field = mtu.map(|m| format!(",\"mtu\":{m}")).unwrap_or_default();
+    let vlan_field = opt
+        .vlan
+        .map(|v| format!(",\"vlan\":{v}"))
+        .unwrap_or_default();
     // The prefixed pass also sets next_hop_src to the assigned uplink address,
     // exercising the explicit route-lookup hint end to end.
     let (local, remote, hint_field) = if opt.outer_prefix {
@@ -885,7 +947,7 @@ fn write_config(
         )
     };
     let json = format!(
-        "{{\"name\":\"{}\",\"local\":\"{local}\",\"remote\":\"{remote}\",\"mss\":\"auto\"{hint_field}{mtu_field}}}\n",
+        "{{\"name\":\"{}\",\"local\":\"{local}\",\"remote\":\"{remote}\",\"mss\":\"auto\"{hint_field}{mtu_field}{vlan_field}}}\n",
         opt.tunnel_name
     );
     std::fs::write(&path, json).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;

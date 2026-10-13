@@ -69,19 +69,26 @@ pub(crate) fn run(opts: Options, _workspace_root: &std::path::Path) -> anyhow::R
             init, modprobe, daemon, scenario, &mod_dir, version, &initramfs,
         )?;
 
-        let sock = cache_dir.join(format!("s{index}.sock"));
-        match run_pair(
-            &vmlinuz,
-            &initramfs,
-            &sock,
-            &reconnect,
-            timeout_secs,
-            version,
-        ) {
-            Ok(()) => println!("=== kernel {version}: PASS ==="),
-            Err(e) => {
-                eprintln!("=== kernel {version}: FAIL: {e:#} ===");
-                failures.push(format!("{version}: {e:#}"));
+        // Two scenarios per kernel: the plain-endpoint run with the restart
+        // phases, and an 802.1Q VLAN underlay run (tagged encap/decap). Fresh
+        // VMs and socket each so neither leaks into the other.
+        for (variant, vlan) in [("plain", None), ("vlan", Some(VM_VLAN_ID))] {
+            let label = format!("{version}/{variant}");
+            let sock = cache_dir.join(format!("s{index}-{variant}.sock"));
+            match run_pair(
+                &vmlinuz,
+                &initramfs,
+                &sock,
+                &reconnect,
+                timeout_secs,
+                &label,
+                vlan,
+            ) {
+                Ok(()) => println!("=== kernel {label}: PASS ==="),
+                Err(e) => {
+                    eprintln!("=== kernel {label}: FAIL: {e:#} ===");
+                    failures.push(format!("{label}: {e:#}"));
+                }
             }
         }
     }
@@ -140,6 +147,13 @@ pub(crate) fn group_kernels(
 /// must be carried for the latter or eth0 never appears.
 const WANTED_MODULES: &[&str] = &[
     "veth",
+    // 802.1Q VLAN and its possible modular prerequisites (built-in ones resolve
+    // to no `.ko` and are skipped, like the virtio chain below).
+    "8021q",
+    "garp",
+    "mrp",
+    "stp",
+    "llc",
     "virtio_net",
     "virtio_pci",
     "net_failover",
@@ -237,6 +251,10 @@ fn find_modules(
 
 /// Boot the listener, wait for its socket, boot the connector, and require both
 /// guests to print `init: success`.
+/// VLAN id for the tagged-underlay VM scenario.
+const VM_VLAN_ID: u16 = 100;
+
+#[allow(clippy::too_many_arguments)]
 fn run_pair(
     vmlinuz: &std::path::Path,
     initramfs: &std::path::Path,
@@ -244,6 +262,7 @@ fn run_pair(
     reconnect: &str,
     timeout_secs: u64,
     label: &str,
+    vlan: Option<u16>,
 ) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(sock);
     let sock_str = sock
@@ -263,7 +282,7 @@ fn run_pair(
         initramfs,
         &server_netdev,
         "52:54:00:00:00:01",
-        &linux_scenario_args("server", timeout_secs),
+        &linux_scenario_args("server", timeout_secs, vlan),
     )?;
     drain_stderr(&mut server, format!("{label}/A!"));
     let ta = watch(
@@ -283,7 +302,7 @@ fn run_pair(
         initramfs,
         &client_netdev,
         "52:54:00:00:00:02",
-        &linux_scenario_args("client", timeout_secs),
+        &linux_scenario_args("client", timeout_secs, vlan),
     )?;
     drain_stderr(&mut client, format!("{label}/B!"));
     let tb = watch(
@@ -333,16 +352,26 @@ fn run_pair(
     }
 }
 
-/// Scenario `init.arg=` tokens for a Linux peer in the symmetric vm test.
-fn linux_scenario_args(role: &str, timeout_secs: u64) -> Vec<String> {
-    vec![
+/// Scenario `init.arg=` tokens for a Linux peer in the symmetric vm test. The
+/// plain run adds the restart phases; the VLAN run tags the underlay instead
+/// (the restart phases are endpoint/underlay-agnostic and covered by the plain
+/// run, so they are not repeated).
+fn linux_scenario_args(role: &str, timeout_secs: u64, vlan: Option<u16>) -> Vec<String> {
+    let mut args = vec![
         "--role".into(),
         role.into(),
         "--load-veth".into(),
         "--timeout-secs".into(),
         timeout_secs.to_string(),
-        "--restart-scenarios".into(),
-    ]
+    ];
+    match vlan {
+        Some(vid) => {
+            args.push("--vlan".into());
+            args.push(vid.to_string());
+        }
+        None => args.push("--restart-scenarios".into()),
+    }
+    args
 }
 
 /// Boot a Linux guest: `netdev`/`mac` wire it to the L2 link, `scenario_args` are

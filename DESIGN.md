@@ -37,7 +37,45 @@ via ordinary ARP/ND), or enslave it to a Linux bridge to extend an L2 segment.
 The `mac` config option only sets `<name>`'s own address.
 
 The tunnel MTU defaults to `external_mtu - 56` (outer IPv6 40 + EtherIP 2 + inner
-Ethernet 14) and can be overridden per tunnel.
+Ethernet 14), or `- 60` when the tunnel is VLAN-tagged (see [VLAN
+underlays](#vlan-underlays)), and can be overridden per tunnel.
+
+### VLAN underlays
+
+The kernel does not support XDP on a VLAN subinterface, so when the underlay
+runs on a tagged VLAN the daemon attaches to the **physical** uplink and handles
+the 802.1Q tag itself. A tunnel with `vlan: N` set carries the id in its
+`TunnelConfig`; encap inserts a tag (TPID 0x8100, PCP/DEI 0, 4 bytes between the
+source MAC and the EtherType).
+
+Decap is **VLAN-agnostic by default**: it detects an in-band tag by EtherType
+(`0x8100`) to know how many L2 bytes to strip, demuxes by the outer `(remote,
+local)` address pair — the tunnel's unique key — and strips whatever L2 header
+is present. It deliberately does **not** require or validate the tag, because a
+NIC with RX VLAN offload strips the tag into descriptor metadata before XDP
+runs, so the tag simply isn't in the buffer XDP sees. Recovering it needs the
+`bpf_xdp_metadata_rx_vlan_tag` kfunc, which requires a device-bound program and
+is implemented by only `ice`/`mlx5`/`veth` (never through a bond) — not a
+portable option. Demuxing by the address pair sidesteps all of that: the data
+path is indifferent to the uplink's offload settings.
+
+Opting in with `check_vlan_tag_on_decap: true` sets
+`TUNNEL_FLAG_CHECK_VLAN_TAG`, and decap then drops (`XDP_PASS`, counted as
+`decap_vlan_mismatch`) any frame whose observed VLAN differs from `vlan_id` —
+which is only meaningful when the tag is visible, i.e. RX VLAN offload disabled.
+The whole tag handling lives in the shared `data_path` core, so the host tests
+and fuzzer cover it and the byte-exact `BPF_PROG_TEST_RUN` tests assert the
+kernel program agrees. One physical uplink can serve tunnels on several VLANs
+simultaneously (each demuxes independently by address pair), which a single
+XDP-on-`eth1.N` attach could not do.
+
+Because a tagged underlay's routes and neighbours live on the kernel VLAN
+subinterface (`eth1.N`), next-hop resolution runs there, not on the physical
+uplink: the daemon auto-discovers the subinterface by matching parent ifindex
+and VLAN id over a netlink link dump, then does its route/source/neighbour/probe
+lookups against it. The XDP redirect target stays the physical uplink (the tag
+is already on the frame). A tunnel whose subinterface does not exist yet is left
+pending and retried, as with any unresolved endpoint.
 
 ### Hidden peer namespace
 
@@ -273,7 +311,8 @@ Per-CPU counters are maintained across the encap/decap paths, summed across CPUs
 surfaced in `etheripctl` (non-zero only) and dumped on exit: `encap_enter`,
 `encap_redirect`, `encap_mss_fail`, `decap_enter`, `decap_redirect`,
 `decap_not_ipv6`, `decap_not_etherip`, `decap_no_tunnel`, `decap_own_pkt`,
-`decap_bad_header`, `main_enter`, … Set `RUST_LOG=debug` for verbose logging.
+`decap_bad_header`, `decap_vlan_mismatch`, `main_enter`, … Set `RUST_LOG=debug`
+for verbose logging.
 
 ## Testing
 

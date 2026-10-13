@@ -75,6 +75,10 @@ type Tunnel (
   # Effective inner MSS clamps; 0 means clamping disabled.
   mssClampIpv4: int,
   mssClampIpv6: int,
+  # Outer 802.1Q VLAN id the underlay runs on; null when untagged.
+  vlan: ?int,
+  # Whether decap enforces the VLAN tag against `vlan` (off by default).
+  checkVlanTagOnDecap: bool,
   # veth-peer ifindex (decap redirect target).
   peerIfindex: int
 )
